@@ -153,6 +153,8 @@ struct PreviewState {
     statements: Vec<String>,
     error: Option<String>,
     applying: bool,
+    /// false en un envío directo (⇧ / ⌘S): no se muestra la ventana.
+    visible: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -680,6 +682,33 @@ impl DataCraftApp {
 
     /// Abre la ventana de previsualización con el SQL de los cambios pendientes.
     fn open_preview(&mut self, idx: usize, view: usize) {
+        self.prepare_changes(idx, view, true);
+    }
+
+    /// Guarda los cambios pendientes sin mostrar el SQL (para eso está Preview).
+    fn submit_now(&mut self, idx: usize, view: usize) {
+        self.prepare_changes(idx, view, false);
+        match self.preview.as_ref() {
+            Some(pv) if !pv.visible => match pv.error.clone() {
+                Some(err) => {
+                    self.preview = None;
+                    self.error(err);
+                }
+                None => {
+                    self.submit_preview();
+                    // Si no se pudo enviar (sin conexión, pestaña ocupada), se avisa y se descarta.
+                    if let Some(pv) = self.preview.as_ref().filter(|p| !p.visible && !p.applying) {
+                        let err = pv.error.clone().unwrap_or_default();
+                        self.preview = None;
+                        self.error(err);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn prepare_changes(&mut self, idx: usize, view: usize, visible: bool) {
         let Some(c) = self.consoles.get_mut(idx) else { return };
         let Some(v) = c.results.get_mut(view) else { return };
         v.finish_inline_edit();
@@ -692,7 +721,7 @@ impl DataCraftApp {
             Ok(changes) => (changes.iter().map(|ch| edit::change_sql(driver, &e.target.schema, &e.target.table, ch)).collect(), None),
             Err(err) => (Vec::new(), Some(err)),
         };
-        self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false });
+        self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false, visible });
     }
 
     /// Envía los cambios de la previsualización en una transacción.
@@ -763,12 +792,17 @@ impl DataCraftApp {
                     message: format!("No se guardaron los cambios: {e}"),
                     is_error: true,
                 });
-                match self.preview.as_mut().filter(|p| p.console == console) {
+                match self.preview.as_mut().filter(|p| p.console == console && p.visible) {
                     Some(pv) => {
                         pv.applying = false;
                         pv.error = Some(e);
                     }
-                    None => self.error(format!("No se guardaron los cambios: {e}")),
+                    None => {
+                        if self.preview.as_ref().is_some_and(|p| p.console == console) {
+                            self.preview = None;
+                        }
+                        self.error(format!("No se guardaron los cambios: {e}"));
+                    }
                 }
             }
         }
@@ -1141,7 +1175,7 @@ impl DataCraftApp {
         if self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.show_about
-            || self.preview.is_some()
+            || self.preview.as_ref().is_some_and(|p| p.visible)
             || self.confirm_discard.is_some()
         {
             return;
@@ -1171,7 +1205,7 @@ impl DataCraftApp {
             && let Some(vi) = c.edit_view_index()
             && !c.is_busy()
         {
-            self.open_preview(self.active, vi);
+            self.submit_now(self.active, vi);
         }
         if new_console {
             self.new_console_here();
@@ -1800,6 +1834,7 @@ impl DataCraftApp {
                 ConsoleAction::Connect(id) => self.connect(id),
                 ConsoleAction::Error(e) => self.error(e),
                 ConsoleAction::Preview(view) => self.open_preview(idx, view),
+                ConsoleAction::Submit(view) => self.submit_now(idx, view),
             }
         }
     }
@@ -1926,7 +1961,7 @@ impl DataCraftApp {
 impl DataCraftApp {
     /// Ventana modal "Preview pending changes".
     fn preview_dialog(&mut self, ctx: &egui::Context, frame: egui::Frame) {
-        let Some(pv) = self.preview.as_ref() else { return };
+        let Some(pv) = self.preview.as_ref().filter(|p| p.visible) else { return };
         let p = palette(self.dark);
         let n = pv.statements.len();
         let applying = pv.applying;

@@ -90,6 +90,15 @@ pub enum ConsoleAction {
     Error(String),
     /// Abrir la previsualización de cambios pendientes del resultado indicado.
     Preview(usize),
+    /// Guardar directamente los cambios pendientes del resultado indicado.
+    Submit(usize),
+}
+
+fn edit_action(a: results::EditAction, view: usize) -> ConsoleAction {
+    match a {
+        results::EditAction::Submit => ConsoleAction::Submit(view),
+        results::EditAction::Preview => ConsoleAction::Preview(view),
+    }
 }
 
 /// Contexto de solo lectura que necesita la consola.
@@ -392,10 +401,10 @@ impl Console {
             theme::icon_button(ui, Ico::Stop, false, "Cancelar (no disponible)");
             theme::toolbar_separator(ui);
             let idx = self.results.len().checked_sub(1);
-            if results::edit_buttons(ui, self.results.last_mut(), !busy)
+            if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)
                 && let Some(i) = idx
             {
-                actions.push(ConsoleAction::Preview(i));
+                actions.push(edit_action(a, i));
             }
             if let Some(v) = self.results.last() {
                 edit_status_icon(ui, v);
@@ -523,15 +532,15 @@ impl Console {
             && self.results.get(i).is_some_and(|r| r.edit.is_some())
         {
             let busy = self.is_busy();
-            let mut preview = false;
+            let mut edit = None;
             toolbar_row(ui, |ui| {
-                preview = results::edit_buttons(ui, self.results.get_mut(i), !busy);
+                edit = results::edit_buttons(ui, self.results.get_mut(i), !busy);
                 if let Some(v) = self.results.get(i) {
                     edit_status_icon(ui, v);
                 }
             });
-            if preview {
-                actions.push(ConsoleAction::Preview(i));
+            if let Some(a) = edit {
+                actions.push(edit_action(a, i));
             }
             hline(ui);
         }

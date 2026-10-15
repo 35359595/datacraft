@@ -797,12 +797,20 @@ fn ui_mods(resp: &egui::Response) -> Modifiers {
 
 /// Botones de edición de datos (+, −, deshacer, revertir, enviar) y "Preview".
 /// Devuelve true si se pidió la previsualización de cambios.
-pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -> bool {
+/// Acción de la barra de edición que debe resolver la app.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditAction {
+    /// ⇧: guardar los cambios directamente.
+    Submit,
+    /// Abrir la ventana con el SQL de los cambios.
+    Preview,
+}
+
+pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -> Option<EditAction> {
     let editable = enabled && view.as_ref().is_some_and(|v| v.edit.is_some());
     let dirty = editable && view.as_ref().is_some_and(|v| v.is_dirty());
     let can_undo = editable && view.as_ref().is_some_and(|v| v.can_undo());
     let has_sel = editable && view.as_ref().is_some_and(|v| v.has_selection());
-    let mut preview = false;
     let add = theme::icon_button(ui, Ico::Plus, editable, "Añadir fila");
     let del = theme::icon_button(ui, Ico::Minus, has_sel, "Eliminar filas seleccionadas");
     let undo = theme::icon_button(ui, Ico::Undo, can_undo, "Deshacer (⌘Z)");
@@ -824,10 +832,13 @@ pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -
             v.revert_all();
         }
     }
-    if submit.clicked() || pv.clicked() {
-        preview = true;
+    if submit.clicked() {
+        Some(EditAction::Submit)
+    } else if pv.clicked() {
+        Some(EditAction::Preview)
+    } else {
+        None
     }
-    preview
 }
 
 /// Píldora flotante centrada en la parte inferior del grid: "N rows ⌄  ⋮".
