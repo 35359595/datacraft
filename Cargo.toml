@@ -1,0 +1,31 @@
+[package]
+name = "datacraft"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+dirs = "7.0.0"
+# GPU: solo Metal + WGSL (sin Vulkan/GLES/DX12/WebGPU), que es lo único que usa macOS.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu_no_default_features", "persistence"] }
+egui-wgpu = { version = "0.36", default-features = false }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+egui = "0.36"
+egui_extras = "0.36"
+futures-util = "0.3.34"
+keyring = { version = "3", features = ["apple-native"] }
+rfd = "0.17.2"
+# SQLite del sistema (/usr/lib/libsqlite3) en vez de compilarlo dentro del binario.
+rusqlite = "0.40.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "native-tls", "chrono"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-postgres = "0.7.18"
+tokio-util = { version = "0.7.20", features = ["compat"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
