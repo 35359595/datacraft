@@ -880,10 +880,10 @@ impl DataCraftApp {
         bottom.add_space(4.0);
         let has_error = self.status_msg.as_ref().is_some_and(|(_, e)| *e);
         let problems = stripe_button(&mut bottom, Ico::Problems, false, "Problemas");
-        if problems.clicked() {
-            if let Some((msg, _)) = &self.status_msg {
-                ui.ctx().copy_text(msg.clone());
-            }
+        if problems.clicked()
+            && let Some((msg, _)) = &self.status_msg
+        {
+            ui.ctx().copy_text(msg.clone());
         }
         if has_error {
             let c = problems.rect.right_top() + vec2(-9.0, 9.0);

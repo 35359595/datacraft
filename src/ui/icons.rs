@@ -49,8 +49,6 @@ pub enum Ico {
     MoreVert,
     Close,
     Export,
-    Copy,
-    Tx,
 }
 
 const W: f32 = 1.3;
@@ -158,9 +156,6 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
         }
         Ico::Ddl => {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "DDL", FontId::proportional(9.5 * s), color);
-        }
-        Ico::Tx => {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Tx", FontId::proportional(11.0 * s), color);
         }
         Ico::Eye => {
             let mut top = Vec::new();
@@ -302,10 +297,6 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
             line(&[(8.0, 2.0), (8.0, 10.5)], color);
             line(&[(4.5, 7.0), (8.0, 10.5), (11.5, 7.0)], color);
             line(&[(2.5, 11.0), (2.5, 13.5), (13.5, 13.5), (13.5, 11.0)], color);
-        }
-        Ico::Copy => {
-            painter.rect_stroke(Rect::from_min_max(at(5.0, 5.0), at(14.0, 14.0)), 1.5 * s, st(color), StrokeKind::Middle);
-            line(&[(2.0, 11.0), (2.0, 2.0), (11.0, 2.0)], color);
         }
     }
 }

@@ -767,7 +767,7 @@ struct Palette {
 }
 
 impl Palette {
-    // Darcula (DataGrip oscuro)
+    // Esquema "Dark" de las Islands (DataGrip 2026)
     const DARK: Palette = Palette {
         text: Color32::from_rgb(0xBC, 0xBE, 0xC4),
         keyword: Color32::from_rgb(0xCF, 0x8E, 0x6D),

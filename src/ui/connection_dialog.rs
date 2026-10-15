@@ -27,7 +27,10 @@ pub enum DialogResult {
 
 impl ConnectionDialog {
     pub fn new_connection(id: u64) -> Self {
-        Self { cfg: ConnectionConfig::new(id, Driver::Postgres), editing: false, test: TestState::Idle, error: None }
+        let mut cfg = ConnectionConfig::new(id, Driver::Postgres);
+        // El id es una marca de tiempo: no se muestra en el nombre por defecto.
+        cfg.name = Driver::Postgres.label().to_string();
+        Self { cfg, editing: false, test: TestState::Idle, error: None }
     }
 
     pub fn edit(cfg: ConnectionConfig) -> Self {

@@ -4,7 +4,7 @@
 
 use crate::ui::icons::{self, Ico};
 use egui::{
-    Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect, Response, Sense, Shadow,
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect, Response, Sense, Shadow,
     Stroke, TextStyle, Ui, Vec2, vec2,
 };
 use std::sync::Arc;
@@ -214,10 +214,6 @@ pub fn bold(size: f32) -> FontId {
 
 pub fn mono_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FONT_MONO_BOLD.into()))
-}
-
-pub fn mono_italic(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(FONT_MONO_ITALIC.into()))
 }
 
 /// Inter (UI) y JetBrains Mono (editor y grid). Las fuentes por defecto de egui quedan
@@ -453,11 +449,6 @@ pub fn paint_badge(ui: &Ui, left_center: egui::Pos2, text: &str) -> Rect {
     ui.painter().rect_filled(rect, 5.0, p.badge_bg);
     ui.painter().galley(egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y / 2.0), galley, p.badge_fg);
     rect
-}
-
-/// Texto pintado centrado verticalmente; devuelve su rectángulo.
-pub fn paint_text(ui: &Ui, left_center: egui::Pos2, text: &str, font: FontId, color: Color32) -> Rect {
-    ui.painter().text(left_center, Align2::LEFT_CENTER, text, font, color)
 }
 
 /// Marco de una "isla": tarjeta redondeada con el fondo de tool window.

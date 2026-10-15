@@ -335,7 +335,7 @@ impl Console {
             if theme::icon_button(ui, Ico::Refresh, !busy, "Recargar página (⌘R)").clicked() {
                 actions.push(ConsoleAction::Reload);
             }
-            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), "Log de consultas").clicked() {
+            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), "Copiar el log de consultas").clicked() {
                 let text = self.log.iter().map(|e| format!("[{}] {} {}", e.time, e.statement, e.message)).collect::<Vec<_>>().join("\n");
                 ui.ctx().copy_text(text);
             }
