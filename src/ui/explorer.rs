@@ -1,7 +1,8 @@
-//! Panel "Database Explorer": árbol de conexiones, esquemas, tablas y columnas (estilo Islands).
+//! Panel "Database Explorer": árbol de conexiones, bases de datos, esquemas, tablas y columnas
+//! (estilo Islands).
 
 use crate::app::{ConnState, ConnStatus};
-use crate::db::{ObjectKind, TableInfo};
+use crate::db::{DatabaseInfo, Driver, ObjectKind, SchemaInfo, TableInfo};
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, pal};
 use crate::worker::ConnId;
@@ -23,6 +24,7 @@ pub struct ExplorerState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub conn: ConnId,
+    pub db: String,
     pub schema: String,
     pub table: String,
 }
@@ -35,7 +37,10 @@ pub enum ExplorerAction {
     Edit(ConnId),
     Duplicate(ConnId),
     Delete(ConnId),
-    NewConsole(ConnId),
+    /// Nueva consola en la conexión (y la base, si se abre desde una base).
+    NewConsole(ConnId, Option<String>),
+    /// Cargar el esquema de una base al expandirla.
+    LoadDatabase(ConnId, String),
     OpenTable(TableRef),
     GenerateSelect(TableRef),
     GenerateInsert(TableRef),
@@ -144,6 +149,24 @@ fn table_matches(t: &TableInfo, f: &str) -> bool {
     f.is_empty() || t.name.to_lowercase().contains(f)
 }
 
+/// Base de la fila seleccionada (si es una base o algo dentro de ella).
+fn selected_db(state: &ExplorerState, conns: &[ConnState]) -> Option<String> {
+    let key = state.selected.as_deref()?;
+    let (kind, rest) = key.split_once(':')?;
+    if kind == "c" {
+        return None;
+    }
+    let conn = conn_of_key(key)?;
+    let c = conns.iter().find(|c| c.cfg.id == conn)?;
+    let after = rest.split_once(':')?.1;
+    // La base puede contener ':'; se busca la más larga que encaje.
+    c.databases
+        .iter()
+        .filter(|d| after == d.name || after.starts_with(&format!("{}:", d.name)))
+        .max_by_key(|d| d.name.len())
+        .map(|d| d.name.clone())
+}
+
 /// Conexión de la fila seleccionada (si la hay).
 fn selected_conn(state: &ExplorerState) -> Option<ConnId> {
     state.selected.as_deref().and_then(conn_of_key)
@@ -217,7 +240,7 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
         if theme::icon_button(ui, Ico::JumpToConsole, sel_conn.is_some(), "Ir a consola").clicked()
             && let Some(id) = sel_conn
         {
-            actions.push(ExplorerAction::NewConsole(id));
+            actions.push(ExplorerAction::NewConsole(id, selected_db(state, conns)));
         }
         if theme::icon_button(ui, Ico::Table, table.is_some(), "Editar datos de la tabla").clicked()
             && let Some(t) = table.clone()
@@ -270,7 +293,6 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
     header(ui, state, conns, &mut actions);
 
     let filter = state.filter.trim().to_lowercase();
-    let filtering = !filter.is_empty();
 
     egui::ScrollArea::both().id_salt("explorer_tree").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -285,193 +307,330 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
             });
         }
         for c in conns {
-            let id = c.cfg.id;
-            let name_match = filtering && c.cfg.name.to_lowercase().contains(&filter);
-            let any_table = c.schemas.iter().any(|s| s.tables.iter().any(|t| table_matches(t, &filter)));
-            if filtering && !name_match && !any_table {
-                continue;
-            }
-            let ckey = format!("c:{id}");
-            let open = state.expanded.contains(&ckey) || (filtering && any_table);
-            let (dot, detail) = match &c.status {
-                ConnStatus::Disconnected => (None, None),
-                ConnStatus::Connecting => (Some(p.warn), Some(("conectando…", p.muted))),
-                ConnStatus::Connected => (Some(p.ok), None),
-                ConnStatus::Error(_) => (Some(p.error), Some(("error", p.error))),
-            };
-            let n_tables: usize = c.schemas.iter().map(|s| s.tables.len()).sum();
-            let badge = match c.schemas.len() {
-                0 => None,
-                1 => Some(n_tables.to_string()),
-                n => Some(format!("{n} of {n}")),
-            };
-            let row = tree_row(
-                ui,
-                state,
-                RowSpec {
-                    key: &ckey,
-                    depth: 0,
-                    expandable: true,
-                    expanded: open,
-                    icon: Ico::Driver(c.cfg.driver),
-                    label: &c.cfg.name,
-                    badge: badge.as_deref(),
-                    detail,
-                    status: dot,
-                    label_color: None,
-                },
-            );
-            let mut resp = row.resp;
-            if let ConnStatus::Error(e) = &c.status {
-                resp = resp.on_hover_text(RichText::new(e).color(p.error));
-            } else {
-                resp = resp.on_hover_text(connection_summary(c));
-            }
-            if row.toggled {
-                toggle(state, &ckey, open);
-                if !open && matches!(c.status, ConnStatus::Disconnected | ConnStatus::Error(_)) {
-                    actions.push(ExplorerAction::Connect(id));
-                }
-            }
-            resp.context_menu(|ui| {
-                let connected = matches!(c.status, ConnStatus::Connected);
-                if ui.add_enabled(!connected, egui::Button::new("Conectar")).clicked() {
-                    actions.push(ExplorerAction::Connect(id));
-                    state.expanded.insert(ckey.clone());
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(!matches!(c.status, ConnStatus::Disconnected), egui::Button::new("Desconectar"))
-                    .clicked()
-                {
-                    actions.push(ExplorerAction::Disconnect(id));
-                    ui.close();
-                }
-                if ui.add_enabled(connected, egui::Button::new("Refrescar")).clicked() {
-                    actions.push(ExplorerAction::Refresh(id));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Nueva consola").clicked() {
-                    actions.push(ExplorerAction::NewConsole(id));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Propiedades…").clicked() {
-                    actions.push(ExplorerAction::Edit(id));
-                    ui.close();
-                }
-                if ui.button("Duplicar").clicked() {
-                    actions.push(ExplorerAction::Duplicate(id));
-                    ui.close();
-                }
-                if ui.button(RichText::new("Eliminar…").color(p.error)).clicked() {
-                    actions.push(ExplorerAction::Delete(id));
-                    ui.close();
-                }
-            });
-            if !open {
-                continue;
-            }
-
-            if let ConnStatus::Error(e) = &c.status {
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0 + INDENT + 20.0);
-                    ui.add(egui::Label::new(RichText::new(e).small().color(p.error)).wrap());
-                });
-            }
-
-            for s in &c.schemas {
-                let skey = format!("s:{id}:{}", s.name);
-                let s_any = s.tables.iter().any(|t| table_matches(t, &filter));
-                if filtering && !s_any && !name_match {
-                    continue;
-                }
-                let s_open = state.expanded.contains(&skey)
-                    || (filtering && s_any)
-                    || (c.schemas.len() == 1 && !state.expanded.contains(&format!("{skey}:closed")));
-                let row = tree_row(
-                    ui,
-                    state,
-                    RowSpec {
-                        key: &skey,
-                        depth: 1,
-                        expandable: true,
-                        expanded: s_open,
-                        icon: Ico::Schema,
-                        label: &s.name,
-                        badge: None,
-                        detail: None,
-                        status: None,
-                        label_color: None,
-                    },
-                );
-                if row.toggled {
-                    if c.schemas.len() == 1 {
-                        let closed_key = format!("{skey}:closed");
-                        if s_open {
-                            state.expanded.insert(closed_key);
-                            state.expanded.remove(&skey);
-                        } else {
-                            state.expanded.remove(&closed_key);
-                        }
-                    } else {
-                        toggle(state, &skey, s_open);
-                    }
-                }
-                if !s_open {
-                    continue;
-                }
-                for (kind, label, gk) in [(ObjectKind::Table, "tables", "t"), (ObjectKind::View, "views", "v")] {
-                    let tables: Vec<&TableInfo> =
-                        s.tables.iter().filter(|t| t.kind == kind && table_matches(t, &filter)).collect();
-                    if tables.is_empty() {
-                        continue;
-                    }
-                    let gkey = format!("g:{id}:{}:{gk}", s.name);
-                    let g_open = !state.expanded.contains(&format!("{gkey}:closed")) || filtering;
-                    let n = tables.len().to_string();
-                    let row = tree_row(
-                        ui,
-                        state,
-                        RowSpec {
-                            key: &gkey,
-                            depth: 2,
-                            expandable: true,
-                            expanded: g_open,
-                            icon: Ico::Folder,
-                            label,
-                            badge: None,
-                            detail: Some((&n, p.muted)),
-                            status: None,
-                            label_color: None,
-                        },
-                    );
-                    if row.toggled {
-                        let closed_key = format!("{gkey}:closed");
-                        if g_open {
-                            state.expanded.insert(closed_key);
-                        } else {
-                            state.expanded.remove(&closed_key);
-                        }
-                    }
-                    if !g_open {
-                        continue;
-                    }
-                    for t in tables {
-                        table_rows(ui, state, &mut actions, id, &s.name, t);
-                    }
-                }
-            }
+            connection_rows(ui, state, &mut actions, c, &filter);
         }
         ui.add_space(8.0);
     });
     actions
 }
 
-fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, conn: ConnId, schema: &str, t: &TableInfo) {
+fn db_has_match(d: &DatabaseInfo, filter: &str) -> bool {
+    d.schemas.as_ref().is_some_and(|ss| ss.iter().any(|s| s.tables.iter().any(|t| table_matches(t, filter))))
+}
+
+fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, c: &ConnState, filter: &str) {
     let p = pal(ui);
-    let tkey = format!("t:{conn}:{schema}:{}", t.name);
+    let filtering = !filter.is_empty();
+    let id = c.cfg.id;
+    let name_match = filtering && c.cfg.name.to_lowercase().contains(filter);
+    let any_table = c.databases.iter().any(|d| db_has_match(d, filter));
+    if filtering && !name_match && !any_table {
+        return;
+    }
+    let ckey = format!("c:{id}");
+    let open = state.expanded.contains(&ckey) || (filtering && any_table);
+    let (dot, detail) = match &c.status {
+        ConnStatus::Disconnected => (None, None),
+        ConnStatus::Connecting => (Some(p.warn), Some(("conectando…", p.muted))),
+        ConnStatus::Connected => (Some(p.ok), None),
+        ConnStatus::Error(_) => (Some(p.error), Some(("error", p.error))),
+    };
+    let badge = (!c.databases.is_empty()).then(|| c.databases.len().to_string());
+    let row = tree_row(
+        ui,
+        state,
+        RowSpec {
+            key: &ckey,
+            depth: 0,
+            expandable: true,
+            expanded: open,
+            icon: Ico::Driver(c.cfg.driver),
+            label: &c.cfg.name,
+            badge: badge.as_deref(),
+            detail,
+            status: dot,
+            label_color: None,
+        },
+    );
+    let mut resp = row.resp;
+    if let ConnStatus::Error(e) = &c.status {
+        resp = resp.on_hover_text(RichText::new(e).color(p.error));
+    } else {
+        resp = resp.on_hover_text(connection_summary(c));
+    }
+    if row.toggled {
+        toggle(state, &ckey, open);
+        if !open && matches!(c.status, ConnStatus::Disconnected | ConnStatus::Error(_)) {
+            actions.push(ExplorerAction::Connect(id));
+        }
+    }
+    resp.context_menu(|ui| {
+        let connected = matches!(c.status, ConnStatus::Connected);
+        if ui.add_enabled(!connected, egui::Button::new("Conectar")).clicked() {
+            actions.push(ExplorerAction::Connect(id));
+            state.expanded.insert(ckey.clone());
+            ui.close();
+        }
+        if ui.add_enabled(!matches!(c.status, ConnStatus::Disconnected), egui::Button::new("Desconectar")).clicked() {
+            actions.push(ExplorerAction::Disconnect(id));
+            ui.close();
+        }
+        if ui.add_enabled(connected, egui::Button::new("Refrescar")).clicked() {
+            actions.push(ExplorerAction::Refresh(id));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Nueva consola").clicked() {
+            actions.push(ExplorerAction::NewConsole(id, None));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Propiedades…").clicked() {
+            actions.push(ExplorerAction::Edit(id));
+            ui.close();
+        }
+        if ui.button("Duplicar").clicked() {
+            actions.push(ExplorerAction::Duplicate(id));
+            ui.close();
+        }
+        if ui.button(RichText::new("Eliminar…").color(p.error)).clicked() {
+            actions.push(ExplorerAction::Delete(id));
+            ui.close();
+        }
+    });
+    if !open {
+        return;
+    }
+    if let ConnStatus::Error(e) = &c.status {
+        error_line(ui, 1, e);
+    }
+    for d in &c.databases {
+        database_rows(ui, state, actions, c, d, filter, name_match);
+    }
+}
+
+/// Mensaje de error en rojo bajo un nodo.
+fn error_line(ui: &mut Ui, depth: usize, msg: &str) {
+    let p = pal(ui);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0 + depth as f32 * INDENT + 20.0);
+        ui.add(egui::Label::new(RichText::new(msg).small().color(p.error)).wrap());
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn database_rows(
+    ui: &mut Ui,
+    state: &mut ExplorerState,
+    actions: &mut Vec<ExplorerAction>,
+    c: &ConnState,
+    d: &DatabaseInfo,
+    filter: &str,
+    name_match: bool,
+) {
+    let p = pal(ui);
+    let filtering = !filter.is_empty();
+    let id = c.cfg.id;
+    let has_match = db_has_match(d, filter);
+    if filtering && !has_match && !name_match {
+        return;
+    }
+    let dkey = format!("d:{id}:{}", d.name);
+    let open = state.expanded.contains(&dkey) || (filtering && has_match);
+    let loading = c.loading.contains(&d.name);
+    let sqlite = c.cfg.driver == Driver::Sqlite;
+    // SQLite: un único esquema "main" igual que la base; se muestran sus tablas directamente.
+    let flat = sqlite && d.schemas.as_ref().is_some_and(|ss| ss.len() == 1);
+    let badge = d.schemas.as_ref().map(|ss| {
+        if flat { ss.iter().map(|s| s.tables.len()).sum::<usize>().to_string() } else { ss.len().to_string() }
+    });
+    let detail = if loading {
+        Some(("cargando…", p.muted))
+    } else if d.current && !sqlite {
+        Some(("por defecto", p.muted))
+    } else {
+        None
+    };
+    let row = tree_row(
+        ui,
+        state,
+        RowSpec {
+            key: &dkey,
+            depth: 1,
+            expandable: true,
+            expanded: open,
+            icon: Ico::Database,
+            label: &d.name,
+            badge: badge.as_deref(),
+            detail,
+            status: None,
+            label_color: None,
+        },
+    );
+    if row.toggled {
+        toggle(state, &dkey, open);
+        if !open && d.schemas.is_none() && !loading && matches!(c.status, ConnStatus::Connected) {
+            actions.push(ExplorerAction::LoadDatabase(id, d.name.clone()));
+        }
+    }
+    let db_name = d.name.clone();
+    row.resp.context_menu(|ui| {
+        if ui.button("Nueva consola").clicked() {
+            actions.push(ExplorerAction::NewConsole(id, Some(db_name.clone())));
+            ui.close();
+        }
+        let connected = matches!(c.status, ConnStatus::Connected);
+        if ui.add_enabled(connected && !loading, egui::Button::new("Recargar esquema")).clicked() {
+            actions.push(ExplorerAction::LoadDatabase(id, db_name.clone()));
+            ui.close();
+        }
+        if ui.button("Copiar nombre").clicked() {
+            ui.ctx().copy_text(db_name.clone());
+            ui.close();
+        }
+    });
+    if !open {
+        return;
+    }
+    if let Some(e) = c.db_errors.get(&d.name) {
+        error_line(ui, 2, e);
+    }
+    let Some(schemas) = &d.schemas else {
+        if loading {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0 + 2.0 * INDENT + 20.0);
+                ui.add(egui::Spinner::new().size(12.0).color(p.muted));
+                ui.label(RichText::new("cargando…").small().color(p.muted));
+            });
+        }
+        return;
+    };
+    if flat {
+        if let Some(s) = schemas.first() {
+            object_groups(ui, state, actions, id, &d.name, s, filter, 2);
+        }
+        return;
+    }
+    for s in schemas {
+        schema_rows(ui, state, actions, id, &d.name, schemas, s, filter, name_match);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schema_rows(
+    ui: &mut Ui,
+    state: &mut ExplorerState,
+    actions: &mut Vec<ExplorerAction>,
+    conn: ConnId,
+    db: &str,
+    all: &[SchemaInfo],
+    s: &SchemaInfo,
+    filter: &str,
+    name_match: bool,
+) {
+    let filtering = !filter.is_empty();
+    let skey = format!("s:{conn}:{db}:{}", s.name);
+    let s_any = s.tables.iter().any(|t| table_matches(t, filter));
+    if filtering && !s_any && !name_match {
+        return;
+    }
+    let s_open = state.expanded.contains(&skey)
+        || (filtering && s_any)
+        || (all.len() == 1 && !state.expanded.contains(&format!("{skey}:closed")));
+    let n = s.tables.len().to_string();
+    let row = tree_row(
+        ui,
+        state,
+        RowSpec {
+            key: &skey,
+            depth: 2,
+            expandable: true,
+            expanded: s_open,
+            icon: Ico::Schema,
+            label: &s.name,
+            badge: None,
+            detail: (!s.tables.is_empty()).then_some((n.as_str(), pal(ui).muted)),
+            status: None,
+            label_color: None,
+        },
+    );
+    if row.toggled {
+        if all.len() == 1 {
+            let closed_key = format!("{skey}:closed");
+            if s_open {
+                state.expanded.insert(closed_key);
+                state.expanded.remove(&skey);
+            } else {
+                state.expanded.remove(&closed_key);
+            }
+        } else {
+            toggle(state, &skey, s_open);
+        }
+    }
+    if s_open {
+        object_groups(ui, state, actions, conn, db, s, filter, 3);
+    }
+}
+
+/// Carpetas "tables" / "views" de un esquema y sus objetos.
+#[allow(clippy::too_many_arguments)]
+fn object_groups(
+    ui: &mut Ui,
+    state: &mut ExplorerState,
+    actions: &mut Vec<ExplorerAction>,
+    conn: ConnId,
+    db: &str,
+    s: &SchemaInfo,
+    filter: &str,
+    depth: usize,
+) {
+    let p = pal(ui);
+    let filtering = !filter.is_empty();
+    for (kind, label, gk) in [(ObjectKind::Table, "tables", "t"), (ObjectKind::View, "views", "v")] {
+        let tables: Vec<&TableInfo> = s.tables.iter().filter(|t| t.kind == kind && table_matches(t, filter)).collect();
+        if tables.is_empty() {
+            continue;
+        }
+        let gkey = format!("g:{conn}:{db}:{}:{gk}", s.name);
+        let g_open = !state.expanded.contains(&format!("{gkey}:closed")) || filtering;
+        let n = tables.len().to_string();
+        let row = tree_row(
+            ui,
+            state,
+            RowSpec {
+                key: &gkey,
+                depth,
+                expandable: true,
+                expanded: g_open,
+                icon: Ico::Folder,
+                label,
+                badge: None,
+                detail: Some((&n, p.muted)),
+                status: None,
+                label_color: None,
+            },
+        );
+        if row.toggled {
+            let closed_key = format!("{gkey}:closed");
+            if g_open {
+                state.expanded.insert(closed_key);
+            } else {
+                state.expanded.remove(&closed_key);
+            }
+        }
+        if !g_open {
+            continue;
+        }
+        for t in tables {
+            let tref = TableRef { conn, db: db.to_string(), schema: s.name.clone(), table: t.name.clone() };
+            table_rows(ui, state, actions, tref, t, depth + 1);
+        }
+    }
+}
+
+fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize) {
+    let p = pal(ui);
+    let tkey = table_key(&tref);
     let open = state.expanded.contains(&tkey);
     let icon = if t.kind == ObjectKind::Table { Ico::Table } else { Ico::View };
     let row = tree_row(
@@ -479,7 +638,7 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         state,
         RowSpec {
             key: &tkey,
-            depth: 3,
+            depth,
             expandable: !t.columns.is_empty(),
             expanded: open,
             icon,
@@ -490,7 +649,6 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             label_color: None,
         },
     );
-    let tref = TableRef { conn, schema: schema.to_string(), table: t.name.clone() };
     if row.resp.clicked() || row.resp.secondary_clicked() {
         state.selected_table = Some(tref.clone());
     }
@@ -536,7 +694,7 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             state,
             RowSpec {
                 key: &ckey,
-                depth: 4,
+                depth: depth + 1,
                 expandable: false,
                 expanded: false,
                 icon: if col.primary_key { Ico::Key } else { Ico::Column },
@@ -554,6 +712,16 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             }
         });
     }
+}
+
+/// Clave del árbol de una tabla (para expandirla o seleccionarla desde fuera).
+pub fn table_key(t: &TableRef) -> String {
+    format!("t:{}:{}:{}:{}", t.conn, t.db, t.schema, t.table)
+}
+
+/// Clave del árbol de una base.
+pub fn db_key(conn: ConnId, db: &str) -> String {
+    format!("d:{conn}:{db}")
 }
 
 fn conn_of_key(key: &str) -> Option<ConnId> {

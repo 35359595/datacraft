@@ -139,6 +139,20 @@ pub struct SchemaInfo {
     pub tables: Vec<TableInfo>,
 }
 
+/// Base de datos del servidor. `schemas` es `None` hasta que se carga (al expandirla).
+#[derive(Debug, Clone)]
+pub struct DatabaseInfo {
+    pub name: String,
+    /// Base por defecto de la conexión.
+    pub current: bool,
+    pub schemas: Option<Vec<SchemaInfo>>,
+}
+
+/// Error estándar cuando un cambio no afecta exactamente a una fila.
+pub(crate) fn not_single_row(n: u64, stmt: &str) -> anyhow::Error {
+    anyhow::anyhow!("La sentencia afectó a {n} filas (se esperaba 1); no se ha guardado nada:\n{stmt}")
+}
+
 /// Sesión abierta contra un motor concreto.
 pub enum Session {
     Postgres(postgres::PgSession),
@@ -162,6 +176,49 @@ impl Session {
             Session::Postgres(s) => s.execute(sql, max_rows).await,
             Session::Sqlite(s) => s.execute(sql, max_rows).await,
             Session::MsSql(s) => s.execute(sql, max_rows).await,
+        }
+    }
+
+    /// Base a la que está conectada la sesión al abrirla.
+    pub async fn current_database(&mut self) -> anyhow::Result<String> {
+        match self {
+            Session::Postgres(s) => s.current_database().await,
+            Session::Sqlite(_) => Ok("main".into()),
+            Session::MsSql(s) => s.current_database().await,
+        }
+    }
+
+    /// Bases visibles en el servidor (SQLite: solo "main").
+    pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Session::Postgres(s) => s.list_databases().await,
+            Session::Sqlite(_) => Ok(vec!["main".into()]),
+            Session::MsSql(s) => s.list_databases().await,
+        }
+    }
+
+    /// Esquema de `db`. En PostgreSQL la sesión ya debe estar conectada a esa base.
+    pub async fn introspect_database(&mut self, db: &str) -> anyhow::Result<Vec<SchemaInfo>> {
+        self.use_database(db).await?;
+        self.introspect().await
+    }
+
+    /// SQL Server: `USE [db]`. En los demás motores no hace nada (cada sesión es de una base).
+    pub async fn use_database(&mut self, db: &str) -> anyhow::Result<()> {
+        match self {
+            Session::MsSql(s) if !db.is_empty() => s.use_database(db).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Aplica cambios del editor de datos en UNA transacción. Cada sentencia debe afectar
+    /// exactamente a una fila; si alguna falla o afecta a 0 o varias, se deshace todo.
+    /// Devuelve el total de filas modificadas.
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        match self {
+            Session::Postgres(s) => s.apply_changes(statements).await,
+            Session::Sqlite(s) => s.apply_changes(statements).await,
+            Session::MsSql(s) => s.apply_changes(statements).await,
         }
     }
 

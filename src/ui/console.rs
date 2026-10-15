@@ -6,7 +6,7 @@ use crate::sql;
 use crate::ui::icons::{self, Ico};
 use crate::ui::results::{self, OutputEntry, ResultView};
 use crate::ui::theme::{self, pal, palette};
-use crate::ui::{ConnStatusKind, byte_to_char, char_to_byte, quote_ident};
+use crate::ui::{ConnStatusKind, ConnSummary, byte_to_char, char_to_byte, quote_ident};
 use crate::worker::ConnId;
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{Event, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -48,6 +48,8 @@ pub struct Console {
     pub title: String,
     pub text: String,
     pub conn: Option<ConnId>,
+    /// Base de datos de la pestaña (`None` = la por defecto de la conexión).
+    pub db: Option<String>,
     pub running: bool,
     pub run_started: Option<Instant>,
     /// Sentencias a ejecutar cuando termine de conectar.
@@ -62,6 +64,8 @@ pub struct Console {
     completion: Option<Completion>,
     /// Si es Some, la pestaña es un editor de datos de tabla en vez de una consola.
     pub table: Option<TableTab>,
+    /// Tras guardar cambios: la próxima ejecución sustituye solo este resultado.
+    pub replace_view: Option<usize>,
 }
 
 /// Estado del editor de datos de una tabla.
@@ -84,11 +88,13 @@ pub enum ConsoleAction {
     Ddl,
     Connect(ConnId),
     Error(String),
+    /// Abrir la previsualización de cambios pendientes del resultado indicado.
+    Preview(usize),
 }
 
 /// Contexto de solo lectura que necesita la consola.
 pub struct ConsoleCtx<'a> {
-    pub connections: &'a [(ConnId, String, Driver, crate::ui::ConnStatusKind)],
+    pub connections: &'a [ConnSummary],
     pub schemas: Option<&'a [SchemaInfo]>,
     pub driver: Driver,
     pub dark: bool,
@@ -104,6 +110,7 @@ impl Console {
             title,
             text,
             conn,
+            db: None,
             running: false,
             run_started: None,
             pending: None,
@@ -115,18 +122,42 @@ impl Console {
             hl_cache: None,
             completion: None,
             table: None,
+            replace_view: None,
         }
     }
 
     /// Pestaña de editor de datos para `schema.table`.
-    pub fn new_table(id: u64, conn: ConnId, schema: String, table: String) -> Self {
+    pub fn new_table(id: u64, conn: ConnId, db: Option<String>, schema: String, table: String) -> Self {
         let mut c = Self::new(id, table.clone(), String::new(), Some(conn));
+        c.db = db;
         c.table = Some(TableTab { schema, table, where_clause: String::new(), order_by: String::new(), loaded: false });
         c
     }
 
     pub fn is_busy(&self) -> bool {
         self.running || self.pending.is_some()
+    }
+
+    /// Resultado cuyos cambios se editan ahora: el último en el editor de datos o el
+    /// resultado visible en una consola.
+    pub fn edit_view_index(&self) -> Option<usize> {
+        if self.table.is_some() {
+            return self.results.len().checked_sub(1);
+        }
+        match self.result_tab {
+            ResultTab::Result(i) if i < self.results.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn has_pending_edits(&self) -> bool {
+        self.results.iter().any(|r| r.is_dirty())
+    }
+
+    pub fn discard_edits(&mut self) {
+        for r in &mut self.results {
+            r.discard_edits();
+        }
     }
 
     /// (línea, columna) 1-based del cursor del editor.
@@ -269,37 +300,56 @@ impl Console {
         });
     }
 
-    /// Selector de conexión de la consola (deshabilitado mientras está ocupada).
+    /// Selector "conexión · base" de la consola (deshabilitado mientras está ocupada).
     fn connection_selector(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let busy = self.is_busy();
-        let current = self.conn.and_then(|id| cx.connections.iter().find(|c| c.0 == id));
+        let current = self.conn.and_then(|id| cx.connections.iter().find(|c| c.id == id));
         let (ico, label) = match current {
-            Some((_, name, driver, _)) => (Ico::Driver(*driver), name.clone()),
+            Some(c) => (Ico::Driver(c.driver), c.label(self.db.as_deref())),
             None => (Ico::Database, "<sin conexión>".to_string()),
         };
         let resp = theme::flat_button(ui, Some(ico), &label, FontId::proportional(13.0), true, !busy)
-            .on_hover_text("Data source de la consola");
-        let before = self.conn;
+            .on_hover_text("Data source y base de datos de la consola");
+        let before = (self.conn, self.db.clone());
         egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(220.0);
+            ui.set_min_width(240.0);
             if ui.selectable_label(self.conn.is_none(), "<sin conexión>").clicked() {
                 self.conn = None;
+                self.db = None;
                 ui.close();
             }
-            for (id, name, driver, _) in cx.connections {
-                if ui.selectable_label(self.conn == Some(*id), format!("{name}  ·  {}", driver.label())).clicked() {
-                    self.conn = Some(*id);
+            for c in cx.connections {
+                let this = self.conn == Some(c.id);
+                if ui.selectable_label(this && self.db.is_none(), format!("{}  ·  {}", c.name, c.driver.label())).clicked() {
+                    self.conn = Some(c.id);
+                    self.db = None;
                     ui.close();
+                }
+                if c.driver == Driver::Sqlite {
+                    continue;
+                }
+                let effective = if this { self.db.clone().or_else(|| c.default_db.clone()) } else { None };
+                for d in &c.databases {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        let sel = effective.as_deref() == Some(d.as_str());
+                        let text = if c.default_db.as_deref() == Some(d.as_str()) { format!("{d}  (por defecto)") } else { d.clone() };
+                        if ui.add(egui::Button::selectable(sel, text)).clicked() {
+                            self.conn = Some(c.id);
+                            self.db = Some(d.clone());
+                            ui.close();
+                        }
+                    });
                 }
             }
         });
-        if self.conn != before {
-            // Lo pendiente era para la conexión anterior.
+        if (self.conn, self.db.clone()) != before {
+            // Lo pendiente era para la conexión/base anterior.
             self.pending = None;
             self.run_started = None;
             if let Some(id) = self.conn
-                && let Some(c) = cx.connections.iter().find(|c| c.0 == id)
-                && matches!(c.3, ConnStatusKind::Disconnected | ConnStatusKind::Error)
+                && let Some(c) = cx.connections.iter().find(|c| c.id == id)
+                && matches!(c.status, ConnStatusKind::Disconnected | ConnStatusKind::Error)
             {
                 actions.push(ConsoleAction::Connect(id));
             }
@@ -341,14 +391,14 @@ impl Console {
             }
             theme::icon_button(ui, Ico::Stop, false, "Cancelar (no disponible)");
             theme::toolbar_separator(ui);
-            for (ico, tip) in [
-                (Ico::Plus, "Añadir fila"),
-                (Ico::Minus, "Eliminar filas"),
-                (Ico::Undo, "Deshacer"),
-                (Ico::Revert, "Revertir cambios"),
-                (Ico::Submit, "Enviar cambios"),
-            ] {
-                theme::icon_button(ui, ico, false, tip);
+            let idx = self.results.len().checked_sub(1);
+            if results::edit_buttons(ui, self.results.last_mut(), !busy)
+                && let Some(i) = idx
+            {
+                actions.push(ConsoleAction::Preview(i));
+            }
+            if let Some(v) = self.results.last() {
+                edit_status_icon(ui, v);
             }
             theme::toolbar_separator(ui);
             self.tx_dropdown(ui);
@@ -451,10 +501,40 @@ impl Console {
                     self.result_tab = ResultTab::Result(i);
                 }
             }
+            if let ResultTab::Result(i) = self.result_tab
+                && let Some(r) = self.results.get(i)
+                && r.edit.is_none()
+                && !r.rs.is_command()
+            {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(14.0)), Ico::Lock, p.muted, &p, true);
+                    let why = r.readonly_reason.clone().unwrap_or_else(|| "Resultado de solo lectura".into());
+                    resp.on_hover_text(format!("Solo lectura: {why}"));
+                });
+            }
         });
         hline(ui);
         let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Copy)))
             && ui.memory(|m| m.focused().is_none());
+        // Mini barra de edición sobre el grid si el resultado es editable.
+        if let ResultTab::Result(i) = self.result_tab
+            && self.results.get(i).is_some_and(|r| r.edit.is_some())
+        {
+            let busy = self.is_busy();
+            let mut preview = false;
+            toolbar_row(ui, |ui| {
+                preview = results::edit_buttons(ui, self.results.get_mut(i), !busy);
+                if let Some(v) = self.results.get(i) {
+                    edit_status_icon(ui, v);
+                }
+            });
+            if preview {
+                actions.push(ConsoleAction::Preview(i));
+            }
+            hline(ui);
+        }
         match self.result_tab {
             ResultTab::Result(i) if i < self.results.len() => {
                 if let Some(err) = results::show_result(ui, &mut self.results[i], copy_requested, cx.columns) {
@@ -868,6 +948,26 @@ fn resolve_alias(alias: &str, text: &str, schemas: &[SchemaInfo]) -> Option<Stri
         }
     }
     None
+}
+
+/// Contador de cambios pendientes y aviso de tabla sin clave primaria.
+fn edit_status_icon(ui: &mut Ui, v: &ResultView) {
+    let p = pal(ui);
+    let Some(e) = &v.edit else { return };
+    if !e.target.has_pk {
+        let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+        icons::paint(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(15.0)), Ico::Problems, p.warn, &p, true);
+        resp.on_hover_text(
+            "La tabla no tiene clave primaria: cada fila se identifica por todos sus valores \
+             originales. Si un cambio no afecta exactamente a una fila, no se guarda nada.",
+        );
+    }
+    let n = e.state.pending_count();
+    if n > 0 {
+        ui.add_space(4.0);
+        let text = if n == 1 { "1 cambio".to_string() } else { format!("{n} cambios") };
+        ui.label(RichText::new(text).color(p.accent).size(12.5));
+    }
 }
 
 /// Línea horizontal fina a todo el ancho (separador interno de isla).

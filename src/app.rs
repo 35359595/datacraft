@@ -6,24 +6,54 @@
 //! el estado de la UI se persiste en un directorio temporal (ver `main.rs`).
 //! `DATACRAFT_DEMO_DARK=1` fuerza Islands Dark y `DATACRAFT_DEMO_DIALOG=1` abre el diálogo
 //! de nueva conexión y `DATACRAFT_DEMO_TAB=console` deja activa la consola.
+//! `DATACRAFT_DEMO_ZOOM=<porcentaje>` fija el zoom del IDE (p.ej. 125).
+//! `DATACRAFT_DEMO_EDIT=cell|changes|preview` simula en memoria, sobre el editor de datos de la
+//! primera tabla, una celda en edición, varios cambios pendientes (celda modificada, NULL, fila
+//! nueva y fila marcada para borrar) o esos cambios con la ventana de previsualización abierta.
+//! Nunca se envían a la base de datos.
 
 use crate::config;
-use crate::db::{ColumnInfo, ConnectionConfig, Driver, SchemaInfo, Session};
+use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
+use crate::edit;
 use crate::sql;
 use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{Console, ConsoleAction, ConsoleCtx, ResultTab};
+use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
 use crate::ui::results::{self, OutputEntry, ResultView};
 use crate::ui::theme::{self, palette};
-use crate::ui::{ConnStatusKind, quote_ident_if_needed};
+use crate::ui::{ConnStatusKind, ConnSummary, quote_ident_if_needed};
 use crate::worker::{ConnId, Request, Response, Worker};
 use egui::{FontId, Key, Margin, Modifiers, Rect, RichText, Sense, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 const STORAGE_KEY: &str = "datacraft_ui_state";
 const DEFAULT_FONT_SIZE: f32 = 13.0;
+
+/// Pasos del zoom del IDE.
+pub const ZOOM_STEPS: [f32; 11] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// Siguiente paso de zoom por encima de `z`.
+pub fn zoom_in(z: f32) -> f32 {
+    ZOOM_STEPS.iter().copied().find(|s| *s > z + 0.001).unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
+}
+
+/// Paso de zoom anterior a `z`.
+pub fn zoom_out(z: f32) -> f32 {
+    ZOOM_STEPS.iter().rev().copied().find(|s| *s < z - 0.001).unwrap_or(ZOOM_STEPS[0])
+}
+
+/// Zoom válido (dentro de 50%–200%; valores no finitos vuelven a 100%).
+pub fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() { z.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]) } else { 1.0 }
+}
+
+pub fn zoom_label(z: f32) -> String {
+    format!("{:.0}%", z * 100.0)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnStatus {
@@ -56,7 +86,80 @@ impl ConnStatus {
 pub struct ConnState {
     pub cfg: ConnectionConfig,
     pub status: ConnStatus,
-    pub schemas: Vec<SchemaInfo>,
+    /// Bases del servidor (vacío si no está conectada).
+    pub databases: Vec<DatabaseInfo>,
+    /// Bases cuyo esquema se está cargando.
+    pub loading: HashSet<String>,
+    /// Último error al cargar cada base.
+    pub db_errors: HashMap<String, String>,
+}
+
+impl ConnState {
+    pub fn new(cfg: ConnectionConfig) -> Self {
+        Self { cfg, status: ConnStatus::Disconnected, databases: Vec::new(), loading: HashSet::new(), db_errors: HashMap::new() }
+    }
+
+    fn clear(&mut self) {
+        self.databases.clear();
+        self.loading.clear();
+        self.db_errors.clear();
+    }
+
+    /// Base por defecto de la conexión (si está conectada).
+    pub fn default_db(&self) -> Option<&str> {
+        self.databases.iter().find(|d| d.current).map(|d| d.name.as_str())
+    }
+
+    /// Nombre real de `db` (`None` = la por defecto).
+    pub fn resolve_db<'a>(&'a self, db: Option<&'a str>) -> Option<&'a str> {
+        db.filter(|d| !d.is_empty()).or_else(|| self.default_db())
+    }
+
+    pub fn database(&self, db: Option<&str>) -> Option<&DatabaseInfo> {
+        let name = self.resolve_db(db)?;
+        self.databases.iter().find(|d| d.name == name)
+    }
+
+    /// Esquemas de `db` si ya están cargados.
+    pub fn schemas(&self, db: Option<&str>) -> Option<&[SchemaInfo]> {
+        self.database(db)?.schemas.as_deref()
+    }
+
+    fn summary(&self) -> ConnSummary {
+        ConnSummary {
+            id: self.cfg.id,
+            name: self.cfg.name.clone(),
+            driver: self.cfg.driver,
+            status: self.status.kind(),
+            databases: self.databases.iter().map(|d| d.name.clone()).collect(),
+            default_db: self.default_db().map(str::to_string),
+        }
+    }
+}
+
+/// Acción que espera confirmación porque descartaría cambios sin guardar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Discard {
+    Close(u64),
+    CloseAll,
+    Reload(u64),
+    Run(u64, bool),
+}
+
+/// Ventana "Preview pending changes".
+struct PreviewState {
+    console: u64,
+    view: usize,
+    statements: Vec<String>,
+    error: Option<String>,
+    applying: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemoEdit {
+    Cell,
+    Changes,
+    Preview,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,6 +170,9 @@ struct PersistedConsole {
     /// (esquema, tabla) si la pestaña es un editor de datos.
     #[serde(default)]
     table: Option<(String, String)>,
+    /// Base de datos de la pestaña (`None` = la por defecto de la conexión).
+    #[serde(default)]
+    db: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,6 +187,8 @@ struct Persisted {
     console_counter: u64,
     show_explorer: bool,
     show_results: bool,
+    /// Zoom del IDE (1.0 = 100%).
+    zoom: f32,
 }
 
 impl Default for Persisted {
@@ -94,6 +202,7 @@ impl Default for Persisted {
             console_counter: 0,
             show_explorer: true,
             show_results: true,
+            zoom: 1.0,
         }
     }
 }
@@ -123,6 +232,13 @@ pub struct DataCraftApp {
     last_conn_id: u64,
     /// Modo demo: abrir el editor de datos de la primera tabla al conectar.
     demo_pending: bool,
+    /// Modo demo: cambios simulados a aplicar al cargar el editor de datos.
+    demo_edit: Option<DemoEdit>,
+    /// Zoom del IDE y el último aplicado al contexto.
+    zoom: f32,
+    applied_zoom: Option<f32>,
+    preview: Option<PreviewState>,
+    confirm_discard: Option<Discard>,
 }
 
 impl DataCraftApp {
@@ -138,7 +254,7 @@ impl DataCraftApp {
         } else {
             config::load_connections()
                 .into_iter()
-                .map(|cfg| ConnState { cfg, status: ConnStatus::Disconnected, schemas: Vec::new() })
+                .map(ConnState::new)
                 .collect()
         };
         let last_conn_id = conns.iter().map(|c| c.cfg.id).max().unwrap_or(0);
@@ -166,14 +282,23 @@ impl DataCraftApp {
             status_msg: None,
             last_conn_id,
             demo_pending: false,
+            demo_edit: None,
+            zoom: clamp_zoom(persisted.zoom),
+            applied_zoom: None,
+            preview: None,
+            confirm_discard: None,
         };
         for pc in persisted.consoles {
             let conn = pc.conn.filter(|id| app.conns.iter().any(|c| c.cfg.id == *id));
             let id = app.alloc_console_id();
             match (pc.table, conn) {
-                (Some((schema, table)), Some(conn)) => app.consoles.push(Console::new_table(id, conn, schema, table)),
+                (Some((schema, table)), Some(conn)) => app.consoles.push(Console::new_table(id, conn, pc.db, schema, table)),
                 (Some(_), None) => {}
-                (None, _) => app.consoles.push(Console::new(id, pc.title, pc.text, conn)),
+                (None, _) => {
+                    let mut c = Console::new(id, pc.title, pc.text, conn);
+                    c.db = pc.db.filter(|_| conn.is_some());
+                    app.consoles.push(c);
+                }
             }
         }
         if app.consoles.is_empty() && demo.is_none() {
@@ -186,6 +311,10 @@ impl DataCraftApp {
         }
         theme::apply(&cc.egui_ctx, app.dark);
         app.applied_dark = Some(app.dark);
+        // El zoom por teclado lo gestiona la app (⌘= / ⌘- / ⌘0) para no aplicarlo dos veces.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        cc.egui_ctx.set_zoom_factor(app.zoom);
+        app.applied_zoom = Some(app.zoom);
         app
     }
 
@@ -195,13 +324,22 @@ impl DataCraftApp {
         let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
         cfg.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
         cfg.file_path = path.to_string();
-        self.conns.push(ConnState { cfg, status: ConnStatus::Disconnected, schemas: Vec::new() });
+        self.conns.push(ConnState::new(cfg));
         self.explorer.expanded.insert(format!("c:{id}"));
         self.explorer.selected = Some(format!("c:{id}"));
         self.dark = std::env::var("DATACRAFT_DEMO_DARK").is_ok_and(|v| v == "1");
         if std::env::var("DATACRAFT_DEMO_DIALOG").is_ok_and(|v| v == "1") {
             self.open_new_connection_dialog();
         }
+        if let Some(z) = std::env::var("DATACRAFT_DEMO_ZOOM").ok().and_then(|v| v.trim().trim_end_matches('%').parse::<f32>().ok()) {
+            self.zoom = clamp_zoom(z / 100.0);
+        }
+        self.demo_edit = match std::env::var("DATACRAFT_DEMO_EDIT").as_deref() {
+            Ok("cell") => Some(DemoEdit::Cell),
+            Ok("changes") => Some(DemoEdit::Changes),
+            Ok("preview") => Some(DemoEdit::Preview),
+            _ => None,
+        };
         let idx = self.new_console(Some(id), None, "SELECT o.id, u.name, o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\nORDER BY o.total DESC;\n".into());
         self.run_console(idx, true);
         // El editor de datos de la primera tabla se abre al llegar el esquema.
@@ -253,16 +391,39 @@ impl DataCraftApp {
         }
     }
 
-    /// Columnas conocidas de una tabla (para claves primarias y DDL).
-    fn table_columns(&self, conn: ConnId, schema: &str, table: &str) -> Option<&[ColumnInfo]> {
-        self.conn(conn)?
-            .schemas
-            .iter()
-            .find(|s| s.name == schema)?
-            .tables
-            .iter()
-            .find(|t| t.name == table)
-            .map(|t| t.columns.as_slice())
+    /// Tabla conocida de una base (para claves primarias, DDL y edición).
+    fn table_info(&self, conn: ConnId, db: Option<&str>, schema: &str, table: &str) -> Option<&TableInfo> {
+        self.conn(conn)?.schemas(db)?.iter().find(|s| s.name == schema)?.tables.iter().find(|t| t.name == table)
+    }
+
+    fn table_columns(&self, conn: ConnId, db: Option<&str>, schema: &str, table: &str) -> Option<&[ColumnInfo]> {
+        self.table_info(conn, db, schema, table).map(|t| t.columns.as_slice())
+    }
+
+    /// Pide el esquema de una base al worker.
+    fn load_database(&mut self, conn: ConnId, db: String) {
+        let Some(c) = self.conn_mut(conn) else { return };
+        if !matches!(c.status, ConnStatus::Connected) || c.loading.contains(&db) {
+            return;
+        }
+        c.loading.insert(db.clone());
+        c.db_errors.remove(&db);
+        self.worker.send(Request::LoadDatabase { conn, db });
+    }
+
+    /// Carga la base si aún no lo está (autocompletado y editores de datos).
+    fn ensure_db_loaded(&mut self, conn: ConnId, db: Option<&str>) {
+        let Some(c) = self.conn(conn) else { return };
+        if !matches!(c.status, ConnStatus::Connected) {
+            return;
+        }
+        let Some(name) = c.resolve_db(db).map(str::to_string) else { return };
+        let needs = c.databases.iter().any(|d| d.name == name && d.schemas.is_none())
+            && !c.loading.contains(&name)
+            && !c.db_errors.contains_key(&name);
+        if needs {
+            self.load_database(conn, name);
+        }
     }
 
     // ---------------------------------------------------------------- conexión
@@ -281,7 +442,7 @@ impl DataCraftApp {
     fn disconnect(&mut self, id: ConnId) {
         if let Some(c) = self.conn_mut(id) {
             c.status = ConnStatus::Disconnected;
-            c.schemas.clear();
+            c.clear();
             self.worker.send(Request::Disconnect(id));
         }
         // Lo que esperaba a esta conexión ya no se va a ejecutar.
@@ -295,33 +456,45 @@ impl DataCraftApp {
     fn handle_responses(&mut self) {
         for resp in self.worker.poll() {
             match resp {
-                Response::Connected { conn, schemas } => {
+                Response::Connected { conn, databases } => {
                     // Respuesta obsoleta: la conexión se desconectó, editó o borró mientras conectaba.
                     if !self.conn(conn).is_some_and(|c| c.status == ConnStatus::Connecting) {
                         self.worker.send(Request::Disconnect(conn));
                         continue;
                     }
+                    let mut default_db = None;
                     if let Some(c) = self.conn_mut(conn) {
                         c.status = ConnStatus::Connected;
-                        c.schemas = schemas;
+                        c.clear();
+                        c.databases = databases;
+                        default_db = c.default_db().map(str::to_string);
+                    }
+                    if let Some(db) = &default_db {
+                        self.explorer.expanded.insert(explorer::db_key(conn, db));
                     }
                     let max_rows = self.max_rows;
                     for console in self.consoles.iter_mut().filter(|c| c.conn == Some(conn)) {
                         if let Some(statements) = console.pending.take() {
                             console.running = true;
-                            self.worker.send(Request::Execute { conn, console: console.id, statements, max_rows });
+                            let db = console.db.clone();
+                            self.worker.send(Request::Execute { conn, db, console: console.id, statements, max_rows });
                         }
                     }
+                    self.recheck_edit_targets(conn);
                     if self.demo_pending {
                         self.demo_pending = false;
                         let first = self.conn(conn).and_then(|c| {
-                            c.schemas.iter().find_map(|s| s.tables.first().map(|t| (s.name.clone(), t.name.clone())))
+                            let db = c.default_db()?.to_string();
+                            c.schemas(None)?
+                                .iter()
+                                .find_map(|s| s.tables.first().map(|t| (db.clone(), s.name.clone(), t.name.clone())))
                         });
-                        if let Some((schema, table)) = first {
-                            self.explorer.expanded.insert(format!("t:{conn}:{schema}:{table}"));
-                            self.explorer.selected = Some(format!("t:{conn}:{schema}:{table}"));
-                            self.explorer.selected_table = Some(TableRef { conn, schema: schema.clone(), table: table.clone() });
-                            self.open_table(&TableRef { conn, schema, table });
+                        if let Some((db, schema, table)) = first {
+                            let tref = TableRef { conn, db, schema, table };
+                            self.explorer.expanded.insert(explorer::table_key(&tref));
+                            self.explorer.selected = Some(explorer::table_key(&tref));
+                            self.explorer.selected_table = Some(tref.clone());
+                            self.open_table(&tref);
                         }
                         if std::env::var("DATACRAFT_DEMO_TAB").is_ok_and(|v| v == "console") {
                             self.active = 0;
@@ -363,14 +536,26 @@ impl DataCraftApp {
                         && c.status != ConnStatus::Connecting
                     {
                         c.status = ConnStatus::Disconnected;
-                        c.schemas.clear();
+                        c.clear();
                     }
                 }
-                Response::Schema { conn, schemas } => {
+                Response::Refreshed { conn, databases } => self.refreshed(conn, databases),
+                Response::DatabaseLoaded { conn, db, result } => {
                     if let Some(c) = self.conn_mut(conn) {
-                        c.schemas = schemas;
+                        c.loading.remove(&db);
+                        match result {
+                            Ok(schemas) => {
+                                c.db_errors.remove(&db);
+                                if let Some(d) = c.databases.iter_mut().find(|d| d.name == db) {
+                                    d.schemas = Some(schemas);
+                                }
+                            }
+                            Err(e) => {
+                                c.db_errors.insert(db.clone(), e);
+                            }
+                        }
                     }
-                    self.info("Esquema actualizado");
+                    self.recheck_edit_targets(conn);
                 }
                 Response::Executed { console, results, error, elapsed } => {
                     self.result_salt += 1;
@@ -378,6 +563,249 @@ impl DataCraftApp {
                     if let Some(c) = self.console_by_id(console) {
                         apply_execution(c, results, error, elapsed, salt);
                     }
+                    self.attach_edit_targets(console);
+                    self.apply_demo_edit(console);
+                }
+                Response::ChangesApplied { console, result } => self.changes_applied(console, result),
+            }
+        }
+    }
+
+    /// Lista de bases nueva tras refrescar: se conservan los esquemas ya cargados mientras
+    /// se vuelven a pedir.
+    fn refreshed(&mut self, conn: ConnId, mut databases: Vec<DatabaseInfo>) {
+        let Some(c) = self.conn_mut(conn) else { return };
+        let mut reload = Vec::new();
+        for d in &mut databases {
+            if d.schemas.is_some() {
+                continue;
+            }
+            if let Some(old) = c.databases.iter_mut().find(|o| o.name == d.name)
+                && let Some(schemas) = old.schemas.take()
+            {
+                d.schemas = Some(schemas);
+                reload.push(d.name.clone());
+            }
+        }
+        c.databases = databases;
+        c.db_errors.clear();
+        let names: HashSet<String> = c.databases.iter().map(|d| d.name.clone()).collect();
+        c.loading.retain(|d| names.contains(d));
+        for db in &reload {
+            c.loading.remove(db);
+        }
+        for db in reload {
+            self.load_database(conn, db);
+        }
+        self.recheck_edit_targets(conn);
+        self.info("Esquema actualizado");
+    }
+
+    /// Vuelve a decidir si son editables los resultados de solo lectura de una conexión
+    /// (p.ej. cuando llega el esquema de su base).
+    fn recheck_edit_targets(&mut self, conn: ConnId) {
+        let ids: Vec<u64> = self.consoles.iter().filter(|c| c.conn == Some(conn)).map(|c| c.id).collect();
+        for id in ids {
+            if let Some(c) = self.console_by_id(id) {
+                for v in c.results.iter_mut().filter(|v| v.edit.is_none()) {
+                    v.edit_checked = false;
+                }
+            }
+            self.attach_edit_targets(id);
+        }
+    }
+
+    /// Decide qué resultados nuevos de una pestaña se pueden editar.
+    fn attach_edit_targets(&mut self, console: u64) {
+        let Some(idx) = self.consoles.iter().position(|c| c.id == console) else { return };
+        let c = &self.consoles[idx];
+        let mut targets = Vec::new();
+        for (i, v) in c.results.iter().enumerate() {
+            if v.edit_checked || v.rs.is_command() {
+                continue;
+            }
+            let target = match (c.conn, &c.table) {
+                (None, _) => Err("Sin conexión".to_string()),
+                (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
+                    Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
+                    None => Err("Estructura de la tabla aún no cargada".to_string()),
+                },
+                (Some(conn), None) => match self.conn(conn).and_then(|cs| cs.schemas(c.db.as_deref())) {
+                    Some(schemas) => editing::console_target(&v.rs.statement, &v.rs.columns, schemas),
+                    None => Err("Esquema de la base aún no cargado".to_string()),
+                },
+            };
+            targets.push((i, target));
+        }
+        let c = &mut self.consoles[idx];
+        for (i, t) in targets {
+            if let Some(v) = c.results.get_mut(i) {
+                v.set_edit_target(t);
+            }
+        }
+    }
+
+    /// Modo demo: cambios simulados (nunca se guardan) sobre el primer editor de datos.
+    fn apply_demo_edit(&mut self, console: u64) {
+        let Some(kind) = self.demo_edit else { return };
+        let Some(idx) = self.consoles.iter().position(|c| c.id == console && c.table.is_some()) else { return };
+        let Some(v) = self.consoles[idx].results.last_mut() else { return };
+        if v.edit.is_none() {
+            return;
+        }
+        self.demo_edit = None;
+        self.active = idx;
+        let n_cols = v.rs.columns.len();
+        let last = n_cols.saturating_sub(1);
+        if kind == DemoEdit::Cell {
+            v.begin_edit(1, last);
+            return;
+        }
+        if let Some(e) = v.edit.as_mut() {
+            let t = e.target.clone();
+            e.state.set_value(&v.rs, RowRef::Existing(0), last, Some("editado".into()));
+            e.state.set_value(&v.rs, RowRef::Existing(2), 2.min(last), None);
+            e.state.set_value(&v.rs, RowRef::Existing(4), last, Some("nota nueva".into()));
+            let n = e.state.add_row(n_cols);
+            e.state.set_value(&v.rs, RowRef::New(n), last, Some("fila nueva".into()));
+            e.state.delete_rows(&v.rs, &t, &[RowRef::Existing(3)]);
+        }
+        if kind == DemoEdit::Preview {
+            let vi = self.consoles[idx].results.len() - 1;
+            self.open_preview(idx, vi);
+        }
+    }
+
+    // ---------------------------------------------------------------- edición de datos
+
+    /// Abre la ventana de previsualización con el SQL de los cambios pendientes.
+    fn open_preview(&mut self, idx: usize, view: usize) {
+        let Some(c) = self.consoles.get_mut(idx) else { return };
+        let Some(v) = c.results.get_mut(view) else { return };
+        v.finish_inline_edit();
+        let Some(e) = v.edit.as_ref() else { return };
+        if !e.state.is_dirty() {
+            return;
+        }
+        let driver = c.conn.and_then(|id| self.conns.iter().find(|x| x.cfg.id == id)).map(|x| x.cfg.driver).unwrap_or(Driver::Postgres);
+        let (statements, error) = match e.state.build_changes(&v.rs, &e.target) {
+            Ok(changes) => (changes.iter().map(|ch| edit::change_sql(driver, &e.target.schema, &e.target.table, ch)).collect(), None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
+        self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false });
+    }
+
+    /// Envía los cambios de la previsualización en una transacción.
+    fn submit_preview(&mut self) {
+        let Some(pv) = self.preview.as_ref() else { return };
+        if pv.applying || pv.statements.is_empty() {
+            return;
+        }
+        let (console, statements) = (pv.console, pv.statements.clone());
+        let Some(c) = self.consoles.iter().find(|c| c.id == console) else {
+            self.preview = None;
+            return;
+        };
+        let (conn, db, busy) = (c.conn, c.db.clone(), c.is_busy());
+        let connected = conn.and_then(|id| self.conn(id)).is_some_and(|c| matches!(c.status, ConnStatus::Connected));
+        let Some(pv) = self.preview.as_mut() else { return };
+        match conn {
+            _ if busy => pv.error = Some("La pestaña está ejecutando otra operación".into()),
+            Some(conn) if connected => {
+                pv.applying = true;
+                pv.error = None;
+                if let Some(c) = self.console_by_id(console) {
+                    c.running = true;
+                    c.run_started = Some(Instant::now());
+                }
+                self.worker.send(Request::ApplyChanges { conn, db, console, statements });
+            }
+            _ => pv.error = Some("La conexión no está abierta; conéctala y vuelve a intentarlo".into()),
+        }
+    }
+
+    fn changes_applied(&mut self, console: u64, result: Result<u64, String>) {
+        let preview_view = self.preview.as_ref().filter(|p| p.console == console).map(|p| p.view);
+        let Some(idx) = self.consoles.iter().position(|c| c.id == console) else {
+            self.preview = None;
+            return;
+        };
+        let c = &mut self.consoles[idx];
+        c.running = false;
+        c.run_started = None;
+        match result {
+            Ok(n) => {
+                if preview_view.is_some() {
+                    self.preview = None;
+                }
+                let msg = if n == 1 { "1 fila modificada".to_string() } else { format!("{n} filas modificadas") };
+                c.log.push(OutputEntry { time: now(), statement: String::new(), message: msg.clone(), is_error: false });
+                let vi = preview_view.or_else(|| c.edit_view_index());
+                if let Some(v) = vi.and_then(|i| c.results.get_mut(i)) {
+                    v.discard_edits();
+                }
+                self.info(msg);
+                // Recarga los datos de esa pestaña.
+                let c = &mut self.consoles[idx];
+                if c.table.is_some() {
+                    self.reload_table(idx);
+                } else if let Some(i) = vi
+                    && let Some(stmt) = c.results.get(i).map(|v| v.rs.statement.clone())
+                {
+                    c.replace_view = Some(i);
+                    self.run_statements(idx, vec![stmt]);
+                }
+            }
+            Err(e) => {
+                c.log.push(OutputEntry {
+                    time: now(),
+                    statement: String::new(),
+                    message: format!("No se guardaron los cambios: {e}"),
+                    is_error: true,
+                });
+                match self.preview.as_mut().filter(|p| p.console == console) {
+                    Some(pv) => {
+                        pv.applying = false;
+                        pv.error = Some(e);
+                    }
+                    None => self.error(format!("No se guardaron los cambios: {e}")),
+                }
+            }
+        }
+    }
+
+    /// true si la acción puede seguir ya; si hay cambios sin guardar, pide confirmación.
+    fn guard(&mut self, action: Discard) -> bool {
+        let dirty = match action {
+            Discard::CloseAll => self.consoles.iter().any(|c| c.has_pending_edits()),
+            Discard::Close(id) | Discard::Reload(id) | Discard::Run(id, _) => {
+                self.consoles.iter().any(|c| c.id == id && c.has_pending_edits())
+            }
+        };
+        if dirty {
+            self.confirm_discard = Some(action);
+        }
+        !dirty
+    }
+
+    /// Ejecuta una acción confirmada descartando los cambios pendientes.
+    fn discard_and_do(&mut self, action: Discard) {
+        match action {
+            Discard::CloseAll => {
+                self.consoles.clear();
+                self.active = 0;
+            }
+            Discard::Close(id) => {
+                if let Some(i) = self.consoles.iter().position(|c| c.id == id) {
+                    self.close_console_now(i);
+                }
+            }
+            Discard::Reload(id) | Discard::Run(id, _) => {
+                let Some(i) = self.consoles.iter().position(|c| c.id == id) else { return };
+                self.consoles[i].discard_edits();
+                match action {
+                    Discard::Run(_, all) => self.run_console(i, all),
+                    _ => self.reload_table(i),
                 }
             }
         }
@@ -387,10 +815,20 @@ impl DataCraftApp {
 
     fn run_console(&mut self, idx: usize, all: bool) {
         let Some(console) = self.consoles.get(idx) else { return };
-        if console.table.is_some() {
-            self.reload_table(idx);
+        let id = console.id;
+        if console.is_busy() {
             return;
         }
+        if console.table.is_some() {
+            if self.guard(Discard::Reload(id)) {
+                self.reload_table(idx);
+            }
+            return;
+        }
+        if !self.guard(Discard::Run(id, all)) {
+            return;
+        }
+        let Some(console) = self.consoles.get(idx) else { return };
         let conn_id = console.conn;
         let driver = conn_id.and_then(|id| self.conn(id)).map(|c| c.cfg.driver).unwrap_or(Driver::Postgres);
         let statements: Vec<String> = if all {
@@ -435,7 +873,8 @@ impl DataCraftApp {
             ConnStatus::Connected => {
                 console.running = true;
                 let id = console.id;
-                self.worker.send(Request::Execute { conn, console: id, statements, max_rows });
+                let db = console.db.clone();
+                self.worker.send(Request::Execute { conn, db, console: id, statements, max_rows });
             }
             ConnStatus::Connecting => console.pending = Some(statements),
             ConnStatus::Disconnected | ConnStatus::Error(_) => {
@@ -447,15 +886,21 @@ impl DataCraftApp {
 
     /// Abre (o activa) el editor de datos de una tabla.
     fn open_table(&mut self, t: &TableRef) {
+        let default_db = self.conn(t.conn).and_then(|c| c.default_db()).map(str::to_string);
         if let Some(i) = self.consoles.iter().position(|c| {
-            c.conn == Some(t.conn) && c.table.as_ref().is_some_and(|x| x.schema == t.schema && x.table == t.table)
+            c.conn == Some(t.conn)
+                && c.db.as_ref().or(default_db.as_ref()) == Some(&t.db)
+                && c.table.as_ref().is_some_and(|x| x.schema == t.schema && x.table == t.table)
         }) {
             self.active = i;
-            self.reload_table(i);
+            // Con cambios pendientes solo se activa (recargar los descartaría).
+            if !self.consoles[i].has_pending_edits() && !self.consoles[i].is_busy() {
+                self.reload_table(i);
+            }
             return;
         }
         let id = self.alloc_console_id();
-        self.consoles.push(Console::new_table(id, t.conn, t.schema.clone(), t.table.clone()));
+        self.consoles.push(Console::new_table(id, t.conn, Some(t.db.clone()), t.schema.clone(), t.table.clone()));
         self.active = self.consoles.len() - 1;
         self.reload_table(self.active);
     }
@@ -475,7 +920,7 @@ impl DataCraftApp {
     fn generate(&mut self, ctx: &egui::Context, t: &TableRef, kind: Generate) {
         let Some(c) = self.conn(t.conn) else { return };
         let driver = c.cfg.driver;
-        let Some(columns) = self.table_columns(t.conn, &t.schema, &t.table) else {
+        let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table) else {
             return;
         };
         let cols: Vec<String> = columns.iter().map(|c| quote_ident_if_needed(driver, &c.name)).collect();
@@ -489,16 +934,20 @@ impl DataCraftApp {
             Generate::Select => format!("SELECT {}\nFROM {table};", cols.join(", ")),
             Generate::Ddl => ddl(driver, &table, columns),
         };
+        let default_db = c.default_db().map(str::to_string);
         let target = self
             .consoles
             .get(self.active)
-            .filter(|c| c.conn == Some(t.conn) && c.table.is_none())
+            .filter(|c| {
+                c.conn == Some(t.conn) && c.table.is_none() && c.db.as_ref().or(default_db.as_ref()) == Some(&t.db)
+            })
             .map(|_| self.active);
         match target {
             Some(i) => self.consoles[i].append_text(ctx, &text),
             None => {
                 let title = (kind == Generate::Ddl).then(|| format!("{}.sql", t.table));
-                self.new_console(Some(t.conn), title, text);
+                let i = self.new_console(Some(t.conn), title, text);
+                self.consoles[i].db = Some(t.db.clone());
             }
         }
     }
@@ -521,13 +970,15 @@ impl DataCraftApp {
                         cfg.id = self.next_conn_id();
                         cfg.name = format!("{} (copia)", cfg.name);
                         config::store_password(cfg.id, &cfg.password);
-                        self.conns.push(ConnState { cfg, status: ConnStatus::Disconnected, schemas: Vec::new() });
+                        self.conns.push(ConnState::new(cfg));
                         self.persist_connections();
                     }
                 }
                 ExplorerAction::Delete(id) => self.confirm_delete = Some(id),
-                ExplorerAction::NewConsole(id) => {
-                    self.new_console(Some(id), None, String::new());
+                ExplorerAction::LoadDatabase(id, db) => self.load_database(id, db),
+                ExplorerAction::NewConsole(id, db) => {
+                    let i = self.new_console(Some(id), None, String::new());
+                    self.consoles[i].db = db;
                     if self.conn(id).is_some_and(|c| matches!(c.status, ConnStatus::Disconnected | ConnStatus::Error(_))) {
                         self.connect(id);
                     }
@@ -568,7 +1019,7 @@ impl DataCraftApp {
                 self.disconnect(id);
             }
         } else {
-            self.conns.push(ConnState { cfg, status: ConnStatus::Disconnected, schemas: Vec::new() });
+            self.conns.push(ConnState::new(cfg));
             if let Some(c) = self.consoles.get_mut(self.active)
                 && c.conn.is_none()
             {
@@ -585,6 +1036,7 @@ impl DataCraftApp {
         config::delete_password(id);
         for c in self.consoles.iter_mut().filter(|c| c.conn == Some(id)) {
             c.conn = None;
+            c.db = None;
             c.pending = None;
             c.run_started = None;
         }
@@ -607,8 +1059,9 @@ impl DataCraftApp {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let title = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-                let conn = self.consoles.get(self.active).and_then(|c| c.conn);
-                self.new_console(conn, title, text);
+                let (conn, db) = self.consoles.get(self.active).map(|c| (c.conn, c.db.clone())).unwrap_or_default();
+                let i = self.new_console(conn, title, text);
+                self.consoles[i].db = db;
             }
             Err(e) => self.error(format!("No se pudo abrir {}: {e}", path.display())),
         }
@@ -631,6 +1084,14 @@ impl DataCraftApp {
     }
 
     fn close_console(&mut self, idx: usize) {
+        if let Some(id) = self.consoles.get(idx).map(|c| c.id)
+            && self.guard(Discard::Close(id))
+        {
+            self.close_console_now(idx);
+        }
+    }
+
+    fn close_console_now(&mut self, idx: usize) {
         if idx < self.consoles.len() {
             self.consoles.remove(idx);
             if self.active > idx || self.active >= self.consoles.len() {
@@ -640,42 +1101,80 @@ impl DataCraftApp {
     }
 
     fn new_console_here(&mut self) {
-        let conn = self.consoles.get(self.active).and_then(|c| c.conn).or_else(|| self.conns.first().map(|c| c.cfg.id));
-        self.new_console(conn, None, String::new());
+        let (conn, db) = match self.consoles.get(self.active).filter(|c| c.conn.is_some()) {
+            Some(c) => (c.conn, c.db.clone()),
+            None => (self.conns.first().map(|c| c.cfg.id), None),
+        };
+        let i = self.new_console(conn, None, String::new());
+        self.consoles[i].db = db;
     }
 
     // ---------------------------------------------------------------- UI
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() || self.confirm_delete.is_some() || self.show_about {
+        // Zoom del IDE (⌘= / ⌘+ / ⌘- / ⌘0) y fuente del editor (⌥⌘= / ⌥⌘-). Las variantes con
+        // ⌥ van primero: `consume_key` ignora un ⌥ de más.
+        let (font_up, font_down, zoom_up, zoom_down, zoom_reset) = ctx.input_mut(|i| {
+            let alt = Modifiers::COMMAND | Modifiers::ALT;
+            let font_up = i.consume_key(alt, Key::Equals) || i.consume_key(alt, Key::Plus);
+            let font_down = i.consume_key(alt, Key::Minus);
+            let zoom_up = i.consume_key(Modifiers::COMMAND, Key::Equals) || i.consume_key(Modifiers::COMMAND, Key::Plus);
+            let zoom_down = i.consume_key(Modifiers::COMMAND, Key::Minus);
+            let zoom_reset = i.consume_key(Modifiers::COMMAND, Key::Num0);
+            (font_up, font_down, zoom_up, zoom_down, zoom_reset)
+        });
+        if font_up {
+            self.font_size = (self.font_size + 1.0).min(32.0);
+        }
+        if font_down {
+            self.font_size = (self.font_size - 1.0).max(8.0);
+        }
+        if zoom_up {
+            self.zoom = zoom_in(self.zoom);
+        }
+        if zoom_down {
+            self.zoom = zoom_out(self.zoom);
+        }
+        if zoom_reset {
+            self.zoom = 1.0;
+        }
+        if self.dialog.is_some()
+            || self.confirm_delete.is_some()
+            || self.show_about
+            || self.preview.is_some()
+            || self.confirm_discard.is_some()
+        {
             return;
         }
-        let (run_all, run, new_console, bigger, smaller, reload, quit) = ctx.input_mut(|i| {
+        let (run_all, run, new_console, reload, quit, save) = ctx.input_mut(|i| {
             let run_all = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
             let run = i.consume_key(Modifiers::COMMAND, Key::Enter);
             let new_console = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
-            let bigger = i.consume_key(Modifiers::COMMAND, Key::Equals) || i.consume_key(Modifiers::COMMAND, Key::Plus);
-            let smaller = i.consume_key(Modifiers::COMMAND, Key::Minus);
             let reload = i.consume_key(Modifiers::COMMAND, Key::R);
             let quit = i.consume_key(Modifiers::COMMAND, Key::Q);
-            (run_all, run, new_console, bigger, smaller, reload, quit)
+            let save = i.consume_key(Modifiers::COMMAND, Key::S);
+            (run_all, run, new_console, reload, quit, save)
         });
         if run_all {
             self.run_console(self.active, true);
         } else if run {
             self.run_console(self.active, false);
         }
-        if reload && self.consoles.get(self.active).is_some_and(|c| c.table.is_some()) {
+        if reload
+            && let Some(c) = self.consoles.get(self.active).filter(|c| c.table.is_some() && !c.is_busy())
+            && self.guard(Discard::Reload(c.id))
+        {
             self.reload_table(self.active);
+        }
+        if save
+            && let Some(c) = self.consoles.get(self.active)
+            && let Some(vi) = c.edit_view_index()
+            && !c.is_busy()
+        {
+            self.open_preview(self.active, vi);
         }
         if new_console {
             self.new_console_here();
-        }
-        if bigger {
-            self.font_size = (self.font_size + 1.0).min(32.0);
-        }
-        if smaller {
-            self.font_size = (self.font_size - 1.0).max(8.0);
         }
         if quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -733,15 +1232,39 @@ impl DataCraftApp {
         ui.checkbox(&mut self.show_explorer, "Database Explorer");
         ui.checkbox(&mut self.show_results, "Services (resultados)");
         ui.separator();
+        ui.menu_button(format!("Zoom IDE ({})", zoom_label(self.zoom)), |ui| self.zoom_menu(ui));
+        ui.separator();
         ui.label(RichText::new(format!("Fuente del editor: {:.0} pt", self.font_size)).small().color(p.muted));
-        if ui.add(egui::Button::new("Aumentar").shortcut_text("⌘+")).clicked() {
+        if ui.add(egui::Button::new("Aumentar").shortcut_text("⌥⌘+")).clicked() {
             self.font_size = (self.font_size + 1.0).min(32.0);
         }
-        if ui.add(egui::Button::new("Reducir").shortcut_text("⌘-")).clicked() {
+        if ui.add(egui::Button::new("Reducir").shortcut_text("⌥⌘-")).clicked() {
             self.font_size = (self.font_size - 1.0).max(8.0);
         }
         if ui.button("Restablecer").clicked() {
             self.font_size = DEFAULT_FONT_SIZE;
+        }
+    }
+
+    /// Submenú "Zoom IDE": acercar, alejar, restablecer y pasos fijos.
+    fn zoom_menu(&mut self, ui: &mut Ui) {
+        ui.set_min_width(180.0);
+        if ui.add_enabled(self.zoom < ZOOM_STEPS[ZOOM_STEPS.len() - 1], egui::Button::new("Acercar").shortcut_text("⌘+")).clicked() {
+            self.zoom = zoom_in(self.zoom);
+        }
+        if ui.add_enabled(self.zoom > ZOOM_STEPS[0], egui::Button::new("Alejar").shortcut_text("⌘-")).clicked() {
+            self.zoom = zoom_out(self.zoom);
+        }
+        if ui.add(egui::Button::new("Restablecer (100%)").shortcut_text("⌘0")).clicked() {
+            self.zoom = 1.0;
+            ui.close();
+        }
+        ui.separator();
+        for z in ZOOM_STEPS {
+            if ui.radio((self.zoom - z).abs() < 0.001, zoom_label(z)).clicked() {
+                self.zoom = z;
+                ui.close();
+            }
         }
     }
 
@@ -760,7 +1283,9 @@ impl DataCraftApp {
         let fullscreen = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(if fullscreen { 10.0 } else { 80.0 });
+            // Hueco de los semáforos: 80 pt de pantalla, sea cual sea el zoom del IDE.
+            let zoom = ui.ctx().zoom_factor().max(0.1);
+            ui.add_space(if fullscreen { 10.0 } else { 80.0 / zoom });
 
             // Widget de proyecto: cuadrado morado con la inicial + nombre + chevron.
             let font = theme::bold(13.0);
@@ -786,8 +1311,9 @@ impl DataCraftApp {
 
             // Selector de la conexión de la pestaña activa.
             let current = self.consoles.get(self.active).and_then(|c| c.conn).and_then(|id| self.conn(id));
+            let active_db = self.consoles.get(self.active).and_then(|c| c.db.clone());
             let (ico, label) = match current {
-                Some(c) => (Ico::Driver(c.cfg.driver), c.cfg.name.clone()),
+                Some(c) => (Ico::Driver(c.cfg.driver), c.summary().label(active_db.as_deref())),
                 None => (Ico::Database, "Sin conexión".into()),
             };
             let busy = self.consoles.get(self.active).is_some_and(|c| c.is_busy() || c.table.is_some());
@@ -850,6 +1376,7 @@ impl DataCraftApp {
                 return;
             }
             c.conn = Some(id);
+            c.db = None;
             c.pending = None;
             c.run_started = None;
         } else {
@@ -929,7 +1456,7 @@ impl DataCraftApp {
         egui::Popup::menu(&structure).show(|ui| {
             let cols = self.consoles.get(self.active).and_then(|c| {
                 let t = c.table.as_ref()?;
-                self.table_columns(c.conn?, &t.schema, &t.table)
+                self.table_columns(c.conn?, c.db.as_deref(), &t.schema, &t.table)
             });
             match cols {
                 Some(cols) => {
@@ -955,11 +1482,17 @@ impl DataCraftApp {
             let mut crumbs: Vec<(Option<Ico>, String)> = vec![(None, "Database".into())];
             if let Some(c) = conn {
                 crumbs.push((Some(Ico::Driver(c.cfg.driver)), c.cfg.name.clone()));
+                if let Some(db) = c.resolve_db(console.and_then(|x| x.db.as_deref())) {
+                    crumbs.push((Some(Ico::Database), db.to_string()));
+                }
             }
             if let Some(c) = console {
                 match &c.table {
                     Some(t) => {
-                        crumbs.push((Some(Ico::Schema), t.schema.clone()));
+                        // SQLite: esquema "main" igual que la base (el explorador también lo omite).
+                        if conn.is_none_or(|x| x.cfg.driver != Driver::Sqlite) {
+                            crumbs.push((Some(Ico::Schema), t.schema.clone()));
+                        }
                         crumbs.push((Some(Ico::Folder), "tables".into()));
                         crumbs.push((Some(Ico::Table), t.table.clone()));
                     }
@@ -992,6 +1525,12 @@ impl DataCraftApp {
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                 icons::paint(ui.painter(), r, Ico::Lock, p.text_muted, &p, true);
                 ui.add_space(6.0);
+                if (self.zoom - 1.0).abs() > 0.001 {
+                    let resp = theme::flat_button(ui, None, &zoom_label(self.zoom), FontId::proportional(12.5), false, true)
+                        .on_hover_text("Zoom del IDE (⌘0 para restablecer)");
+                    egui::Popup::menu(&resp).show(|ui| self.zoom_menu(ui));
+                    ui.add_space(4.0);
+                }
                 ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
                 ui.style_mut().visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
@@ -1067,7 +1606,13 @@ impl DataCraftApp {
                             }
                             let ico = if c.table.is_some() { Ico::Table } else { Ico::Console };
                             let busy = c.is_busy();
-                            let title = if busy { format!("{} …", c.title) } else { c.title.clone() };
+                            let title = if busy {
+                                format!("{} …", c.title)
+                            } else if c.has_pending_edits() {
+                                format!("{} *", c.title)
+                            } else {
+                                c.title.clone()
+                            };
                             let (resp, closed) = theme::tab(ui, i == self.active, Some(ico), &title, true);
                             if closed {
                                 close = Some(i);
@@ -1132,7 +1677,7 @@ impl DataCraftApp {
         if let Some(i) = close {
             self.close_console(i);
         }
-        if close_all {
+        if close_all && self.guard(Discard::CloseAll) {
             self.consoles.clear();
             self.active = 0;
         }
@@ -1150,8 +1695,16 @@ impl DataCraftApp {
         {
             self.reload_table(self.active);
         }
+        // Esquema de la base de la pestaña (autocompletado, claves y edición).
+        if let Some(c) = self.consoles.get(self.active)
+            && let Some(conn) = c.conn
+        {
+            let db = c.db.clone();
+            self.ensure_db_loaded(conn, db.as_deref());
+        }
         let is_console = self.consoles.get(self.active).is_some_and(|c| c.table.is_none());
         let mut actions = Vec::new();
+        let conn_list = self.conn_list();
 
         if is_console && self.show_results {
             egui::Panel::bottom(egui::Id::new("results_island"))
@@ -1164,15 +1717,15 @@ impl DataCraftApp {
                     theme::island_frame(&p).show(ui, |ui| {
                         ui.set_min_size(ui.available_size());
                         let idx = self.active;
-                        let (conn_list, cx_columns) = (self.conn_list(), None);
-                        let conn = self.consoles[idx].conn.and_then(|id| self.conns.iter().find(|c| c.cfg.id == id));
+                        let console = &self.consoles[idx];
+                        let conn = console.conn.and_then(|id| self.conns.iter().find(|c| c.cfg.id == id));
                         let cx = ConsoleCtx {
                             connections: &conn_list,
-                            schemas: conn.map(|c| c.schemas.as_slice()),
+                            schemas: conn.and_then(|c| c.schemas(console.db.as_deref())),
                             driver: conn.map(|c| c.cfg.driver).unwrap_or(Driver::Postgres),
                             dark: self.dark,
                             font_size: self.font_size,
-                            columns: cx_columns,
+                            columns: None,
                         };
                         actions.extend(self.consoles[idx].show_results(ui, &cx));
                     });
@@ -1198,21 +1751,21 @@ impl DataCraftApp {
             }
             let idx = self.active.min(self.consoles.len() - 1);
             self.active = idx;
-            let conn_list = self.conn_list();
-            let conn_id = self.consoles[idx].conn;
-            let conn = conn_id.and_then(|id| self.conns.iter().find(|c| c.cfg.id == id));
-            let columns = match (&self.consoles[idx].table, conn) {
-                (Some(t), Some(c)) => c
-                    .schemas
+            let console = &self.consoles[idx];
+            let conn = console.conn.and_then(|id| self.conns.iter().find(|c| c.cfg.id == id));
+            let schemas = conn.and_then(|c| c.schemas(console.db.as_deref()));
+            let columns = console.table.as_ref().and_then(|t| {
+                schemas?
                     .iter()
-                    .find(|s| s.name == t.schema)
-                    .and_then(|s| s.tables.iter().find(|x| x.name == t.table))
-                    .map(|t| t.columns.as_slice()),
-                _ => None,
-            };
+                    .find(|s| s.name == t.schema)?
+                    .tables
+                    .iter()
+                    .find(|x| x.name == t.table)
+                    .map(|t| t.columns.as_slice())
+            });
             let cx = ConsoleCtx {
                 connections: &conn_list,
-                schemas: conn.map(|c| c.schemas.as_slice()),
+                schemas,
                 driver: conn.map(|c| c.cfg.driver).unwrap_or(Driver::Postgres),
                 dark: self.dark,
                 font_size: self.font_size,
@@ -1228,23 +1781,31 @@ impl DataCraftApp {
             match a {
                 ConsoleAction::Run => self.run_console(idx, false),
                 ConsoleAction::RunAll => self.run_console(idx, true),
-                ConsoleAction::Reload => self.reload_table(idx),
+                ConsoleAction::Reload => {
+                    if let Some(id) = self.consoles.get(idx).map(|c| c.id)
+                        && self.guard(Discard::Reload(id))
+                    {
+                        self.reload_table(idx);
+                    }
+                }
                 ConsoleAction::Ddl => {
                     if let Some(c) = self.consoles.get(idx)
                         && let (Some(conn), Some(t)) = (c.conn, c.table.as_ref())
+                        && let Some(db) = self.conn(conn).and_then(|x| x.resolve_db(c.db.as_deref()))
                     {
-                        let tref = TableRef { conn, schema: t.schema.clone(), table: t.table.clone() };
+                        let tref = TableRef { conn, db: db.to_string(), schema: t.schema.clone(), table: t.table.clone() };
                         self.generate(ui.ctx(), &tref, Generate::Ddl);
                     }
                 }
                 ConsoleAction::Connect(id) => self.connect(id),
                 ConsoleAction::Error(e) => self.error(e),
+                ConsoleAction::Preview(view) => self.open_preview(idx, view),
             }
         }
     }
 
-    fn conn_list(&self) -> Vec<(ConnId, String, Driver, ConnStatusKind)> {
-        self.conns.iter().map(|c| (c.cfg.id, c.cfg.name.clone(), c.cfg.driver, c.status.kind())).collect()
+    fn conn_list(&self) -> Vec<ConnSummary> {
+        self.conns.iter().map(ConnState::summary).collect()
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1299,6 +1860,44 @@ impl DataCraftApp {
             }
         }
 
+        if let Some(action) = self.confirm_discard {
+            let mut decision = None;
+            egui::Modal::new(egui::Id::new("confirm_discard")).frame(frame).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new("Cambios sin guardar").font(theme::bold(15.0)));
+                ui.add_space(8.0);
+                let what = match action {
+                    Discard::Close(_) | Discard::CloseAll => "Al cerrar la pestaña",
+                    Discard::Reload(_) => "Al recargar los datos",
+                    Discard::Run(..) => "Al volver a ejecutar",
+                };
+                ui.label(format!("{what} se perderán los cambios pendientes del grid."));
+                ui.add_space(16.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if theme::primary_button(ui, "Descartar").clicked() {
+                        decision = Some(true);
+                    }
+                    if theme::secondary_button(ui, "Cancelar").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                decision = Some(false);
+            }
+            match decision {
+                Some(true) => {
+                    self.confirm_discard = None;
+                    self.discard_and_do(action);
+                }
+                Some(false) => self.confirm_discard = None,
+                None => {}
+            }
+        }
+
+        self.preview_dialog(ctx, frame);
+
         if self.show_about {
             let resp = egui::Modal::new(egui::Id::new("about")).frame(frame).show(ctx, |ui| {
                 ui.set_width(320.0);
@@ -1320,6 +1919,102 @@ impl DataCraftApp {
             if resp.inner || resp.should_close() {
                 self.show_about = false;
             }
+        }
+    }
+}
+
+impl DataCraftApp {
+    /// Ventana modal "Preview pending changes".
+    fn preview_dialog(&mut self, ctx: &egui::Context, frame: egui::Frame) {
+        let Some(pv) = self.preview.as_ref() else { return };
+        let p = palette(self.dark);
+        let n = pv.statements.len();
+        let applying = pv.applying;
+        let error = pv.error.clone();
+        let title = self
+            .consoles
+            .iter()
+            .find(|c| c.id == pv.console)
+            .and_then(|c| c.results.get(pv.view))
+            .and_then(|v| v.edit.as_ref())
+            .map(|e| format!("{}.{}", e.target.schema, e.target.table))
+            .unwrap_or_default();
+        let sql_text = pv.statements.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
+        let dark = self.dark;
+        let mut submit = false;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::new("preview_changes")).frame(frame).show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            let w = (screen.width() * 0.6).clamp(360.0, 860.0);
+            ui.set_width(w);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preview pending changes").font(theme::bold(15.0)));
+                ui.add_space(8.0);
+                let count = if n == 1 { "1 cambio".to_string() } else { format!("{n} cambios") };
+                ui.label(RichText::new(format!("{count} · {title}")).color(p.muted));
+            });
+            ui.add_space(10.0);
+            egui::Frame::NONE
+                .fill(p.editor_bg)
+                .stroke(egui::Stroke::new(1.0, p.control_border))
+                .corner_radius(6)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    let max_h = (screen.height() * 0.5).clamp(120.0, 520.0);
+                    egui::ScrollArea::both().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
+                            let mut job = sql::highlight(buf.as_str(), dark, FontId::monospace(12.5));
+                            job.wrap.max_width = f32::INFINITY;
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+                        let mut text = sql_text.as_str();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .id(egui::Id::new("preview_sql"))
+                                .code_editor()
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4)
+                                .layouter(&mut layouter),
+                        );
+                    });
+                });
+            if let Some(e) = &error {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(e).monospace().color(p.error)).wrap());
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, "Copiar SQL").clicked() {
+                    ui.ctx().copy_text(sql_text.clone());
+                }
+                if applying {
+                    ui.add_space(8.0);
+                    ui.add(egui::Spinner::new().size(14.0).color(p.muted));
+                    ui.label(RichText::new("Guardando…").color(p.muted));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add_enabled_ui(!applying && n > 0, |ui| {
+                        if theme::primary_button(ui, "Submit").clicked() {
+                            submit = true;
+                        }
+                    });
+                    ui.add_enabled_ui(!applying, |ui| {
+                        if theme::secondary_button(ui, "Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        });
+        if !applying && (resp.should_close() || ctx.input(|i| i.key_pressed(Key::Escape))) {
+            cancel = true;
+        }
+        if cancel {
+            self.preview = None;
+        } else if submit {
+            self.submit_preview();
         }
     }
 }
@@ -1456,6 +2151,22 @@ fn apply_execution(
         c.log.drain(..extra);
     }
 
+    // Recarga tras guardar cambios: sustituye solo el resultado editado.
+    let replace = c.replace_view.take();
+    if let Some(i) = replace
+        && error.is_none()
+        && i < c.results.len()
+        && results_in.len() == 1
+        && let Some(rs) = results_in.first().cloned()
+    {
+        let title = std::mem::take(&mut c.results[i].title);
+        c.results[i] = ResultView::new(rs, salt * 1000);
+        if !title.is_empty() {
+            c.results[i].title = title;
+        }
+        c.result_tab = ResultTab::Result(i);
+        return;
+    }
     let has_queries = results_in.iter().any(|r| !r.is_command());
     let mut views: Vec<ResultView> = Vec::new();
     let last_command = results_in.iter().rev().find(|r| r.is_command()).cloned();
@@ -1480,6 +2191,10 @@ fn apply_execution(
 impl eframe::App for DataCraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_responses();
+        if self.applied_zoom != Some(self.zoom) {
+            ctx.set_zoom_factor(self.zoom);
+            self.applied_zoom = Some(self.zoom);
+        }
         if self.applied_dark != Some(self.dark) {
             theme::apply(ctx, self.dark);
             self.applied_dark = Some(self.dark);
@@ -1492,8 +2207,10 @@ impl eframe::App for DataCraftApp {
         let p = palette(self.dark);
         let bar = egui::Frame::NONE.fill(p.main_bg);
 
+        // Con zoom < 100% la barra no baja de 32 pt de pantalla (semáforos de macOS).
+        let title_h = 40.0_f32.max(32.0 / ctx.zoom_factor().max(0.1));
         egui::Panel::top("title_bar")
-            .exact_size(40.0)
+            .exact_size(title_h)
             .resizable(false)
             .show_separator_line(false)
             .frame(bar)
@@ -1554,12 +2271,14 @@ impl eframe::App for DataCraftApp {
                     text: c.text.clone(),
                     conn: c.conn,
                     table: c.table.as_ref().map(|t| (t.schema.clone(), t.table.clone())),
+                    db: c.db.clone(),
                 })
                 .collect(),
             active: self.active,
             console_counter: self.console_counter,
             show_explorer: self.show_explorer,
             show_results: self.show_results,
+            zoom: self.zoom,
         };
         eframe::set_value(storage, STORAGE_KEY, &state);
     }
@@ -1572,6 +2291,25 @@ impl eframe::App for DataCraftApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasos_de_zoom() {
+        assert_eq!(zoom_in(1.0), 1.1);
+        assert_eq!(zoom_out(1.0), 0.9);
+        assert_eq!(zoom_in(2.0), 2.0);
+        assert_eq!(zoom_out(0.5), 0.5);
+        // Desde un valor intermedio va al paso más cercano en esa dirección.
+        assert_eq!(zoom_in(1.2), 1.25);
+        assert_eq!(zoom_out(1.2), 1.1);
+        assert_eq!(clamp_zoom(5.0), 2.0);
+        assert_eq!(clamp_zoom(f32::NAN), 1.0);
+        assert_eq!(zoom_label(1.25), "125%");
+        let mut z = 0.5;
+        for _ in 0..ZOOM_STEPS.len() {
+            z = zoom_in(z);
+        }
+        assert_eq!(z, 2.0);
+    }
 
     #[test]
     fn table_query_limits_rows_per_dialect() {

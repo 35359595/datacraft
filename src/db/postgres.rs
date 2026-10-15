@@ -53,6 +53,39 @@ impl PgSession {
         Ok(Self { client })
     }
 
+    pub async fn current_database(&mut self) -> anyhow::Result<String> {
+        let row = self.client.query_one("SELECT current_database()", &[]).await.map_err(pg_error)?;
+        Ok(row.get(0))
+    }
+
+    pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn \
+                 AND has_database_privilege(datname, 'CONNECT') ORDER BY lower(datname)",
+                &[],
+            )
+            .await
+            .map_err(pg_error)?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        // Si algo falla, `tx` se suelta sin commit y tokio-postgres hace ROLLBACK.
+        let tx = self.client.transaction().await.map_err(pg_error)?;
+        let mut total = 0;
+        for stmt in statements {
+            let n = tx.execute(stmt.as_str(), &[]).await.map_err(pg_error)?;
+            if n != 1 {
+                return Err(super::not_single_row(n, stmt));
+            }
+            total += n;
+        }
+        tx.commit().await.map_err(pg_error)?;
+        Ok(total)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.client.is_closed()
     }

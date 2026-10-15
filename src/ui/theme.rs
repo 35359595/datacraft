@@ -97,6 +97,13 @@ pub struct Palette {
     pub column_icon: Color32,
     pub key_icon: Color32,
     pub project_badge: Color32,
+    // --- edición de datos (aproximados al grid de DataGrip) ---
+    /// Celda modificada pendiente de guardar.
+    pub cell_modified: Color32,
+    /// Fila nueva pendiente de insertar.
+    pub row_added: Color32,
+    /// Fila marcada para borrar.
+    pub row_deleted: Color32,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -144,6 +151,9 @@ pub const LIGHT: Palette = Palette {
     column_icon: hex(0x7B8094),
     key_icon: hex(0xD9A343),
     project_badge: hex(0x8E6CEF),
+    cell_modified: hex(0xD6E4FD),
+    row_added: hex(0xDDF1E1),
+    row_deleted: hex(0xF3E1E2),
 };
 
 pub const DARK: Palette = Palette {
@@ -191,6 +201,9 @@ pub const DARK: Palette = Palette {
     column_icon: hex(0x9FA2A8),
     key_icon: hex(0xE4AD5F),
     project_badge: hex(0x8060DB),
+    cell_modified: hex(0x263A5C),
+    row_added: hex(0x233F2D),
+    row_deleted: hex(0x45282B),
 };
 
 pub fn palette(dark: bool) -> Palette {

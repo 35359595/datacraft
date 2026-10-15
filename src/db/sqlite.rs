@@ -59,6 +59,25 @@ impl SqliteSession {
         self.with_conn(move |conn| run_batch(conn, &sql, max_rows)).await
     }
 
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        let statements = statements.to_vec();
+        self.with_conn(move |conn| {
+            // Sin commit, el Drop de la transacción hace ROLLBACK.
+            let tx = conn.unchecked_transaction()?;
+            let mut total = 0;
+            for stmt in &statements {
+                let n = tx.execute(stmt, [])? as u64;
+                if n != 1 {
+                    return Err(super::not_single_row(n, stmt));
+                }
+                total += n;
+            }
+            tx.commit()?;
+            Ok(total)
+        })
+        .await
+    }
+
     pub async fn introspect(&mut self) -> anyhow::Result<Vec<SchemaInfo>> {
         self.with_conn(load_schema).await
     }
@@ -204,6 +223,26 @@ mod tests {
     async fn ruta_vacia_da_error() {
         let cfg = ConnectionConfig::new(1, Driver::Sqlite);
         assert!(SqliteSession::connect(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_changes_es_atomico() {
+        let db = TempDb::new("apply");
+        let mut s = db.open().await;
+        s.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'b'),(4,'c');", 10)
+            .await
+            .unwrap();
+        let ok = vec!["UPDATE t SET v = 'x' WHERE id = '1'".to_string(), "DELETE FROM t WHERE id = '4'".to_string()];
+        assert_eq!(s.apply_changes(&ok).await.unwrap(), 2);
+        // La segunda afecta a 0 filas: se deshace también la primera.
+        let bad = vec!["UPDATE t SET v = 'y' WHERE id = '1'".to_string(), "UPDATE t SET v = 'z' WHERE id = '99'".to_string()];
+        assert!(s.apply_changes(&bad).await.is_err());
+        // Clave no única (sin PK): afecta a 2 filas y se rechaza.
+        assert!(s.apply_changes(&["UPDATE t SET v = 'w' WHERE v = 'b'".to_string()]).await.is_err());
+        let rs = s.execute("SELECT id, v FROM t ORDER BY id", 10).await.unwrap();
+        let rows: Vec<Vec<Option<String>>> = rs[0].rows.clone();
+        let b = |id: &str, v: &str| vec![Some(id.to_string()), Some(v.to_string())];
+        assert_eq!(rows, vec![b("1", "x"), b("2", "b"), b("3", "b")]);
     }
 
     #[tokio::test]

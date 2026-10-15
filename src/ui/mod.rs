@@ -2,6 +2,7 @@
 
 pub mod connection_dialog;
 pub mod console;
+pub mod editing;
 pub mod explorer;
 pub mod icons;
 pub mod results;
@@ -16,6 +17,29 @@ pub enum ConnStatusKind {
     Connecting,
     Connected,
     Error,
+}
+
+/// Resumen de una conexión para los selectores de las consolas.
+#[derive(Clone, Debug)]
+pub struct ConnSummary {
+    pub id: crate::worker::ConnId,
+    pub name: String,
+    pub driver: Driver,
+    pub status: ConnStatusKind,
+    /// Bases conocidas (vacío si no está conectada).
+    pub databases: Vec<String>,
+    /// Base por defecto de la conexión (si está conectada).
+    pub default_db: Option<String>,
+}
+
+impl ConnSummary {
+    /// Etiqueta "conexión · base" (SQLite solo tiene "main": se omite).
+    pub fn label(&self, db: Option<&str>) -> String {
+        match db.or(self.default_db.as_deref()) {
+            Some(d) if self.driver != Driver::Sqlite => format!("{} · {d}", self.name),
+            _ => self.name.clone(),
+        }
+    }
 }
 
 /// Índice de char -> índice de byte (acotado al final del texto).

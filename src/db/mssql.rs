@@ -70,6 +70,66 @@ impl MsSession {
         }
     }
 
+    pub async fn current_database(&mut self) -> anyhow::Result<String> {
+        let rows = self.scalar_strings("SELECT DB_NAME()").await?;
+        rows.into_iter().next().ok_or_else(|| anyhow!("El servidor no devolvió la base actual"))
+    }
+
+    /// Bases ONLINE a las que el usuario tiene acceso, como en el explorador de DataGrip.
+    pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
+        self.scalar_strings(
+            "SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' AND HAS_DBACCESS(name) = 1 ORDER BY name",
+        )
+        .await
+    }
+
+    pub async fn use_database(&mut self, db: &str) -> anyhow::Result<()> {
+        let sql = format!("USE [{}]", db.replace(']', "]]"));
+        self.execute(&sql, 0).await.map(|_| ())
+    }
+
+    /// Primera columna de cada fila como texto.
+    async fn scalar_strings(&mut self, sql: &str) -> anyhow::Result<Vec<String>> {
+        let rs = self.execute(sql, usize::MAX).await?;
+        Ok(rs.into_iter().flat_map(|r| r.rows).filter_map(|row| row.into_iter().next().flatten()).collect())
+    }
+
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        self.execute("SET XACT_ABORT ON; BEGIN TRANSACTION", 0).await?;
+        let mut outcome: anyhow::Result<u64> = Ok(0);
+        for stmt in statements {
+            let n = match self.client.execute(stmt.as_str(), &[]).await {
+                Ok(r) => r.total(),
+                Err(e) => {
+                    if !matches!(e, tiberius::error::Error::Server(_)) {
+                        self.broken = true;
+                    }
+                    outcome = Err(ms_error(e));
+                    break;
+                }
+            };
+            if n != 1 {
+                outcome = Err(super::not_single_row(n, stmt));
+                break;
+            }
+            if let Ok(total) = &mut outcome {
+                *total += n;
+            }
+        }
+        match outcome {
+            Ok(total) => {
+                self.execute("COMMIT TRANSACTION", 0).await?;
+                Ok(total)
+            }
+            Err(e) => {
+                if !self.broken {
+                    let _ = self.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", 0).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.broken
     }
@@ -281,6 +341,30 @@ mod tests {
         cfg.password = env("DATACRAFT_MSSQL_PASSWORD", "");
         cfg.database = env("DATACRAFT_MSSQL_DB", "master");
         Some(MsSession::connect(&cfg).await.expect("conexión"))
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn bases_y_use() {
+        let Some(mut s) = session().await else { return };
+        let current = s.current_database().await.unwrap();
+        let dbs = s.list_databases().await.unwrap();
+        assert!(dbs.iter().any(|d| d.eq_ignore_ascii_case("master")), "{dbs:?}");
+        s.use_database("master").await.unwrap();
+        assert_eq!(s.current_database().await.unwrap(), "master");
+        s.use_database(&current).await.unwrap();
+        assert_eq!(s.current_database().await.unwrap(), current);
+        // Una transacción vacía en tabla temporal: commit y rollback no dejan nada abierto.
+        s.execute("CREATE TABLE #dc_edit(id int PRIMARY KEY, v nvarchar(10)); INSERT INTO #dc_edit VALUES (1, N'a'), (2, N'b');", 10)
+            .await
+            .unwrap();
+        assert_eq!(s.apply_changes(&["UPDATE #dc_edit SET v = N'x' WHERE id = N'1'".into()]).await.unwrap(), 1);
+        assert!(s.apply_changes(&["UPDATE #dc_edit SET v = N'y' WHERE id = N'1'".into(), "DELETE FROM #dc_edit WHERE id = N'9'".into()]).await.is_err());
+        let rs = s.execute("SELECT v FROM #dc_edit WHERE id = 1; SELECT @@TRANCOUNT;", 10).await.unwrap();
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("x"));
+        assert_eq!(rs[1].rows[0][0].as_deref(), Some("0"));
+        s.execute("DROP TABLE #dc_edit", 0).await.unwrap();
+        println!("bases: {dbs:?}");
     }
 
     #[tokio::test]
