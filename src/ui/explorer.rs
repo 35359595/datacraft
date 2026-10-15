@@ -19,6 +19,10 @@ pub struct ExplorerState {
     pub selected_table: Option<TableRef>,
     /// true si el último clic fue dentro del panel (selección "con foco" en azul).
     pub focused: bool,
+    /// Ancho de las filas del árbol en este frame (el visible o el de la fila más larga).
+    row_width: f32,
+    /// Ancho que necesita la fila más larga dibujada en este frame (scroll horizontal).
+    widest_row: f32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -73,7 +77,19 @@ struct RowSpec<'a> {
 
 fn tree_row(ui: &mut Ui, state: &mut ExplorerState, spec: RowSpec<'_>) -> RowOut {
     let p = pal(ui);
-    let width = ui.available_width().max(160.0);
+    let text_color = spec.label_color.unwrap_or(p.text);
+    let label_galley = ui.painter().layout_no_wrap(spec.label.to_owned(), FontId::proportional(13.0), text_color);
+    let x_label = 12.0 + spec.depth as f32 * INDENT + 20.0 + 16.0 + 6.0;
+    let mut needed = x_label + label_galley.size().x + 6.0;
+    if let Some(b) = spec.badge {
+        needed += ui.painter().layout_no_wrap(b.to_owned(), FontId::proportional(11.0), p.badge_fg).size().x + 12.0 + 6.0;
+    }
+    if let Some((d, _)) = spec.detail {
+        needed += ui.painter().layout_no_wrap(d.to_owned(), FontId::proportional(12.0), p.muted).size().x;
+    }
+    needed += 14.0;
+    state.widest_row = state.widest_row.max(needed);
+    let width = state.row_width.max(needed);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
     if !ui.is_rect_visible(rect) {
         let mut toggled = false;
@@ -112,15 +128,10 @@ fn tree_row(ui: &mut Ui, state: &mut ExplorerState, spec: RowSpec<'_>) -> RowOut
         ui.painter().circle_filled(center, 2.6, c);
     }
     let painter = ui.painter_at(rect);
-    let text_color = spec.label_color.unwrap_or(p.text);
-    let label_rect = painter.text(
-        pos2(icon_rect.right() + 6.0, cy),
-        egui::Align2::LEFT_CENTER,
-        spec.label,
-        FontId::proportional(13.0),
-        text_color,
-    );
-    let mut x = label_rect.right() + 6.0;
+    let label_pos = pos2(icon_rect.right() + 6.0, cy - label_galley.size().y / 2.0);
+    let label_right = label_pos.x + label_galley.size().x;
+    painter.galley(label_pos, label_galley, text_color);
+    let mut x = label_right + 6.0;
     if let Some(b) = spec.badge {
         let r = theme::paint_badge(ui, pos2(x, cy), b);
         x = r.right() + 6.0;
@@ -175,10 +186,14 @@ fn selected_conn(state: &ExplorerState) -> Option<ConnId> {
 /// Cabecera de la tool window + barra de iconos.
 fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: &mut Vec<ExplorerAction>) {
     let p = pal(ui);
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.add_space(4.0);
+    // Filas recortadas: con el panel estrecho no pueden ensanchar la isla.
+    theme::clipped_row(ui, 30.0, |ui| {
         ui.add_space(14.0);
-        ui.label(RichText::new("Database Explorer").font(theme::bold(13.5)).color(p.text));
+        let title_w = (ui.available_width() - 66.0).max(0.0);
+        ui.allocate_ui_with_layout(vec2(title_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new("Database Explorer").font(theme::bold(13.5)).color(p.text)).truncate());
+        });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -212,7 +227,7 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
     let active = sel_state.is_some_and(|c| matches!(c.status, ConnStatus::Connected | ConnStatus::Connecting));
     let table = state.selected_table.clone().filter(|t| Some(t.conn) == sel_conn);
 
-    ui.horizontal(|ui| {
+    theme::clipped_row(ui, 30.0, |ui| {
         ui.add_space(10.0);
         ui.spacing_mut().item_spacing.x = 1.0;
         if theme::icon_button(ui, Ico::Plus, true, "Nueva conexión").clicked() {
@@ -266,9 +281,9 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
     });
     if state.show_filter {
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        theme::clipped_row(ui, 28.0, |ui| {
             ui.add_space(12.0);
-            let w = ui.available_width() - 12.0;
+            let w = (ui.available_width() - 12.0).max(40.0);
             ui.add(
                 egui::TextEdit::singleline(&mut state.filter)
                     .hint_text("Filtrar tablas…")
@@ -294,23 +309,38 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
 
     let filter = state.filter.trim().to_lowercase();
 
-    egui::ScrollArea::both().id_salt("explorer_tree").auto_shrink([false, false]).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        if conns.is_empty() {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Crea un data source con Alt+Insert").color(p.muted));
-                ui.add_space(6.0);
-                if theme::primary_button(ui, "Nueva conexión…").clicked() {
-                    actions.push(ExplorerAction::NewConnection);
-                }
-            });
-        }
-        for c in conns {
-            connection_rows(ui, state, &mut actions, c, &filter);
-        }
-        ui.add_space(8.0);
-    });
+    // El árbol ocupa todo lo que queda bajo la cabecera, con scroll vertical y horizontal.
+    // Se deja un margen abajo para que las barras no pisen las esquinas redondeadas.
+    let max_h = (ui.available_height() - 6.0).max(0.0);
+    let viewport_w = ui.available_width();
+    egui::ScrollArea::both()
+        .id_salt("explorer_tree")
+        .auto_shrink([false, false])
+        .max_height(max_h)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // Todas las filas con el mismo ancho: el visible o el de la fila más larga del
+            // frame anterior, para que el resaltado cubra toda la fila al desplazarse.
+            state.row_width = viewport_w.max(state.widest_row);
+            state.widest_row = 0.0;
+            if conns.is_empty() {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Crea un data source con Alt+Insert").color(p.muted));
+                    ui.add_space(6.0);
+                    if theme::primary_button(ui, "Nueva conexión…").clicked() {
+                        actions.push(ExplorerAction::NewConnection);
+                    }
+                });
+            }
+            for c in conns {
+                connection_rows(ui, state, &mut actions, c, &filter);
+            }
+            ui.add_space(8.0);
+        });
+    if (state.row_width - viewport_w.max(state.widest_row)).abs() > 0.5 {
+        ui.ctx().request_repaint();
+    }
     actions
 }
 

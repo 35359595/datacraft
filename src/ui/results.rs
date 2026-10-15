@@ -9,12 +9,56 @@ use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2};
 use egui_extras::{Column, TableBuilder};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SortDir {
     Asc,
     Desc,
+}
+
+/// Filtro local de una columna (embudo de la cabecera): valores originales que se muestran.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ColumnFilter {
+    pub allowed: HashSet<Cell>,
+}
+
+/// Ventana del embudo abierta sobre una columna.
+struct FilterPopup {
+    col: usize,
+    anchor: egui::Pos2,
+    search: String,
+    /// Valores distintos de la columna con su número de apariciones (ordenados).
+    values: Vec<(Cell, usize)>,
+    /// El clic que la abrió no debe cerrarla en el mismo frame.
+    just_opened: bool,
+}
+
+/// Valores distintos de `col` con su recuento, en el orden del grid (números como números).
+fn distinct_values(rows: &[Vec<Cell>], col: usize) -> Vec<(Cell, usize)> {
+    let mut counts: HashMap<&Cell, usize> = HashMap::new();
+    for r in rows {
+        if let Some(v) = r.get(col) {
+            *counts.entry(v).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(Cell, usize)> = counts.into_iter().map(|(v, n)| (v.clone(), n)).collect();
+    out.sort_by(|a, b| compare_cells(Some(&a.0), Some(&b.0)));
+    out
+}
+
+/// Filas originales visibles: las que pasan todos los filtros, en el orden pedido.
+fn compute_order(rows: &[Vec<Cell>], sort: Option<(usize, SortDir)>, filters: &BTreeMap<usize, ColumnFilter>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len())
+        .filter(|&r| filters.iter().all(|(c, f)| rows[r].get(*c).is_some_and(|v| f.allowed.contains(v))))
+        .collect();
+    if let Some((c, dir)) = sort {
+        order.sort_by(|&a, &b| {
+            let ord = compare_cells(rows[a].get(c), rows[b].get(c));
+            if dir == SortDir::Desc { ord.reverse() } else { ord }
+        });
+    }
+    order
 }
 
 /// Editor en línea abierto sobre una celda.
@@ -40,6 +84,9 @@ pub struct ResultView {
     /// Permutación de filas según el orden actual.
     order: Vec<usize>,
     sort: Option<(usize, SortDir)>,
+    /// Filtros locales por columna (embudo de la cabecera).
+    filters: BTreeMap<usize, ColumnFilter>,
+    filter_popup: Option<FilterPopup>,
     /// Celda seleccionada (fila visual, columna).
     selected: Option<(usize, usize)>,
     /// Filas visuales seleccionadas (para eliminar varias).
@@ -65,6 +112,8 @@ impl ResultView {
             title,
             order,
             sort: None,
+            filters: BTreeMap::new(),
+            filter_popup: None,
             selected: None,
             selected_rows: BTreeSet::new(),
             anchor: None,
@@ -237,14 +286,27 @@ impl ResultView {
             Some((c, SortDir::Desc)) if c == col => None,
             _ => Some((col, SortDir::Asc)),
         };
-        self.order = (0..self.rs.rows.len()).collect();
-        if let Some((c, dir)) = self.sort {
-            let rows = &self.rs.rows;
-            self.order.sort_by(|&a, &b| {
-                let ord = compare_cells(rows[a].get(c), rows[b].get(c));
-                if dir == SortDir::Desc { ord.reverse() } else { ord }
-            });
-        }
+        self.rebuild_order();
+    }
+
+    fn rebuild_order(&mut self) {
+        self.order = compute_order(&self.rs.rows, self.sort, &self.filters);
+    }
+
+    /// Filas originales ocultas por los filtros de columna.
+    pub fn filtered_out(&self) -> usize {
+        self.rs.rows.len() - self.order.len()
+    }
+
+    fn set_filter(&mut self, col: usize, filter: Option<ColumnFilter>) {
+        match filter {
+            Some(f) => self.filters.insert(col, f),
+            None => self.filters.remove(&col),
+        };
+        self.rebuild_order();
+        self.selected = None;
+        self.selected_rows.clear();
+        self.anchor = None;
     }
 
     /// Valor mostrado (con cambios pendientes). `None` = celda nueva sin tocar.
@@ -384,6 +446,7 @@ fn is_numeric(v: &str) -> bool {
 /// Lo que el grid pide hacer tras dibujarse (se aplica fuera del TableBuilder).
 enum GridAction {
     Sort(usize),
+    OpenFilter(usize, egui::Pos2),
     Select { vr: usize, col: Option<usize>, mods: Modifiers },
     StartEdit(usize, usize),
     Commit(i32),
@@ -418,6 +481,8 @@ pub fn show_result(
 
     let mut actions: Vec<GridAction> = Vec::new();
     let editable = view.edit.is_some();
+    demo_filter(view, area_rect);
+    let filters_active: Vec<usize> = view.filters.keys().copied().collect();
     let editing_now = view.edit.as_ref().is_some_and(|e| e.editing.is_some());
 
     // Teclado del grid (solo si ningún widget tiene el foco).
@@ -511,6 +576,7 @@ pub fn show_result(
                     ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.grid));
                 });
                 for (i, name) in view.rs.columns.iter().enumerate() {
+                    let mut funnel_hit = Rect::NOTHING;
                     let (_, resp) = header.col(|ui| {
                         let r = ui.max_rect();
                         ui.painter().rect_filled(r, 0.0, p.header_bg);
@@ -524,7 +590,9 @@ pub fn show_result(
                         let tp = pos2(r.left() + 24.0, cy - galley.size().y / 2.0);
                         painter.with_clip_rect(Rect::from_min_max(r.min, pos2(text_right.max(r.left() + 24.0), r.max.y))).galley(tp, galley, p.text);
                         let funnel = Rect::from_min_size(pos2(r.right() - 36.0, cy - 6.5), egui::Vec2::splat(13.0));
-                        icons::paint(&painter, funnel, Ico::Filter, p.disabled, &p, true);
+                        funnel_hit = funnel.expand(4.0);
+                        let funnel_color = if filters_active.contains(&i) { p.accent } else { p.disabled };
+                        icons::paint(&painter, funnel, Ico::Filter, funnel_color, &p, true);
                         let sort_ico = match sort {
                             Some((c, SortDir::Asc)) if c == i => Ico::SortAsc,
                             Some((c, SortDir::Desc)) if c == i => Ico::SortDesc,
@@ -534,8 +602,15 @@ pub fn show_result(
                         let sr = Rect::from_min_size(pos2(r.right() - 20.0, cy - 6.5), egui::Vec2::splat(13.0));
                         icons::paint(&painter, sr, sort_ico, sort_color, &p, true);
                     });
-                    if resp.on_hover_text(format!("{name}\nClic para ordenar")).clicked() {
-                        actions.push(GridAction::Sort(i));
+                    let on_funnel = resp.hover_pos().is_some_and(|pos| funnel_hit.contains(pos));
+                    let hint = if on_funnel { "Filtrar por valores".to_string() } else { format!("{name}\nClic para ordenar") };
+                    let resp = resp.on_hover_text(hint);
+                    if resp.clicked() {
+                        if resp.interact_pointer_pos().is_some_and(|pos| funnel_hit.contains(pos)) {
+                            actions.push(GridAction::OpenFilter(i, funnel_hit.left_bottom()));
+                        } else {
+                            actions.push(GridAction::Sort(i));
+                        }
                     }
                 }
             })
@@ -730,9 +805,13 @@ pub fn show_result(
     if let Some(e) = row_count_pill(ui, view, area_rect) {
         error = Some(e);
     }
+    filter_popup_ui(ui, view);
 
     for a in actions {
         match a {
+            GridAction::OpenFilter(c, anchor) => {
+                view.filter_popup = Some(FilterPopup { col: c, anchor, search: String::new(), values: distinct_values(&view.rs.rows, c), just_opened: true });
+            }
             GridAction::Sort(c) => {
                 view.toggle_sort(c);
                 view.selected = None;
@@ -841,14 +920,141 @@ pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -
     }
 }
 
+/// Modo demo (`DATACRAFT_DEMO_FILTER=<columna>`): abre el embudo de esa columna y desmarca
+/// su primer valor, para poder capturar el filtro sin interactuar con la app.
+fn demo_filter(view: &mut ResultView, area: Rect) {
+    if view.filters.is_empty()
+        && view.filter_popup.is_none()
+        && let Ok(col_name) = std::env::var("DATACRAFT_DEMO_FILTER")
+        && let Some(c) = view.rs.columns.iter().position(|n| *n == col_name)
+    {
+        let values = distinct_values(&view.rs.rows, c);
+        let mut allowed: HashSet<Cell> = values.iter().map(|(v, _)| v.clone()).collect();
+        if let Some((first, _)) = values.first() {
+            allowed.remove(first);
+        }
+        view.set_filter(c, Some(ColumnFilter { allowed }));
+        let anchor = area.left_top() + egui::vec2(120.0 * c as f32 + 60.0, 30.0);
+        view.filter_popup = Some(FilterPopup { col: c, anchor, search: String::new(), values, just_opened: true });
+    }
+}
+
+/// Ventana del embudo: buscar, marcar valores, todos/ninguno y quitar filtro.
+fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
+    let Some(popup) = view.filter_popup.as_mut() else { return };
+    let p = pal(ui);
+    let col = popup.col;
+    let current = view.filters.get(&col).cloned();
+    let mut new_filter: Option<Option<ColumnFilter>> = None;
+    let mut close = ui.input(|i| i.key_pressed(Key::Escape));
+    let col_name = view.rs.columns.get(col).cloned().unwrap_or_default();
+    let area = egui::Area::new(egui::Id::new(("col_filter", view.salt)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup.anchor + egui::vec2(0.0, 4.0))
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(260.0);
+                ui.label(RichText::new(format!("Filtrar «{col_name}»")).font(theme::bold(13.0)).color(p.text));
+                ui.add_space(4.0);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut popup.search).hint_text("Buscar valor…").desired_width(f32::INFINITY),
+                );
+                if search.gained_focus() || ui.memory(|m| m.focused().is_none()) {
+                    search.request_focus();
+                }
+                let needle = popup.search.to_lowercase();
+                let label_of = |v: &Cell| match v {
+                    None => "<null>".to_string(),
+                    Some(s) if s.is_empty() => "<vacío>".to_string(),
+                    Some(s) => s.chars().take(80).collect(),
+                };
+                let shown: Vec<usize> = popup
+                    .values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (v, _))| needle.is_empty() || label_of(v).to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect();
+                ui.horizontal(|ui| {
+                    if ui.small_button("Todos").clicked() {
+                        let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
+                        allowed.extend(shown.iter().map(|&i| popup.values[i].0.clone()));
+                        new_filter = Some(Some(ColumnFilter { allowed }));
+                    }
+                    if ui.small_button("Ninguno").clicked() {
+                        let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
+                        for &i in &shown {
+                            allowed.remove(&popup.values[i].0);
+                        }
+                        new_filter = Some(Some(ColumnFilter { allowed }));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(current.is_some(), egui::Button::new("Quitar filtro").small()).clicked() {
+                            new_filter = Some(None);
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show_rows(
+                    ui,
+                    20.0,
+                    shown.len(),
+                    |ui, range| {
+                        for &i in &shown[range] {
+                            let (value, count) = &popup.values[i];
+                            let mut on = current.as_ref().is_none_or(|f| f.allowed.contains(value));
+                            let text = RichText::new(label_of(value)).monospace().color(if value.is_none() { p.muted } else { p.text });
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut on, text).changed() {
+                                    let mut allowed = current
+                                        .clone()
+                                        .map(|f| f.allowed)
+                                        .unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
+                                    if on {
+                                        allowed.insert(value.clone());
+                                    } else {
+                                        allowed.remove(value);
+                                    }
+                                    new_filter = Some(Some(ColumnFilter { allowed }));
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(count.to_string()).small().color(p.muted));
+                                });
+                            });
+                        }
+                    },
+                );
+                if shown.is_empty() {
+                    ui.label(RichText::new("Sin coincidencias").color(p.muted));
+                }
+            });
+        });
+    let just_opened = std::mem::take(&mut popup.just_opened);
+    if area.response.clicked_elsewhere() && !just_opened {
+        close = true;
+    }
+    if let Some(f) = new_filter {
+        // Si están marcados todos los valores, el filtro sobra.
+        let total = view.filter_popup.as_ref().map_or(0, |p| p.values.len());
+        let f = f.filter(|f| f.allowed.len() < total || view.filter_popup.as_ref().is_some_and(|p| p.values.iter().any(|(v, _)| !f.allowed.contains(v))));
+        view.set_filter(col, f);
+    }
+    if close {
+        view.filter_popup = None;
+    }
+}
+
 /// Píldora flotante centrada en la parte inferior del grid: "N rows ⌄  ⋮".
 fn row_count_pill(ui: &Ui, view: &ResultView, area: Rect) -> Option<String> {
     let p = pal(ui);
     let n = view.rs.rows.len();
-    let text = match (n, view.rs.truncated) {
-        (1, _) => "1 row".to_string(),
-        (n, true) => format!("{n}+ rows"),
-        (n, false) => format!("{n} rows"),
+    let plus = if view.rs.truncated { "+" } else { "" };
+    let text = match (view.filtered_out(), n) {
+        (0, 1) => "1 row".to_string(),
+        (0, n) => format!("{n}{plus} rows"),
+        (_, n) => format!("{} of {n}{plus} rows", view.order.len()),
     };
     let font = FontId::proportional(12.5);
     let tw = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), p.text).size().x);
@@ -939,5 +1145,37 @@ mod tests {
         assert_eq!(compare_cells(Some(&a), Some(&b)), Ordering::Greater);
         let n: Cell = None;
         assert_eq!(compare_cells(Some(&n), Some(&b)), Ordering::Less);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn rows() -> Vec<Vec<Cell>> {
+        let c = |v: Option<&str>| v.map(str::to_string);
+        vec![
+            vec![c(Some("1")), c(Some("b"))],
+            vec![c(Some("10")), c(None)],
+            vec![c(Some("2")), c(Some("a"))],
+            vec![c(Some("2")), c(Some("b"))],
+        ]
+    }
+
+    #[test]
+    fn valores_distintos_con_recuento_y_orden_numerico() {
+        let d = distinct_values(&rows(), 0);
+        let labels: Vec<_> = d.iter().map(|(v, n)| (v.clone().unwrap_or_default(), *n)).collect();
+        assert_eq!(labels, [("1".into(), 1), ("2".into(), 2), ("10".into(), 1)]);
+        assert_eq!(distinct_values(&rows(), 1).len(), 3);
+    }
+
+    #[test]
+    fn filtro_y_orden_combinados() {
+        let mut filters = BTreeMap::new();
+        filters.insert(1, ColumnFilter { allowed: HashSet::from([Some("b".to_string()), None]) });
+        assert_eq!(compute_order(&rows(), None, &filters), vec![0, 1, 3]);
+        assert_eq!(compute_order(&rows(), Some((0, SortDir::Desc)), &filters), vec![1, 3, 0]);
+        assert_eq!(compute_order(&rows(), None, &BTreeMap::new()), vec![0, 1, 2, 3]);
     }
 }

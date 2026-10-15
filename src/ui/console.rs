@@ -14,10 +14,54 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResultTab {
     Output,
     Result(usize),
+}
+
+/// Qué pestañas de resultados cerrar (la de Output no se cierra nunca).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CloseResults {
+    One(usize),
+    /// Todas menos esta.
+    Others(usize),
+    All,
+}
+
+impl CloseResults {
+    /// Índices (ascendentes) que se cierran de `n` resultados.
+    pub fn indices(self, n: usize) -> Vec<usize> {
+        match self {
+            CloseResults::One(i) => (i < n).then_some(i).into_iter().collect(),
+            CloseResults::Others(i) => (0..n).filter(|&j| j != i).collect(),
+            CloseResults::All => (0..n).collect(),
+        }
+    }
+}
+
+/// Nuevo índice de la vista `i` tras quitar `removed` (ascendentes); `None` si se quitó.
+pub fn remap_index(i: usize, removed: &[usize]) -> Option<usize> {
+    if removed.contains(&i) {
+        return None;
+    }
+    Some(i - removed.iter().filter(|&&r| r < i).count())
+}
+
+/// Pestaña activa tras quitar `removed`: si se cerró la activa, la que ocupa su sitio (o la
+/// última); sin resultados, Output.
+pub fn tab_after_close(tab: ResultTab, removed: &[usize], remaining: usize) -> ResultTab {
+    let ResultTab::Result(i) = tab else { return tab };
+    if remaining == 0 {
+        return ResultTab::Output;
+    }
+    match remap_index(i, removed) {
+        Some(j) => ResultTab::Result(j.min(remaining - 1)),
+        None => {
+            let pos = i - removed.iter().filter(|&&r| r < i).count();
+            ResultTab::Result(pos.min(remaining - 1))
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,6 +136,8 @@ pub enum ConsoleAction {
     Preview(usize),
     /// Guardar directamente los cambios pendientes del resultado indicado.
     Submit(usize),
+    /// Cerrar pestañas de resultados (la app confirma si tienen cambios sin guardar).
+    CloseResults(CloseResults),
 }
 
 fn edit_action(a: results::EditAction, view: usize) -> ConsoleAction {
@@ -161,6 +207,25 @@ impl Console {
 
     pub fn has_pending_edits(&self) -> bool {
         self.results.iter().any(|r| r.is_dirty())
+    }
+
+    /// true si alguna de las vistas que cerraría `which` tiene cambios sin guardar.
+    pub fn closing_dirty(&self, which: CloseResults) -> bool {
+        which.indices(self.results.len()).iter().any(|&i| self.results[i].is_dirty())
+    }
+
+    /// Cierra pestañas de resultados y reajusta la activa y `replace_view`. Devuelve los
+    /// índices quitados (ascendentes) para que la app reajuste los suyos.
+    pub fn close_results(&mut self, which: CloseResults) -> Vec<usize> {
+        let removed = which.indices(self.results.len());
+        for &i in removed.iter().rev() {
+            self.results.remove(i);
+        }
+        if !removed.is_empty() {
+            self.result_tab = tab_after_close(self.result_tab, &removed, self.results.len());
+            self.replace_view = self.replace_view.and_then(|v| remap_index(v, &removed));
+        }
+        removed
     }
 
     pub fn discard_edits(&mut self) {
@@ -492,38 +557,83 @@ impl Console {
 
     fn results_ui(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let p = pal(ui);
-        // Cabecera tipo tool window "Services": título + pestañas de resultados.
-        toolbar_row(ui, |ui| {
-            ui.add_space(6.0);
+        // Cabecera tipo tool window "Services": título + pestañas de resultados (cerrables).
+        let busy = self.is_busy();
+        let mut close = None;
+        theme::clipped_row(ui, 36.0, |ui| {
+            ui.add_space(14.0);
             ui.label(RichText::new("Services").font(theme::bold(13.5)).color(p.text));
             ui.add_space(10.0);
-            ui.spacing_mut().item_spacing.x = 2.0;
-            let out_err = self.log.last().is_some_and(|e| e.is_error);
-            let out_ico = if out_err { Ico::Problems } else { Ico::Console };
-            if theme::tab(ui, self.result_tab == ResultTab::Output, Some(out_ico), "Output", false).0.clicked() {
-                self.result_tab = ResultTab::Output;
-            }
-            for (i, r) in self.results.iter().enumerate() {
-                let sel = self.result_tab == ResultTab::Result(i);
-                let (resp, _) = theme::tab(ui, sel, Some(Ico::Table), &r.title, false);
-                if resp.on_hover_text(&r.rs.statement).clicked() {
-                    self.result_tab = ResultTab::Result(i);
-                }
-            }
-            if let ResultTab::Result(i) = self.result_tab
-                && let Some(r) = self.results.get(i)
-                && r.edit.is_none()
-                && !r.rs.is_command()
-            {
+            let lock = match self.result_tab {
+                ResultTab::Result(i) => self
+                    .results
+                    .get(i)
+                    .filter(|r| r.edit.is_none() && !r.rs.is_command())
+                    .map(|r| r.readonly_reason.clone().unwrap_or_else(|| "Resultado de solo lectura".into())),
+                ResultTab::Output => None,
+            };
+            let tabs_w = (ui.available_width() - if lock.is_some() { 38.0 } else { 8.0 }).max(0.0);
+            ui.allocate_ui_with_layout(vec2(tabs_w, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("result_tabs")
+                    .max_width(tabs_w)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let out_err = self.log.last().is_some_and(|e| e.is_error);
+                            let out_ico = if out_err { Ico::Problems } else { Ico::Console };
+                            let has_results = !self.results.is_empty();
+                            let (out, _) = theme::tab(ui, self.result_tab == ResultTab::Output, Some(out_ico), "Output", false);
+                            if out.clicked() {
+                                self.result_tab = ResultTab::Output;
+                            }
+                            out.context_menu(|ui| {
+                                if ui.add_enabled(has_results && !busy, egui::Button::new("Cerrar todos los resultados")).clicked() {
+                                    close = Some(CloseResults::All);
+                                    ui.close();
+                                }
+                            });
+                            let n = self.results.len();
+                            for (i, r) in self.results.iter().enumerate() {
+                                let sel = self.result_tab == ResultTab::Result(i);
+                                let (resp, closed) = theme::tab(ui, sel, Some(Ico::Table), &r.title, !busy);
+                                let resp = resp.on_hover_text(&r.rs.statement);
+                                if closed || (resp.middle_clicked() && !busy) {
+                                    close = Some(CloseResults::One(i));
+                                } else if resp.clicked() {
+                                    self.result_tab = ResultTab::Result(i);
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.add_enabled(!busy, egui::Button::new("Cerrar")).clicked() {
+                                        close = Some(CloseResults::One(i));
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(!busy && n > 1, egui::Button::new("Cerrar otras")).clicked() {
+                                        close = Some(CloseResults::Others(i));
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(!busy, egui::Button::new("Cerrar todas")).clicked() {
+                                        close = Some(CloseResults::All);
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
+                    });
+            });
+            if let Some(why) = lock {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                     icons::paint(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(14.0)), Ico::Lock, p.muted, &p, true);
-                    let why = r.readonly_reason.clone().unwrap_or_else(|| "Resultado de solo lectura".into());
                     resp.on_hover_text(format!("Solo lectura: {why}"));
                 });
             }
         });
+        if let Some(which) = close {
+            actions.push(ConsoleAction::CloseResults(which));
+        }
         hline(ui);
         let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Copy)))
             && ui.memory(|m| m.focused().is_none());
@@ -1027,5 +1137,47 @@ mod tests {
         let items = build_items("em", Some("users"), "", &s);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "email");
+    }
+
+    #[test]
+    fn indices_a_cerrar() {
+        assert_eq!(CloseResults::One(1).indices(3), vec![1]);
+        assert!(CloseResults::One(5).indices(3).is_empty());
+        assert_eq!(CloseResults::Others(1).indices(3), vec![0, 2]);
+        assert_eq!(CloseResults::All.indices(2), vec![0, 1]);
+    }
+
+    #[test]
+    fn reindexado_tras_cerrar() {
+        assert_eq!(remap_index(0, &[1]), Some(0));
+        assert_eq!(remap_index(1, &[1]), None);
+        assert_eq!(remap_index(3, &[0, 2]), Some(1));
+        // Se cierra la activa: pasa a la que ocupa su sitio o a la última.
+        assert_eq!(tab_after_close(ResultTab::Result(1), &[1], 2), ResultTab::Result(1));
+        assert_eq!(tab_after_close(ResultTab::Result(2), &[2], 2), ResultTab::Result(1));
+        assert_eq!(tab_after_close(ResultTab::Result(2), &[0], 2), ResultTab::Result(1));
+        assert_eq!(tab_after_close(ResultTab::Result(0), &[0, 1], 0), ResultTab::Output);
+        assert_eq!(tab_after_close(ResultTab::Output, &[0], 1), ResultTab::Output);
+    }
+
+    #[test]
+    fn cerrar_resultados_de_consola() {
+        let rs = |stmt: &str| crate::db::ResultSet { statement: stmt.into(), ..Default::default() };
+        let mut c = Console::new(1, "c".into(), String::new(), None);
+        c.results = (0..4).map(|i| ResultView::new(rs(&format!("select {i}")), i)).collect();
+        c.result_tab = ResultTab::Result(2);
+        c.replace_view = Some(3);
+        assert_eq!(c.close_results(CloseResults::One(0)), vec![0]);
+        assert_eq!(c.result_tab, ResultTab::Result(1));
+        assert_eq!(c.replace_view, Some(2));
+        assert_eq!(c.results[0].rs.statement, "select 1");
+        c.close_results(CloseResults::Others(1));
+        assert_eq!(c.results.len(), 1);
+        assert_eq!(c.results[0].rs.statement, "select 2");
+        assert_eq!(c.result_tab, ResultTab::Result(0));
+        assert_eq!(c.replace_view, None);
+        c.close_results(CloseResults::All);
+        assert!(c.results.is_empty());
+        assert_eq!(c.result_tab, ResultTab::Output);
     }
 }

@@ -11,13 +11,18 @@
 //! primera tabla, una celda en edición, varios cambios pendientes (celda modificada, NULL, fila
 //! nueva y fila marcada para borrar) o esos cambios con la ventana de previsualización abierta.
 //! Nunca se envían a la base de datos.
+//! `DATACRAFT_DEMO_EXPLORER_W=<pt>` fija el ancho del Database Explorer (150–700, sin
+//! redimensionar), `DATACRAFT_DEMO_WINDOW=<ancho>x<alto>` cambia el tamaño de la ventana al
+//! arrancar (permite bajar del mínimo normal) y `DATACRAFT_DEMO_MULTI=1` usa una consola con
+//! varias consultas, que se ejecutan con "Ejecutar todo" (una pestaña de resultados por cada una).
+//! `DATACRAFT_DEMO_FILTER=<columna>` abre el embudo de esa columna con su primer valor desmarcado.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
 use crate::edit;
 use crate::sql;
 use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
-use crate::ui::console::{Console, ConsoleAction, ConsoleCtx, ResultTab};
+use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -144,6 +149,8 @@ enum Discard {
     CloseAll,
     Reload(u64),
     Run(u64, bool),
+    /// Cerrar pestañas de resultados de una consola.
+    CloseResults(u64, CloseResults),
 }
 
 /// Ventana "Preview pending changes".
@@ -241,6 +248,10 @@ pub struct DataCraftApp {
     applied_zoom: Option<f32>,
     preview: Option<PreviewState>,
     confirm_discard: Option<Discard>,
+    /// Modo demo: ancho fijo del Database Explorer (`DATACRAFT_DEMO_EXPLORER_W`).
+    demo_explorer_w: Option<f32>,
+    /// Modo demo: tamaño de ventana a aplicar en el primer frame (`DATACRAFT_DEMO_WINDOW`).
+    demo_window: Option<egui::Vec2>,
 }
 
 impl DataCraftApp {
@@ -289,6 +300,8 @@ impl DataCraftApp {
             applied_zoom: None,
             preview: None,
             confirm_discard: None,
+            demo_explorer_w: None,
+            demo_window: None,
         };
         for pc in persisted.consoles {
             let conn = pc.conn.filter(|id| app.conns.iter().any(|c| c.cfg.id == *id));
@@ -336,13 +349,22 @@ impl DataCraftApp {
         if let Some(z) = std::env::var("DATACRAFT_DEMO_ZOOM").ok().and_then(|v| v.trim().trim_end_matches('%').parse::<f32>().ok()) {
             self.zoom = clamp_zoom(z / 100.0);
         }
+        self.demo_explorer_w = std::env::var("DATACRAFT_DEMO_EXPLORER_W").ok().and_then(|v| v.trim().parse::<f32>().ok()).map(|w| w.clamp(150.0, 700.0));
+        self.demo_window = std::env::var("DATACRAFT_DEMO_WINDOW").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once('x')?;
+            Some(vec2(w.trim().parse::<f32>().ok()?.max(400.0), h.trim().parse::<f32>().ok()?.max(300.0)))
+        });
         self.demo_edit = match std::env::var("DATACRAFT_DEMO_EDIT").as_deref() {
             Ok("cell") => Some(DemoEdit::Cell),
             Ok("changes") => Some(DemoEdit::Changes),
             Ok("preview") => Some(DemoEdit::Preview),
             _ => None,
         };
-        let idx = self.new_console(Some(id), None, "SELECT o.id, u.name, o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\nORDER BY o.total DESC;\n".into());
+        let mut text = String::from("SELECT o.id, u.name, o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\nORDER BY o.total DESC;\n");
+        if std::env::var("DATACRAFT_DEMO_MULTI").is_ok_and(|v| v == "1") {
+            text.push_str("\nSELECT * FROM users;\n\nSELECT count(*) AS n FROM orders;\n");
+        }
+        let idx = self.new_console(Some(id), None, text);
         self.run_console(idx, true);
         // El editor de datos de la primera tabla se abre al llegar el esquema.
         self.demo_pending = true;
@@ -808,6 +830,27 @@ impl DataCraftApp {
         }
     }
 
+    /// Cierra pestañas de resultados de una consola (pide confirmación si tienen cambios).
+    fn close_results(&mut self, idx: usize, which: CloseResults) {
+        let Some(c) = self.consoles.get(idx).filter(|c| c.table.is_none() && !c.is_busy()) else { return };
+        if self.guard(Discard::CloseResults(c.id, which)) {
+            self.close_results_now(idx, which);
+        }
+    }
+
+    fn close_results_now(&mut self, idx: usize, which: CloseResults) {
+        let Some(c) = self.consoles.get_mut(idx).filter(|c| c.table.is_none()) else { return };
+        let id = c.id;
+        let removed = c.close_results(which);
+        // La previsualización de cambios guarda el índice de su vista.
+        if let Some(pv) = self.preview.as_mut().filter(|p| p.console == id) {
+            match console::remap_index(pv.view, &removed) {
+                Some(v) => pv.view = v,
+                None => self.preview = None,
+            }
+        }
+    }
+
     /// true si la acción puede seguir ya; si hay cambios sin guardar, pide confirmación.
     fn guard(&mut self, action: Discard) -> bool {
         let dirty = match action {
@@ -815,6 +858,7 @@ impl DataCraftApp {
             Discard::Close(id) | Discard::Reload(id) | Discard::Run(id, _) => {
                 self.consoles.iter().any(|c| c.id == id && c.has_pending_edits())
             }
+            Discard::CloseResults(id, which) => self.consoles.iter().any(|c| c.id == id && c.closing_dirty(which)),
         };
         if dirty {
             self.confirm_discard = Some(action);
@@ -832,6 +876,11 @@ impl DataCraftApp {
             Discard::Close(id) => {
                 if let Some(i) = self.consoles.iter().position(|c| c.id == id) {
                     self.close_console_now(i);
+                }
+            }
+            Discard::CloseResults(id, which) => {
+                if let Some(i) = self.consoles.iter().position(|c| c.id == id) {
+                    self.close_results_now(i, which);
                 }
             }
             Discard::Reload(id) | Discard::Run(id, _) => {
@@ -1748,8 +1797,7 @@ impl DataCraftApp {
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE.inner_margin(Margin { top: 2 * theme::ISLAND_GAP, ..Margin::ZERO }))
                 .show(ui, |ui| {
-                    theme::island_frame(&p).show(ui, |ui| {
-                        ui.set_min_size(ui.available_size());
+                    theme::fixed_island(ui, &p, |ui| {
                         let idx = self.active;
                         let console = &self.consoles[idx];
                         let conn = console.conn.and_then(|id| self.conns.iter().find(|c| c.cfg.id == id));
@@ -1835,6 +1883,7 @@ impl DataCraftApp {
                 ConsoleAction::Error(e) => self.error(e),
                 ConsoleAction::Preview(view) => self.open_preview(idx, view),
                 ConsoleAction::Submit(view) => self.submit_now(idx, view),
+                ConsoleAction::CloseResults(which) => self.close_results(idx, which),
             }
         }
     }
@@ -1904,6 +1953,7 @@ impl DataCraftApp {
                 let what = match action {
                     Discard::Close(_) | Discard::CloseAll => "Al cerrar la pestaña",
                     Discard::Reload(_) => "Al recargar los datos",
+                    Discard::CloseResults(..) => "Al cerrar la pestaña de resultados",
                     Discard::Run(..) => "Al volver a ejecutar",
                 };
                 ui.label(format!("{what} se perderán los cambios pendientes del grid."));
@@ -2238,6 +2288,10 @@ impl eframe::App for DataCraftApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if let Some(size) = self.demo_window.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(vec2(400.0, 300.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
         self.shortcuts(&ctx);
         let p = palette(self.dark);
         let bar = egui::Frame::NONE.fill(p.main_bg);
@@ -2269,20 +2323,17 @@ impl eframe::App for DataCraftApp {
             .frame(bar)
             .show(ui, |ui| self.right_stripe(ui));
         if self.show_explorer {
-            let explorer_actions = egui::Panel::left("explorer")
+            let mut panel = egui::Panel::left("explorer")
                 .resizable(true)
                 .default_size(300.0)
-                .size_range(200.0..=700.0)
+                .size_range(150.0..=700.0)
                 .show_separator_line(false)
-                .frame(bar.inner_margin(Margin { right: theme::ISLAND_GAP, ..Margin::ZERO }))
-                .show(ui, |ui| {
-                    theme::island_frame(&p)
-                        .show(ui, |ui| {
-                            ui.set_min_size(ui.available_size());
-                            explorer::show(ui, &mut self.explorer, &self.conns)
-                        })
-                        .inner
-                })
+                .frame(bar.inner_margin(Margin { right: theme::ISLAND_GAP, ..Margin::ZERO }));
+            if let Some(w) = self.demo_explorer_w {
+                panel = panel.exact_size(w);
+            }
+            let explorer_actions = panel
+                .show(ui, |ui| theme::fixed_island(ui, &p, |ui| explorer::show(ui, &mut self.explorer, &self.conns)))
                 .inner;
             self.handle_explorer(&ctx, explorer_actions);
         }

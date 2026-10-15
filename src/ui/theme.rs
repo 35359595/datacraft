@@ -340,25 +340,33 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         s.spacing.combo_height = 300.0;
         s.spacing.icon_width = 14.0;
         s.spacing.icon_width_inner = 8.0;
-        s.spacing.scroll = egui::style::ScrollStyle {
-            floating: true,
-            bar_width: 8.0,
-            floating_width: 4.0,
-            floating_allocated_width: 0.0,
-            bar_inner_margin: 2.0,
-            bar_outer_margin: 2.0,
-            handle_min_length: 24.0,
-            foreground_color: false,
-            dormant_background_opacity: 0.0,
-            active_background_opacity: 0.0,
-            interact_background_opacity: 0.0,
-            dormant_handle_opacity: 0.45,
-            active_handle_opacity: 0.7,
-            interact_handle_opacity: 0.9,
-            ..egui::style::ScrollStyle::floating()
-        };
+        s.spacing.scroll = scroll_style();
         s.interaction.selectable_labels = false;
     });
+}
+
+/// Barras de scroll al estilo IntelliJ: finas, grises y redondeadas sobre un carril
+/// transparente. Flotan sobre el contenido (no cambian el layout) pero, cuando hay algo que
+/// desplazar, se ven siempre; se ensanchan al pasar el ratón por encima.
+pub fn scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: true,
+        bar_width: 9.0,
+        floating_width: 6.0,
+        floating_allocated_width: 0.0,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 2.0,
+        handle_min_length: 24.0,
+        // Color del texto (no `bg_fill`, que en Islands Light es blanco como la isla).
+        foreground_color: true,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 0.26,
+        active_handle_opacity: 0.36,
+        interact_handle_opacity: 0.5,
+        ..egui::style::ScrollStyle::floating()
+    }
 }
 
 /// Mezcla un color translúcido sobre uno opaco.
@@ -467,6 +475,30 @@ pub fn paint_badge(ui: &Ui, left_center: egui::Pos2, text: &str) -> Rect {
 /// Marco de una "isla": tarjeta redondeada con el fondo de tool window.
 pub fn island_frame(p: &Palette) -> egui::Frame {
     egui::Frame::NONE.fill(p.island_bg).corner_radius(CornerRadius::same(10))
+}
+
+/// Isla que ocupa exactamente todo el espacio disponible del `ui` (p.ej. un panel
+/// redimensionable): el contenido se recorta dentro y nunca agranda la isla ni el panel, así
+/// que las esquinas redondeadas y el hueco entre islas se mantienen a cualquier tamaño.
+pub fn fixed_island<R>(ui: &mut Ui, p: &Palette, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(rect, CornerRadius::same(10), p.island_bg);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let r = add_contents(&mut child);
+    ui.advance_cursor_after_rect(rect);
+    r
+}
+
+/// Fila de alto fijo que no puede ensanchar a su padre: lo que no cabe se recorta.
+pub fn clipped_row<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width().max(0.0), height));
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let r = add_contents(&mut child);
+    ui.advance_cursor_after_rect(rect);
+    r
 }
 
 /// Mitad del hueco entre islas (Island.borderWidth = 6).
