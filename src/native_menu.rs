@@ -22,8 +22,6 @@ use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu
 use std::cell::Cell;
 use std::sync::mpsc::{Receiver, channel};
 
-const HELP_URL: &str = "https://github.com/javy-fernandez/datacraft";
-
 /// Acción elegida en el menú nativo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCommand {
@@ -187,10 +185,7 @@ impl NativeMenu {
     }
 }
 
-/// Abre la ayuda (README del repositorio) en el navegador.
-pub fn open_help() {
-    let _ = std::process::Command::new("open").arg(HELP_URL).spawn();
-}
+
 
 /// Reenvía a egui una acción de edición como si viniera del teclado.
 fn forward_edit(ctx: &egui::Context, cmd: MenuCommand) {

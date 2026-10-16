@@ -21,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>DataCraft</string>
   <key>CFBundleDisplayName</key><string>DataCraft</string>
   <key>CFBundleExecutable</key><string>DataCraft</string>
-  <key>CFBundleIdentifier</key><string>com.javy.datacraft</string>
+  <key>CFBundleIdentifier</key><string>app.datacraft</string>
   <key>CFBundleIconFile</key><string>DataCraft</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
@@ -47,12 +47,12 @@ PLIST
 
 # Firma: con un certificado estable el llavero reconoce cada compilación nueva como la misma
 # app y no vuelve a pedir permiso para las contraseñas. Sin él, firma ad hoc (cambia en cada build).
-IDENTITY="${DATACRAFT_SIGN_IDENTITY:-DataCraft Dev}"
+IDENTITY="${DATACRAFT_SIGN_IDENTITY:-DataCraft}"
 if security find-certificate -c "$IDENTITY" >/dev/null 2>&1 \
-   && codesign --force --deep --identifier com.javy.datacraft --sign "$IDENTITY" "$APP" 2>/dev/null; then
+   && codesign --force --deep --identifier app.datacraft --sign "$IDENTITY" "$APP" 2>/dev/null; then
   echo "Firmado con el certificado «$IDENTITY»"
 else
-  codesign --force --deep --identifier com.javy.datacraft --sign - "$APP"
+  codesign --force --deep --identifier app.datacraft --sign - "$APP"
   echo "Aviso: firmado ad hoc; el llavero pedirá permiso tras cada instalación (crea el certificado «$IDENTITY»)"
 fi
 echo "Generado $APP"

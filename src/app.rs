@@ -1319,7 +1319,8 @@ impl DataCraftApp {
                 M::RunAll if !modal => self.run_console(self.active, true),
                 M::SaveChanges if !modal => self.save_active_changes(),
                 M::Reload if !modal => self.reload_active(),
-                M::Help => crate::native_menu::open_help(),
+                // Sin web de ayuda: muestra la ventana de información de la app.
+                M::Help => self.show_about = true,
                 _ => {}
             }
         }
