@@ -310,8 +310,9 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
     let filter = state.filter.trim().to_lowercase();
 
     // El árbol ocupa todo lo que queda bajo la cabecera, con scroll vertical y horizontal.
-    // Se deja un margen abajo para que las barras no pisen las esquinas redondeadas.
-    let max_h = (ui.available_height() - 6.0).max(0.0);
+    // Llega hasta el borde de la isla, igual que el grid, para que las barras horizontales
+    // de ambos paneles queden a la misma altura.
+    let max_h = ui.available_height().max(0.0);
     let viewport_w = ui.available_width();
     egui::ScrollArea::both()
         .id_salt("explorer_tree")
