@@ -230,6 +230,9 @@ pub struct DataCraftApp {
     confirm_delete: Option<ConnId>,
     renaming: Option<(u64, String)>,
     show_about: bool,
+    show_settings: bool,
+    /// Menú nativo de la barra de macOS (None si no se pudo instalar).
+    native_menu: Option<crate::native_menu::NativeMenu>,
     show_explorer: bool,
     show_results: bool,
     dark: bool,
@@ -286,6 +289,8 @@ impl DataCraftApp {
             confirm_delete: None,
             renaming: None,
             show_about: false,
+            show_settings: false,
+            native_menu: crate::native_menu::NativeMenu::install(&cc.egui_ctx),
             show_explorer: persisted.show_explorer,
             show_results: persisted.show_results,
             dark: persisted.islands_dark,
@@ -1221,12 +1226,7 @@ impl DataCraftApp {
         if zoom_reset {
             self.zoom = 1.0;
         }
-        if self.dialog.is_some()
-            || self.confirm_delete.is_some()
-            || self.show_about
-            || self.preview.as_ref().is_some_and(|p| p.visible)
-            || self.confirm_discard.is_some()
-        {
+        if self.modal_open() {
             return;
         }
         let (run_all, run, new_console, reload, quit, save) = ctx.input_mut(|i| {
@@ -1243,24 +1243,88 @@ impl DataCraftApp {
         } else if run {
             self.run_console(self.active, false);
         }
-        if reload
-            && let Some(c) = self.consoles.get(self.active).filter(|c| c.table.is_some() && !c.is_busy())
-            && self.guard(Discard::Reload(c.id))
-        {
-            self.reload_table(self.active);
+        if reload {
+            self.reload_active();
         }
-        if save
-            && let Some(c) = self.consoles.get(self.active)
-            && let Some(vi) = c.edit_view_index()
-            && !c.is_busy()
-        {
-            self.submit_now(self.active, vi);
+        if save {
+            self.save_active_changes();
         }
         if new_console {
             self.new_console_here();
         }
         if quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Hay un diálogo modal abierto: los atajos y comandos de ejecución se ignoran.
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+            || self.confirm_delete.is_some()
+            || self.show_about
+            || self.show_settings
+            || self.preview.as_ref().is_some_and(|p| p.visible)
+            || self.confirm_discard.is_some()
+    }
+
+    fn reload_active(&mut self) {
+        if let Some(c) = self.consoles.get(self.active).filter(|c| c.table.is_some() && !c.is_busy())
+            && self.guard(Discard::Reload(c.id))
+        {
+            self.reload_table(self.active);
+        }
+    }
+
+    fn save_active_changes(&mut self) {
+        if let Some(c) = self.consoles.get(self.active)
+            && let Some(vi) = c.edit_view_index()
+            && !c.is_busy()
+        {
+            self.submit_now(self.active, vi);
+        }
+    }
+
+    /// Comandos del menú nativo de macOS. Sus aceleradores (⌘↩, ⌘S, ⌘=...) se los queda el
+    /// menú, así que los atajos equivalentes de `shortcuts` solo actúan si el menú no se instaló.
+    fn menu_commands(&mut self, ctx: &egui::Context) {
+        use crate::native_menu::MenuCommand as M;
+        let Some(menu) = self.native_menu.as_ref() else { return };
+        let cmds = menu.poll();
+        for cmd in cmds {
+            let modal = self.modal_open();
+            match cmd {
+                M::About => self.show_about = true,
+                M::Settings => self.show_settings = true,
+                M::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                M::NewConnection if !modal => self.open_new_connection_dialog(),
+                M::NewConsole if !modal => self.new_console_here(),
+                M::OpenSql if !modal => self.open_sql_file(),
+                M::SaveSqlAs if !modal => self.save_console_as(),
+                M::CloseTab if !modal && !self.consoles.is_empty() => self.close_console(self.active),
+                M::Find => {
+                    self.show_explorer = true;
+                    self.explorer.show_filter = true;
+                }
+                M::ToggleExplorer => self.show_explorer = !self.show_explorer,
+                M::ToggleResults => self.show_results = !self.show_results,
+                M::ThemeLight => self.dark = false,
+                M::ThemeDark => self.dark = true,
+                M::ZoomIn => self.zoom = zoom_in(self.zoom),
+                M::ZoomOut => self.zoom = zoom_out(self.zoom),
+                M::ZoomReset => self.zoom = 1.0,
+                M::FontBigger => self.font_size = (self.font_size + 1.0).min(32.0),
+                M::FontSmaller => self.font_size = (self.font_size - 1.0).max(8.0),
+                M::FontReset => self.font_size = DEFAULT_FONT_SIZE,
+                M::Run if !modal => self.run_console(self.active, false),
+                M::RunAll if !modal => self.run_console(self.active, true),
+                M::SaveChanges if !modal => self.save_active_changes(),
+                M::Reload if !modal => self.reload_active(),
+                M::Help => crate::native_menu::open_help(),
+                _ => {}
+            }
+        }
+        if let Some(menu) = self.native_menu.as_ref() {
+            menu.sync(self.dark, self.show_explorer, self.show_results);
         }
     }
 
@@ -2025,6 +2089,25 @@ impl DataCraftApp {
                 self.show_about = false;
             }
         }
+        if self.show_settings {
+            let resp = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.label(RichText::new("Ajustes").font(theme::bold(15.0)));
+                ui.add_space(8.0);
+                self.view_menu(ui);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Máx. filas por consulta:");
+                    ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=1_000_000).speed(10));
+                });
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| theme::primary_button(ui, "Cerrar").clicked())
+                    .inner
+            });
+            if resp.inner || resp.should_close() {
+                self.show_settings = false;
+            }
+        }
     }
 }
 
@@ -2295,6 +2378,8 @@ fn apply_execution(
 
 impl eframe::App for DataCraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Antes que nada: los comandos de edición del menú se inyectan como eventos de este frame.
+        self.menu_commands(ctx);
         self.handle_responses();
         if self.applied_zoom != Some(self.zoom) {
             ctx.set_zoom_factor(self.zoom);

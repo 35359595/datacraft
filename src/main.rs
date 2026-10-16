@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod db;
 mod edit;
+mod native_menu;
 mod sql;
 mod ui;
 mod worker;
