@@ -110,6 +110,8 @@ pub struct Console {
     pub table: Option<TableTab>,
     /// Tras guardar cambios: la próxima ejecución sustituye solo este resultado.
     pub replace_view: Option<usize>,
+    /// Formato elegido en el selector "CSV ⌄" del editor de datos.
+    pub export_format: results::ExportFormat,
 }
 
 /// Estado del editor de datos de una tabla.
@@ -178,6 +180,7 @@ impl Console {
             completion: None,
             table: None,
             replace_view: None,
+            export_format: results::ExportFormat::Csv,
         }
     }
 
@@ -433,6 +436,8 @@ impl Console {
     fn console_toolbar(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let busy = self.is_busy();
         toolbar_row(ui, |ui| {
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
             if theme::icon_button(ui, Ico::Play, !busy, "Ejecutar sentencia actual o selección (⌘↩)").clicked() {
                 actions.push(ConsoleAction::Run);
             }
@@ -446,9 +451,11 @@ impl Console {
             self.tx_dropdown(ui);
             theme::icon_button(ui, Ico::Stop, false, "Cancelar (no disponible)");
             self.busy_label(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                }
+                theme::Side::Right => {
                 ui.add_space(4.0);
                 self.connection_selector(ui, cx, actions);
+                }
             });
         });
     }
@@ -456,6 +463,8 @@ impl Console {
     fn table_toolbar(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let busy = self.is_busy();
         toolbar_row(ui, |ui| {
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
             if theme::icon_button(ui, Ico::Refresh, !busy, "Recargar página (⌘R)").clicked() {
                 actions.push(ConsoleAction::Reload);
             }
@@ -481,31 +490,52 @@ impl Console {
                 actions.push(ConsoleAction::Ddl);
             }
             self.busy_label(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                }
+                theme::Side::Right => {
                 ui.add_space(4.0);
                 ui.spacing_mut().item_spacing.x = 1.0;
                 let has_rows = self.results.last().is_some_and(|r| !r.rs.is_command());
-                let more = theme::icon_button(ui, Ico::MoreVert, true, "Más");
-                let export = theme::icon_button(ui, Ico::Export, has_rows, "Exportar datos…");
-                let csv = theme::flat_button(ui, None, "CSV", FontId::proportional(13.0), true, has_rows)
-                    .on_hover_text("Formato de extracción");
-                for resp in [csv, export, more] {
-                    egui::Popup::menu(&resp).show(|ui| {
-                        if ui.button("Exportar a CSV…").clicked() {
-                            if let Some(view) = self.results.last()
-                                && let Err(e) = results::export_csv(view)
-                            {
-                                actions.push(ConsoleAction::Error(format!("No se pudo exportar: {e}")));
-                            }
-                            ui.close();
+                let fmt = self.export_format;
+                let (target, base) = match &self.table {
+                    Some(t) => (crate::db::Session::quote_table(cx.driver, &t.schema, &t.table), t.table.clone()),
+                    None => ("tabla".to_string(), "resultado".to_string()),
+                };
+                // ⋮: copiar al portapapeles.
+                let more = theme::icon_button(ui, Ico::MoreVert, has_rows, "Copiar al portapapeles");
+                egui::Popup::menu(&more).show(|ui| {
+                    if ui.button(format!("Copiar todo como {}", fmt.label())).clicked() {
+                        if let Some(view) = self.results.last() {
+                            ui.ctx().copy_text(results::format_rows(view, fmt, &target));
                         }
-                        if ui.button("Copiar como CSV").clicked() {
+                        ui.close();
+                    }
+                    for other in results::ExportFormat::ALL.into_iter().filter(|f| *f != fmt) {
+                        if ui.button(format!("Copiar todo como {}", other.label())).clicked() {
                             if let Some(view) = self.results.last() {
-                                ui.ctx().copy_text(results::to_csv(view));
+                                ui.ctx().copy_text(results::format_rows(view, other, &target));
                             }
                             ui.close();
                         }
-                    });
+                    }
+                });
+                // ⤓: exportar directamente a fichero con el formato elegido.
+                if theme::icon_button(ui, Ico::Export, has_rows, &format!("Exportar a fichero {}…", fmt.label())).clicked()
+                    && let Some(view) = self.results.last()
+                    && let Err(e) = results::export_to_file(view, fmt, &target, &base)
+                {
+                    actions.push(ConsoleAction::Error(format!("No se pudo exportar: {e}")));
+                }
+                // "CSV ⌄": elegir el formato de extracción.
+                let selector = theme::flat_button(ui, None, fmt.label(), FontId::proportional(13.0), true, true)
+                    .on_hover_text("Formato de extracción");
+                egui::Popup::menu(&selector).show(|ui| {
+                    for f in results::ExportFormat::ALL {
+                        if ui.add(egui::Button::selectable(f == fmt, f.label())).clicked() {
+                            self.export_format = f;
+                            ui.close();
+                        }
+                    }
+                });
                 }
             });
         });

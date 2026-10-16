@@ -1365,6 +1365,8 @@ impl DataCraftApp {
         }
         let fullscreen = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
         ui.horizontal_centered(|ui| {
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
             ui.spacing_mut().item_spacing.x = 4.0;
             // Hueco de los semáforos: 80 pt de pantalla, sea cual sea el zoom del IDE.
             let zoom = ui.ctx().zoom_factor().max(0.1);
@@ -1431,7 +1433,8 @@ impl DataCraftApp {
                 self.set_active_connection(id);
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                }
+                theme::Side::Right => {
                 ui.add_space(10.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let gear = theme::icon_button_sized(ui, Ico::Gear, true, "Ajustes", 30.0);
@@ -1446,6 +1449,7 @@ impl DataCraftApp {
                 if theme::icon_button_sized(ui, Ico::Search, true, "Buscar tablas", 30.0).clicked() {
                     self.show_explorer = true;
                     self.explorer.show_filter = !self.explorer.show_filter;
+                }
                 }
             });
         });
@@ -1557,6 +1561,8 @@ impl DataCraftApp {
     fn status_bar(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
         ui.horizontal_centered(|ui| {
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(12.0);
             // Breadcrumbs de la pestaña activa.
@@ -1602,7 +1608,8 @@ impl DataCraftApp {
                 ui.label(RichText::new(c.status.label()).color(color).size(12.0));
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                }
+                theme::Side::Right => {
                 ui.add_space(12.0);
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
@@ -1643,10 +1650,18 @@ impl DataCraftApp {
                 if let Some((msg, is_err)) = &self.status_msg {
                     ui.add_space(8.0);
                     let color = if *is_err { p.error } else { p.text_muted };
-                    let resp = ui.add(egui::Label::new(RichText::new(msg).color(color).size(12.5)).truncate().sense(Sense::click()));
+                    // El aviso no puede comerse toda la barra: como mucho un tercio.
+                    let max_w = (ui.available_width() / 3.0).max(80.0);
+                    let resp = ui
+                        .scope(|ui| {
+                            ui.set_max_width(max_w);
+                            ui.add(egui::Label::new(RichText::new(msg).color(color).size(12.5)).truncate().sense(Sense::click()))
+                        })
+                        .inner;
                     if resp.on_hover_text("Clic para descartar").clicked() {
                         self.status_msg = None;
                     }
+                }
                 }
             });
         });
@@ -1790,10 +1805,15 @@ impl DataCraftApp {
         let conn_list = self.conn_list();
 
         if is_console && self.show_results {
+            // El editor (pestañas + toolbar + unas líneas) siempre conserva su sitio: el panel
+            // de resultados no puede crecer por encima de lo que queda, ni con ventanas bajas.
+            let avail = ui.available_height();
+            let max_results = (avail - 170.0).max(avail * 0.45).max(60.0);
+            let min_results = 120.0_f32.min(max_results);
             egui::Panel::bottom(egui::Id::new("results_island"))
                 .resizable(true)
-                .default_size(300.0)
-                .size_range(120.0..=2000.0)
+                .default_size(300.0_f32.min(max_results))
+                .size_range(min_results..=max_results)
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE.inner_margin(Margin { top: 2 * theme::ISLAND_GAP, ..Margin::ZERO }))
                 .show(ui, |ui| {

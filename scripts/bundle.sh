@@ -45,7 +45,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --deep --sign - "$APP"
+# Firma: con un certificado estable el llavero reconoce cada compilación nueva como la misma
+# app y no vuelve a pedir permiso para las contraseñas. Sin él, firma ad hoc (cambia en cada build).
+IDENTITY="${DATACRAFT_SIGN_IDENTITY:-DataCraft Dev}"
+if security find-certificate -c "$IDENTITY" >/dev/null 2>&1 \
+   && codesign --force --deep --identifier com.javy.datacraft --sign "$IDENTITY" "$APP" 2>/dev/null; then
+  echo "Firmado con el certificado «$IDENTITY»"
+else
+  codesign --force --deep --identifier com.javy.datacraft --sign - "$APP"
+  echo "Aviso: firmado ad hoc; el llavero pedirá permiso tras cada instalación (crea el certificado «$IDENTITY»)"
+fi
 echo "Generado $APP"
 
 if [[ "${1:-}" == "--install" ]]; then

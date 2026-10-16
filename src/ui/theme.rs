@@ -501,6 +501,33 @@ pub fn clipped_row<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut U
     r
 }
 
+/// Lado de una fila partida con `split_row`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Fila con un grupo a la izquierda y otro alineado a la derecha que nunca se pisan:
+/// primero se dibuja la derecha (que tiene prioridad) y la izquierda ocupa lo que sobra,
+/// recortada si no cabe. `add` se llama dos veces, una por lado.
+pub fn split_row(ui: &mut Ui, mut add: impl FnMut(&mut Ui, Side)) {
+    let rect = ui.available_rect_before_wrap();
+    let clip = ui.clip_rect();
+    let mut right =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    right.set_clip_rect(rect.intersect(clip));
+    add(&mut right, Side::Right);
+    let right_w = right.min_rect().width();
+    let left_right = (rect.right() - right_w - 8.0).max(rect.left());
+    let left_rect = Rect::from_min_max(rect.min, egui::pos2(left_right, rect.bottom()));
+    let mut left =
+        ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    left.set_clip_rect(left_rect.intersect(clip));
+    add(&mut left, Side::Left);
+    ui.advance_cursor_after_rect(rect);
+}
+
 /// Mitad del hueco entre islas (Island.borderWidth = 6).
 pub const ISLAND_GAP: i8 = 3;
 

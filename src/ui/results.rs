@@ -422,6 +422,129 @@ pub fn to_csv(view: &ResultView) -> String {
     out
 }
 
+/// Formatos de extracción (selector "CSV ⌄" de DataGrip).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExportFormat {
+    #[default]
+    Csv,
+    Tsv,
+    Json,
+    SqlInsert,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub const ALL: [ExportFormat; 5] =
+        [ExportFormat::Csv, ExportFormat::Tsv, ExportFormat::Json, ExportFormat::SqlInsert, ExportFormat::Markdown];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "CSV",
+            ExportFormat::Tsv => "TSV",
+            ExportFormat::Json => "JSON",
+            ExportFormat::SqlInsert => "SQL Inserts",
+            ExportFormat::Markdown => "Markdown",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Tsv => "tsv",
+            ExportFormat::Json => "json",
+            ExportFormat::SqlInsert => "sql",
+            ExportFormat::Markdown => "md",
+        }
+    }
+}
+
+fn json_string(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for ch in v.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Filas visibles (filtro y orden actuales) como texto en `fmt`. `insert_target` es la tabla
+/// ya entrecomillada para "SQL Inserts".
+pub fn format_rows(view: &ResultView, fmt: ExportFormat, insert_target: &str) -> String {
+    let cols = &view.rs.columns;
+    let rows: Vec<&Vec<Cell>> = view.order.iter().filter_map(|&r| view.rs.rows.get(r)).collect();
+    match fmt {
+        ExportFormat::Csv => to_csv(view),
+        ExportFormat::Tsv => {
+            let clean = |v: &str| v.replace(['\t', '\n', '\r'], " ");
+            let mut out = cols.iter().map(|c| clean(c)).collect::<Vec<_>>().join("\t");
+            out.push('\n');
+            for row in rows {
+                out.push_str(&row.iter().map(|c| c.as_deref().map(clean).unwrap_or_default()).collect::<Vec<_>>().join("\t"));
+                out.push('\n');
+            }
+            out
+        }
+        ExportFormat::Json => {
+            let items: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    let fields: Vec<String> = cols
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(c, v)| format!("{}: {}", json_string(c), v.as_deref().map_or("null".into(), json_string)))
+                        .collect();
+                    format!("  {{{}}}", fields.join(", "))
+                })
+                .collect();
+            if items.is_empty() { "[]\n".into() } else { format!("[\n{}\n]\n", items.join(",\n")) }
+        }
+        ExportFormat::SqlInsert => {
+            let col_list = cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+            let mut out = String::new();
+            for row in rows {
+                let vals = row
+                    .iter()
+                    .map(|v| v.as_deref().map_or("NULL".into(), |s| format!("'{}'", s.replace('\'', "''"))))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("INSERT INTO {insert_target} ({col_list}) VALUES ({vals});\n"));
+            }
+            out
+        }
+        ExportFormat::Markdown => {
+            let cell = |v: &str| v.replace('|', "\\|").replace(['\n', '\r'], " ");
+            let mut out = format!("| {} |\n", cols.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "));
+            out.push_str(&format!("|{}\n", " --- |".repeat(cols.len())));
+            for row in rows {
+                out.push_str(&format!("| {} |\n", row.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(" | ")));
+            }
+            out
+        }
+    }
+}
+
+/// Guarda las filas visibles en un fichero elegido por el usuario. Ok(false) si se cancela.
+pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str, base_name: &str) -> Result<bool, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title(format!("Exportar a {}", fmt.label()))
+        .add_filter(fmt.label(), &[fmt.extension()])
+        .set_file_name(format!("{base_name}.{}", fmt.extension()))
+        .save_file()
+    else {
+        return Ok(false);
+    };
+    std::fs::write(&path, format_rows(view, fmt, insert_target)).map(|_| true).map_err(|e| e.to_string())
+}
+
 pub fn export_csv(view: &ResultView) -> Result<bool, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("Exportar a CSV")
@@ -1177,5 +1300,34 @@ mod filter_tests {
         assert_eq!(compute_order(&rows(), None, &filters), vec![0, 1, 3]);
         assert_eq!(compute_order(&rows(), Some((0, SortDir::Desc)), &filters), vec![1, 3, 0]);
         assert_eq!(compute_order(&rows(), None, &BTreeMap::new()), vec![0, 1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    fn view() -> ResultView {
+        let rs = ResultSet {
+            columns: vec!["id".into(), "nota".into()],
+            rows: vec![vec![Some("1".into()), Some("a \"b\"\tc|d".into())], vec![Some("2".into()), None]],
+            ..Default::default()
+        };
+        ResultView::new(rs, 1)
+    }
+
+    #[test]
+    fn formatos_de_exportacion() {
+        let v = view();
+        assert_eq!(
+            format_rows(&v, ExportFormat::Json, ""),
+            "[\n  {\"id\": \"1\", \"nota\": \"a \\\"b\\\"\\tc|d\"},\n  {\"id\": \"2\", \"nota\": null}\n]\n"
+        );
+        assert_eq!(format_rows(&v, ExportFormat::Tsv, ""), "id\tnota\n1\ta \"b\" c|d\n2\t\n");
+        assert_eq!(
+            format_rows(&v, ExportFormat::SqlInsert, "[dbo].[t]"),
+            "INSERT INTO [dbo].[t] (\"id\", \"nota\") VALUES ('1', 'a \"b\"\tc|d');\nINSERT INTO [dbo].[t] (\"id\", \"nota\") VALUES ('2', NULL);\n"
+        );
+        assert_eq!(format_rows(&v, ExportFormat::Markdown, ""), "| id | nota |\n| --- | --- |\n| 1 | a \"b\"\tc\\|d |\n| 2 |  |\n");
     }
 }
