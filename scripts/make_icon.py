@@ -1,4 +1,4 @@
-"""Genera assets/DataCraft.icns (cilindro de base de datos sobre fondo redondeado)."""
+"""Generates assets/DataCraft.icns (database cylinder on a rounded background)."""
 import pathlib, subprocess, tempfile
 from PIL import Image, ImageDraw
 
@@ -6,12 +6,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 S = 1024
 
 def draw(size: int) -> Image.Image:
-    k = 4  # supermuestreo
+    k = 4  # supersampling
     n = size * k
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     m = int(n * 0.09)
-    # fondo con degradado vertical
+    # background with a vertical gradient
     grad = Image.new("RGBA", (n, n))
     gd = ImageDraw.Draw(grad)
     for y in range(n):
@@ -20,7 +20,7 @@ def draw(size: int) -> Image.Image:
     mask = Image.new("L", (n, n), 0)
     ImageDraw.Draw(mask).rounded_rectangle([m, m, n - m, n - m], radius=int(n * 0.2), fill=255)
     img.paste(grad, (0, 0), mask)
-    # cilindro
+    # cylinder
     cx, w = n // 2, int(n * 0.46)
     top, h, eh = int(n * 0.25), int(n * 0.5), int(n * 0.13)
     x0, x1 = cx - w // 2, cx + w // 2

@@ -1,4 +1,4 @@
-//! Componentes de interfaz.
+//! User interface components.
 
 pub mod connection_dialog;
 pub mod console;
@@ -10,7 +10,7 @@ pub mod theme;
 
 use crate::db::Driver;
 
-/// Estado resumido de una conexión, para componentes que no necesitan el detalle.
+/// Summarized connection status, for components that do not need the details.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnStatusKind {
     Disconnected,
@@ -19,21 +19,21 @@ pub enum ConnStatusKind {
     Error,
 }
 
-/// Resumen de una conexión para los selectores de las consolas.
+/// Connection summary for the console selectors.
 #[derive(Clone, Debug)]
 pub struct ConnSummary {
     pub id: crate::worker::ConnId,
     pub name: String,
     pub driver: Driver,
     pub status: ConnStatusKind,
-    /// Bases conocidas (vacío si no está conectada).
+    /// Known databases (empty if not connected).
     pub databases: Vec<String>,
-    /// Base por defecto de la conexión (si está conectada).
+    /// Default database of the connection (if connected).
     pub default_db: Option<String>,
 }
 
 impl ConnSummary {
-    /// Etiqueta "conexión · base" (SQLite solo tiene "main": se omite).
+    /// "connection · database" label (SQLite only has "main": it is omitted).
     pub fn label(&self, db: Option<&str>) -> String {
         match db.or(self.default_db.as_deref()) {
             Some(d) if self.driver != Driver::Sqlite => format!("{} · {d}", self.name),
@@ -42,18 +42,18 @@ impl ConnSummary {
     }
 }
 
-/// Índice de char -> índice de byte (acotado al final del texto).
+/// Char index -> byte index (clamped to the end of the text).
 pub fn char_to_byte(text: &str, char_idx: usize) -> usize {
     text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
 }
 
-/// Índice de byte -> índice de char.
+/// Byte index -> char index.
 pub fn byte_to_char(text: &str, byte_idx: usize) -> usize {
     let b = byte_idx.min(text.len());
     text.char_indices().take_while(|(i, _)| *i < b).count()
 }
 
-/// Entrecomilla un identificador según el dialecto.
+/// Quotes an identifier for the dialect.
 pub fn quote_ident(driver: Driver, name: &str) -> String {
     match driver {
         Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
@@ -61,7 +61,7 @@ pub fn quote_ident(driver: Driver, name: &str) -> String {
     }
 }
 
-/// Entrecomilla solo si hace falta (identificadores simples en minúsculas quedan igual).
+/// Quotes only when needed (simple lowercase identifiers are left as is).
 pub fn quote_ident_if_needed(driver: Driver, name: &str) -> String {
     let simple = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')

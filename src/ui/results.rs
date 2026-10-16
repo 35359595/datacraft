@@ -1,7 +1,8 @@
-//! Panel de resultados: grid de datos (TableBuilder virtualizado) con edición en línea,
-//! log de salida y exportación CSV.
+//! Results panel: data grid (virtualized TableBuilder) with inline editing,
+//! output log and CSV export.
 
 use crate::db::{Cell, ColumnInfo, ResultSet};
+use crate::i18n::{tr, trf};
 use crate::ui::editing::{EditState, EditTarget, RowRef};
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, pal};
@@ -17,24 +18,24 @@ pub enum SortDir {
     Desc,
 }
 
-/// Filtro local de una columna (embudo de la cabecera): valores originales que se muestran.
+/// Local filter of a column (header funnel): original values that are shown.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ColumnFilter {
     pub allowed: HashSet<Cell>,
 }
 
-/// Ventana del embudo abierta sobre una columna.
+/// Funnel popup open on a column.
 struct FilterPopup {
     col: usize,
     anchor: egui::Pos2,
     search: String,
-    /// Valores distintos de la columna con su número de apariciones (ordenados).
+    /// Distinct values of the column with their occurrence count (sorted).
     values: Vec<(Cell, usize)>,
-    /// El clic que la abrió no debe cerrarla en el mismo frame.
+    /// The click that opened it must not close it in the same frame.
     just_opened: bool,
 }
 
-/// Valores distintos de `col` con su recuento, en el orden del grid (números como números).
+/// Distinct values of `col` with their count, in grid order (numbers as numbers).
 fn distinct_values(rows: &[Vec<Cell>], col: usize) -> Vec<(Cell, usize)> {
     let mut counts: HashMap<&Cell, usize> = HashMap::new();
     for r in rows {
@@ -47,7 +48,7 @@ fn distinct_values(rows: &[Vec<Cell>], col: usize) -> Vec<(Cell, usize)> {
     out
 }
 
-/// Filas originales visibles: las que pasan todos los filtros, en el orden pedido.
+/// Visible original rows: those passing every filter, in the requested order.
 fn compute_order(rows: &[Vec<Cell>], sort: Option<(usize, SortDir)>, filters: &BTreeMap<usize, ColumnFilter>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..rows.len())
         .filter(|&r| filters.iter().all(|(c, f)| rows[r].get(*c).is_some_and(|v| f.allowed.contains(v))))
@@ -61,45 +62,45 @@ fn compute_order(rows: &[Vec<Cell>], sort: Option<(usize, SortDir)>, filters: &B
     order
 }
 
-/// Editor en línea abierto sobre una celda.
+/// Inline editor open on a cell.
 struct InlineEdit {
     row: RowRef,
     col: usize,
     buffer: String,
-    /// Pedir el foco (y seleccionar todo) en el próximo frame.
+    /// Request focus (and select all) on the next frame.
     focus: bool,
 }
 
-/// Estado de edición de un resultado editable.
+/// Edit state of an editable result.
 pub struct EditSession {
     pub target: EditTarget,
     pub state: EditState,
     editing: Option<InlineEdit>,
 }
 
-/// Un result set con estado de vista (orden, selección y edición).
+/// A result set with view state (order, selection and editing).
 pub struct ResultView {
     pub rs: ResultSet,
     pub title: String,
-    /// Permutación de filas según el orden actual.
+    /// Row permutation for the current order.
     order: Vec<usize>,
     sort: Option<(usize, SortDir)>,
-    /// Filtros locales por columna (embudo de la cabecera).
+    /// Local per-column filters (header funnel).
     filters: BTreeMap<usize, ColumnFilter>,
     filter_popup: Option<FilterPopup>,
-    /// Celda seleccionada (fila visual, columna).
+    /// Selected cell (visual row, column).
     selected: Option<(usize, usize)>,
-    /// Filas visuales seleccionadas (para eliminar varias).
+    /// Selected visual rows (to delete several).
     selected_rows: BTreeSet<usize>,
     anchor: Option<usize>,
     scroll_to: Option<usize>,
-    /// Sal para el id de la tabla (cambia en cada ejecución para reiniciar anchos).
+    /// Salt for the table id (changes on every run to reset widths).
     salt: u64,
-    /// Some si el resultado se puede editar.
+    /// Some if the result is editable.
     pub edit: Option<EditSession>,
-    /// Motivo por el que es de solo lectura (tooltip).
+    /// Why it is read-only (tooltip).
     pub readonly_reason: Option<String>,
-    /// true cuando la app ya decidió si es editable.
+    /// true once the app has decided whether it is editable.
     pub edit_checked: bool,
 }
 
@@ -147,7 +148,7 @@ impl ResultView {
         self.edit.as_ref().is_some_and(|e| e.state.can_undo())
     }
 
-    /// Descarta cambios pendientes y edición en curso.
+    /// Discards pending changes and any edit in progress.
     pub fn discard_edits(&mut self) {
         if let Some(e) = self.edit.as_mut() {
             e.state.clear();
@@ -172,7 +173,7 @@ impl ResultView {
         self.clamp_selection();
     }
 
-    /// Filas visibles: las originales (en el orden actual) y después las nuevas.
+    /// Visible rows: the original ones (in the current order), then the new ones.
     fn n_view_rows(&self) -> usize {
         self.order.len() + self.edit.as_ref().map_or(0, |e| e.state.inserted.len())
     }
@@ -195,7 +196,7 @@ impl ResultView {
         }
     }
 
-    /// Añade una fila nueva al final y abre el editor en su primera columna editable.
+    /// Appends a new row and opens the editor on its first editable column.
     pub fn add_row(&mut self) {
         let n_cols = self.rs.columns.len();
         let base = self.order.len();
@@ -210,7 +211,7 @@ impl ResultView {
         self.scroll_to = Some(vr);
     }
 
-    /// Filas seleccionadas como referencias a filas originales/nuevas.
+    /// Selected rows as references to original/new rows.
     fn selected_refs(&self) -> Vec<RowRef> {
         let mut rows: BTreeSet<usize> = self.selected_rows.clone();
         if let Some((r, _)) = self.selected {
@@ -223,7 +224,7 @@ impl ResultView {
         self.selected.is_some() || !self.selected_rows.is_empty()
     }
 
-    /// Marca para borrar las filas seleccionadas (las nuevas se quitan directamente).
+    /// Marks the selected rows for deletion (new ones are removed directly).
     pub fn delete_selected(&mut self) {
         let refs = self.selected_refs();
         let Some(e) = self.edit.as_mut() else { return };
@@ -235,7 +236,7 @@ impl ResultView {
         self.clamp_selection();
     }
 
-    /// Abre el editor en línea sobre la celda visual `(vr, col)` si es editable.
+    /// Opens the inline editor on visual cell `(vr, col)` if it is editable.
     fn start_edit(&mut self, vr: usize, col: usize) -> bool {
         let Some(row) = self.row_ref(vr) else { return false };
         let Some(e) = self.edit.as_mut() else { return false };
@@ -248,7 +249,7 @@ impl ResultView {
         true
     }
 
-    /// Confirma el editor en línea. `step` mueve a la celda editable siguiente/anterior.
+    /// Commits the inline editor. `step` moves to the next/previous editable cell.
     fn commit_edit(&mut self, step: i32) {
         let Some(e) = self.edit.as_mut() else { return };
         let Some(ed) = e.editing.take() else { return };
@@ -293,7 +294,7 @@ impl ResultView {
         self.order = compute_order(&self.rs.rows, self.sort, &self.filters);
     }
 
-    /// Filas originales ocultas por los filtros de columna.
+    /// Original rows hidden by the column filters.
     pub fn filtered_out(&self) -> usize {
         self.rs.rows.len() - self.order.len()
     }
@@ -309,7 +310,7 @@ impl ResultView {
         self.anchor = None;
     }
 
-    /// Valor mostrado (con cambios pendientes). `None` = celda nueva sin tocar.
+    /// Displayed value (with pending changes). `None` = untouched new cell.
     fn display_value(&self, row: RowRef, col: usize) -> Option<Cell> {
         match &self.edit {
             Some(e) => e.state.current(&self.rs, row, col),
@@ -330,12 +331,12 @@ impl ResultView {
         self.rs.rows.len()
     }
 
-    /// Abre el editor en línea en la celda visual `(vr, col)` (modo demo y atajos).
+    /// Opens the inline editor on visual cell `(vr, col)` (demo mode and shortcuts).
     pub fn begin_edit(&mut self, vr: usize, col: usize) -> bool {
         self.start_edit(vr, col)
     }
 
-    /// Confirma el editor en línea si hay uno abierto (antes de previsualizar o guardar).
+    /// Commits the inline editor if one is open (before previewing or saving).
     pub fn finish_inline_edit(&mut self) {
         self.commit_edit(0);
     }
@@ -362,7 +363,7 @@ fn compare_cells(a: Option<&Cell>, b: Option<&Cell>) -> Ordering {
     }
 }
 
-/// Título corto a partir de la sentencia.
+/// Short title from the statement.
 pub fn statement_title(sql: &str) -> String {
     let one_line = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&one_line, 28)
@@ -378,7 +379,7 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Entrada del log de ejecución.
+/// Execution log entry.
 pub struct OutputEntry {
     pub time: String,
     pub statement: String,
@@ -388,9 +389,9 @@ pub struct OutputEntry {
 
 pub fn affected_message(rs: &ResultSet) -> String {
     match rs.affected {
-        Some(1) => "1 fila afectada".into(),
-        Some(n) => format!("{n} filas afectadas"),
-        None => "OK".into(),
+        Some(1) => tr("1 row affected").into(),
+        Some(n) => trf("{n} rows affected", &[("n", &n)]),
+        None => tr("OK").into(),
     }
 }
 
@@ -399,7 +400,7 @@ pub fn format_duration(d: std::time::Duration) -> String {
     if ms < 1000.0 { format!("{ms:.0} ms") } else { format!("{:.2} s", ms / 1000.0) }
 }
 
-/// Escapa un valor para CSV (RFC 4180).
+/// Escapes a value for CSV (RFC 4180).
 pub fn csv_escape(value: &str) -> String {
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -422,7 +423,7 @@ pub fn to_csv(view: &ResultView) -> String {
     out
 }
 
-/// Formatos de extracción (selector "CSV ⌄" de DataGrip).
+/// Extraction formats (DataGrip's "CSV ⌄" selector).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ExportFormat {
     #[default]
@@ -476,8 +477,8 @@ fn json_string(v: &str) -> String {
     out
 }
 
-/// Filas visibles (filtro y orden actuales) como texto en `fmt`. `insert_target` es la tabla
-/// ya entrecomillada para "SQL Inserts".
+/// Visible rows (current filter and order) as text in `fmt`. `insert_target` is the already
+/// quoted table for "SQL Inserts".
 pub fn format_rows(view: &ResultView, fmt: ExportFormat, insert_target: &str) -> String {
     let cols = &view.rs.columns;
     let rows: Vec<&Vec<Cell>> = view.order.iter().filter_map(|&r| view.rs.rows.get(r)).collect();
@@ -532,10 +533,10 @@ pub fn format_rows(view: &ResultView, fmt: ExportFormat, insert_target: &str) ->
     }
 }
 
-/// Guarda las filas visibles en un fichero elegido por el usuario. Ok(false) si se cancela.
+/// Saves the visible rows to a file chosen by the user. Ok(false) if cancelled.
 pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str, base_name: &str) -> Result<bool, String> {
     let Some(path) = rfd::FileDialog::new()
-        .set_title(format!("Exportar a {}", fmt.label()))
+        .set_title(trf("Export to {format}", &[("format", &fmt.label())]))
         .add_filter(fmt.label(), &[fmt.extension()])
         .set_file_name(format!("{base_name}.{}", fmt.extension()))
         .save_file()
@@ -547,9 +548,9 @@ pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str,
 
 pub fn export_csv(view: &ResultView) -> Result<bool, String> {
     let Some(path) = rfd::FileDialog::new()
-        .set_title("Exportar a CSV")
+        .set_title(trf("Export to {format}", &[("format", &"CSV")]))
         .add_filter("CSV", &["csv"])
-        .set_file_name("resultado.csv")
+        .set_file_name(format!("{}.csv", tr("result")))
         .save_file()
     else {
         return Ok(false);
@@ -557,7 +558,7 @@ pub fn export_csv(view: &ResultView) -> Result<bool, String> {
     std::fs::write(&path, to_csv(view)).map(|_| true).map_err(|e| e.to_string())
 }
 
-/// Alto de fila y de cabecera del grid.
+/// Grid row and header height.
 const ROW_H: f32 = 24.0;
 const HEADER_H: f32 = 30.0;
 
@@ -566,7 +567,7 @@ fn is_numeric(v: &str) -> bool {
     !t.is_empty() && t.len() < 40 && t.parse::<f64>().is_ok()
 }
 
-/// Lo que el grid pide hacer tras dibujarse (se aplica fuera del TableBuilder).
+/// What the grid asks to do after drawing (applied outside the TableBuilder).
 enum GridAction {
     Sort(usize),
     OpenFilter(usize, egui::Pos2),
@@ -580,9 +581,9 @@ enum GridAction {
     Copy(String),
 }
 
-/// Dibuja un result set como grid de datos al estilo DataGrip. `columns_info` permite marcar
-/// las claves primarias en la cabecera. Si la vista es editable (`view.edit`), permite editar
-/// en línea (doble clic, Enter o F2). Devuelve un mensaje de error si la exportación falla.
+/// Draws a result set as a DataGrip-style data grid. `columns_info` marks primary keys in
+/// the header. If the view is editable (`view.edit`), allows inline editing (double click,
+/// Enter or F2). Returns an error message if exporting fails.
 pub fn show_result(
     ui: &mut Ui,
     view: &mut ResultView,
@@ -608,7 +609,7 @@ pub fn show_result(
     let filters_active: Vec<usize> = view.filters.keys().copied().collect();
     let editing_now = view.edit.as_ref().is_some_and(|e| e.editing.is_some());
 
-    // Teclado del grid (solo si ningún widget tiene el foco).
+    // Grid keyboard (only if no widget has focus).
     if ui.memory(|m| m.focused().is_none()) && !editing_now {
         if copy_requested
             && let Some((r, c)) = view.selected
@@ -639,12 +640,12 @@ pub fn show_result(
     let char_w = ui.fonts_mut(|f| f.glyph_width(&cell_font, '0'));
     let index_width = 22.0 + digits * char_w;
 
-    // Anchos iniciales según el contenido de las primeras filas.
+    // Initial widths from the content of the first rows.
     let initial_widths: Vec<f32> = (0..n_cols)
         .map(|c| {
             let header = view.rs.columns[c].chars().count();
             let content = view.rs.rows.iter().take(50).map(|r| r.get(c).and_then(|v| v.as_deref()).map_or(6, |v| v.chars().count())).max().unwrap_or(0);
-            // Cabecera: icono (24) + nombre en negrita + embudo y orden (44).
+            // Header: icon (24) + bold name + funnel and sort (44).
             let header_w = header as f32 * (char_w + 0.6) + 72.0;
             let content_w = content.min(40) as f32 * char_w + 22.0;
             header_w.max(content_w).clamp(60.0, 380.0)
@@ -655,7 +656,7 @@ pub fn show_result(
     let selected = view.selected;
     let selected_rows = view.selected_rows.clone();
     let scroll_to = view.scroll_to.take();
-    // El editor en línea se saca de la vista para poder editarlo mientras se lee `view`.
+    // The inline editor is taken out of the view so it can be edited while `view` is read.
     let mut inline = view.edit.as_mut().and_then(|e| e.editing.take());
     let edit_id = egui::Id::new(("cell_edit", view.salt));
 
@@ -726,7 +727,7 @@ pub fn show_result(
                         icons::paint(&painter, sr, sort_ico, sort_color, &p, true);
                     });
                     let on_funnel = resp.hover_pos().is_some_and(|pos| funnel_hit.contains(pos));
-                    let hint = if on_funnel { "Filtrar por valores".to_string() } else { format!("{name}\nClic para ordenar") };
+                    let hint = if on_funnel { tr("Filter by values").to_string() } else { trf("{name}\nClick to sort", &[("name", name)]) };
                     let resp = resp.on_hover_text(hint);
                     if resp.clicked() {
                         if resp.interact_pointer_pos().is_some_and(|pos| funnel_hit.contains(pos)) {
@@ -877,13 +878,13 @@ pub fn show_result(
                             actions.push(GridAction::StartEdit(vr, c));
                         }
                         let resp = if editable && !can_edit && resp.hovered() && edit.is_some_and(|e| !e.state.is_deleted(rref)) {
-                            resp.on_hover_text("Celda de solo lectura")
+                            resp.on_hover_text(tr("Read-only cell"))
                         } else {
                             resp
                         };
                         resp.context_menu(|ui| {
                             if editable {
-                                if ui.add_enabled(can_edit, egui::Button::new("Editar").shortcut_text("F2")).clicked() {
+                                if ui.add_enabled(can_edit, egui::Button::new(tr("Edit")).shortcut_text("F2")).clicked() {
                                     actions.push(GridAction::StartEdit(vr, c));
                                     ui.close();
                                 }
@@ -893,25 +894,25 @@ pub fn show_result(
                                     ui.close();
                                 }
                                 let revertible = deleted || edit.is_some_and(|e| e.state.is_modified(rref, c));
-                                if ui.add_enabled(revertible, egui::Button::new("Revertir cambio")).clicked() {
+                                if ui.add_enabled(revertible, egui::Button::new(tr("Revert change"))).clicked() {
                                     actions.push(GridAction::Revert(rref, c));
                                     ui.close();
                                 }
-                                if ui.add_enabled(!deleted, egui::Button::new("Eliminar fila")).clicked() {
+                                if ui.add_enabled(!deleted, egui::Button::new(tr("Delete row"))).clicked() {
                                     actions.push(GridAction::DeleteRows);
                                     ui.close();
                                 }
                                 ui.separator();
                             }
-                            if ui.button("Copiar valor").clicked() {
+                            if ui.button(tr("Copy value")).clicked() {
                                 actions.push(GridAction::Copy(value.clone().flatten().unwrap_or_default()));
                                 ui.close();
                             }
-                            if ui.button("Copiar fila (TSV)").clicked() {
+                            if ui.button(tr("Copy row (TSV)")).clicked() {
                                 actions.push(GridAction::Copy(view.row_tsv(vr)));
                                 ui.close();
                             }
-                            if ui.button("Copiar fila con cabeceras").clicked() {
+                            if ui.button(tr("Copy row with headers")).clicked() {
                                 actions.push(GridAction::Copy(format!("{}\n{}", view.rs.columns.join("\t"), view.row_tsv(vr))));
                                 ui.close();
                             }
@@ -997,29 +998,28 @@ fn ui_mods(resp: &egui::Response) -> Modifiers {
     resp.ctx.input(|i| i.modifiers)
 }
 
-/// Botones de edición de datos (+, −, deshacer, revertir, enviar) y "Preview".
-/// Devuelve true si se pidió la previsualización de cambios.
-/// Acción de la barra de edición que debe resolver la app.
+/// Edit bar action the app must resolve.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EditAction {
-    /// ⇧: guardar los cambios directamente.
+    /// ⇧: save the changes directly.
     Submit,
-    /// Abrir la ventana con el SQL de los cambios.
+    /// Open the window with the SQL of the changes.
     Preview,
 }
 
+/// Data edit buttons (+, −, undo, revert, submit) and "Preview".
 pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -> Option<EditAction> {
     let editable = enabled && view.as_ref().is_some_and(|v| v.edit.is_some());
     let dirty = editable && view.as_ref().is_some_and(|v| v.is_dirty());
     let can_undo = editable && view.as_ref().is_some_and(|v| v.can_undo());
     let has_sel = editable && view.as_ref().is_some_and(|v| v.has_selection());
-    let add = theme::icon_button(ui, Ico::Plus, editable, "Añadir fila");
-    let del = theme::icon_button(ui, Ico::Minus, has_sel, "Eliminar filas seleccionadas");
-    let undo = theme::icon_button(ui, Ico::Undo, can_undo, "Deshacer (⌘Z)");
-    let revert = theme::icon_button(ui, Ico::Revert, dirty, "Revertir todos los cambios");
-    let submit = theme::icon_button(ui, Ico::Submit, dirty, "Enviar cambios (⌘S)");
+    let add = theme::icon_button(ui, Ico::Plus, editable, tr("Add row"));
+    let del = theme::icon_button(ui, Ico::Minus, has_sel, tr("Delete selected rows"));
+    let undo = theme::icon_button(ui, Ico::Undo, can_undo, tr("Undo (⌘Z)"));
+    let revert = theme::icon_button(ui, Ico::Revert, dirty, tr("Revert all changes"));
+    let submit = theme::icon_button(ui, Ico::Submit, dirty, tr("Submit changes (⌘S)"));
     let pv = theme::flat_button(ui, Some(Ico::Eye), "Preview", FontId::proportional(13.0), false, dirty)
-        .on_hover_text("Previsualizar el SQL de los cambios pendientes");
+        .on_hover_text(tr("Preview the SQL of the pending changes"));
     if let Some(v) = view {
         if add.clicked() {
             v.add_row();
@@ -1043,8 +1043,8 @@ pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -
     }
 }
 
-/// Modo demo (`DATACRAFT_DEMO_FILTER=<columna>`): abre el embudo de esa columna y desmarca
-/// su primer valor, para poder capturar el filtro sin interactuar con la app.
+/// Demo mode (`DATACRAFT_DEMO_FILTER=<column>`): opens that column's funnel and unchecks
+/// its first value, to capture the filter without interacting with the app.
 fn demo_filter(view: &mut ResultView, area: Rect) {
     if view.filters.is_empty()
         && view.filter_popup.is_none()
@@ -1062,7 +1062,7 @@ fn demo_filter(view: &mut ResultView, area: Rect) {
     }
 }
 
-/// Ventana del embudo: buscar, marcar valores, todos/ninguno y quitar filtro.
+/// Funnel popup: search, check values, all/none and remove filter.
 fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
     let Some(popup) = view.filter_popup.as_mut() else { return };
     let p = pal(ui);
@@ -1078,10 +1078,10 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(260.0);
-                ui.label(RichText::new(format!("Filtrar «{col_name}»")).font(theme::bold(13.0)).color(p.text));
+                ui.label(RichText::new(trf("Filter “{column}”", &[("column", &col_name)])).font(theme::bold(13.0)).color(p.text));
                 ui.add_space(4.0);
                 let search = ui.add(
-                    egui::TextEdit::singleline(&mut popup.search).hint_text("Buscar valor…").desired_width(f32::INFINITY),
+                    egui::TextEdit::singleline(&mut popup.search).hint_text(tr("Search value…")).desired_width(f32::INFINITY),
                 );
                 if search.gained_focus() || ui.memory(|m| m.focused().is_none()) {
                     search.request_focus();
@@ -1089,7 +1089,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                 let needle = popup.search.to_lowercase();
                 let label_of = |v: &Cell| match v {
                     None => "<null>".to_string(),
-                    Some(s) if s.is_empty() => "<vacío>".to_string(),
+                    Some(s) if s.is_empty() => tr("<empty>").to_string(),
                     Some(s) => s.chars().take(80).collect(),
                 };
                 let shown: Vec<usize> = popup
@@ -1100,12 +1100,12 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                     .map(|(i, _)| i)
                     .collect();
                 ui.horizontal(|ui| {
-                    if ui.small_button("Todos").clicked() {
+                    if ui.small_button(tr("All")).clicked() {
                         let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
                         allowed.extend(shown.iter().map(|&i| popup.values[i].0.clone()));
                         new_filter = Some(Some(ColumnFilter { allowed }));
                     }
-                    if ui.small_button("Ninguno").clicked() {
+                    if ui.small_button(tr("None")).clicked() {
                         let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
                         for &i in &shown {
                             allowed.remove(&popup.values[i].0);
@@ -1113,7 +1113,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                         new_filter = Some(Some(ColumnFilter { allowed }));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(current.is_some(), egui::Button::new("Quitar filtro").small()).clicked() {
+                        if ui.add_enabled(current.is_some(), egui::Button::new(tr("Remove filter")).small()).clicked() {
                             new_filter = Some(None);
                             close = true;
                         }
@@ -1150,7 +1150,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                     },
                 );
                 if shown.is_empty() {
-                    ui.label(RichText::new("Sin coincidencias").color(p.muted));
+                    ui.label(RichText::new(tr("No matches")).color(p.muted));
                 }
             });
         });
@@ -1159,7 +1159,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
         close = true;
     }
     if let Some(f) = new_filter {
-        // Si están marcados todos los valores, el filtro sobra.
+        // If every value is checked, the filter is redundant.
         let total = view.filter_popup.as_ref().map_or(0, |p| p.values.len());
         let f = f.filter(|f| f.allowed.len() < total || view.filter_popup.as_ref().is_some_and(|p| p.values.iter().any(|(v, _)| !f.allowed.contains(v))));
         view.set_filter(col, f);
@@ -1169,7 +1169,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
     }
 }
 
-/// Píldora flotante centrada en la parte inferior del grid: "N rows ⌄  ⋮".
+/// Floating pill centred at the bottom of the grid: "N rows ⌄  ⋮".
 fn row_count_pill(ui: &Ui, view: &ResultView, area: Rect) -> Option<String> {
     let p = pal(ui);
     let n = view.rs.rows.len();
@@ -1197,18 +1197,18 @@ fn row_count_pill(ui: &Ui, view: &ResultView, area: Rect) -> Option<String> {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(2.0, 1.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
             child.spacing_mut().item_spacing.x = 0.0;
             let rows_btn = theme::flat_button(&mut child, None, &text, font.clone(), true, true)
-                .on_hover_text(format!("Consulta ejecutada en {}", format_duration(view.rs.elapsed)));
+                .on_hover_text(trf("Query executed in {time}", &[("time", &format_duration(view.rs.elapsed))]));
             theme::toolbar_separator(&mut child);
             let more = theme::icon_button_sized(&mut child, Ico::MoreVert, true, "", 24.0);
             for resp in [rows_btn, more] {
                 egui::Popup::menu(&resp).show(|ui| {
-                    if ui.button("Exportar a CSV…").clicked() {
+                    if ui.button(tr("Export to CSV…")).clicked() {
                         if let Err(e) = export_csv(view) {
-                            error = Some(format!("No se pudo exportar: {e}"));
+                            error = Some(trf("Export failed: {error}", &[("error", &e)]));
                         }
                         ui.close();
                     }
-                    if ui.button("Copiar todo (CSV)").clicked() {
+                    if ui.button(tr("Copy all (CSV)")).clicked() {
                         ui.ctx().copy_text(to_csv(view));
                         ui.close();
                     }
@@ -1218,7 +1218,7 @@ fn row_count_pill(ui: &Ui, view: &ResultView, area: Rect) -> Option<String> {
     error
 }
 
-/// Log de ejecuciones.
+/// Execution log.
 pub fn show_output(ui: &mut Ui, log: &[OutputEntry]) {
     let pal = pal(ui);
     egui::ScrollArea::both()
@@ -1227,7 +1227,7 @@ pub fn show_output(ui: &mut Ui, log: &[OutputEntry]) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             if log.is_empty() {
-                ui.label(RichText::new("Sin ejecuciones todavía.").color(pal.muted));
+                ui.label(RichText::new(tr("No executions yet.")).color(pal.muted));
             }
             for e in log {
                 ui.horizontal(|ui| {
@@ -1257,7 +1257,7 @@ mod tests {
     fn csv_escaping() {
         assert_eq!(csv_escape("abc"), "abc");
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
-        assert_eq!(csv_escape("di \"hola\""), "\"di \"\"hola\"\"\"");
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_escape("x\ny"), "\"x\ny\"");
     }
 
@@ -1286,7 +1286,7 @@ mod filter_tests {
     }
 
     #[test]
-    fn valores_distintos_con_recuento_y_orden_numerico() {
+    fn distinct_values_with_count_and_numeric_order() {
         let d = distinct_values(&rows(), 0);
         let labels: Vec<_> = d.iter().map(|(v, n)| (v.clone().unwrap_or_default(), *n)).collect();
         assert_eq!(labels, [("1".into(), 1), ("2".into(), 2), ("10".into(), 1)]);
@@ -1294,7 +1294,7 @@ mod filter_tests {
     }
 
     #[test]
-    fn filtro_y_orden_combinados() {
+    fn combined_filter_and_sort() {
         let mut filters = BTreeMap::new();
         filters.insert(1, ColumnFilter { allowed: HashSet::from([Some("b".to_string()), None]) });
         assert_eq!(compute_order(&rows(), None, &filters), vec![0, 1, 3]);
@@ -1309,7 +1309,7 @@ mod export_tests {
 
     fn view() -> ResultView {
         let rs = ResultSet {
-            columns: vec!["id".into(), "nota".into()],
+            columns: vec!["id".into(), "note".into()],
             rows: vec![vec![Some("1".into()), Some("a \"b\"\tc|d".into())], vec![Some("2".into()), None]],
             ..Default::default()
         };
@@ -1317,17 +1317,17 @@ mod export_tests {
     }
 
     #[test]
-    fn formatos_de_exportacion() {
+    fn export_formats() {
         let v = view();
         assert_eq!(
             format_rows(&v, ExportFormat::Json, ""),
-            "[\n  {\"id\": \"1\", \"nota\": \"a \\\"b\\\"\\tc|d\"},\n  {\"id\": \"2\", \"nota\": null}\n]\n"
+            "[\n  {\"id\": \"1\", \"note\": \"a \\\"b\\\"\\tc|d\"},\n  {\"id\": \"2\", \"note\": null}\n]\n"
         );
-        assert_eq!(format_rows(&v, ExportFormat::Tsv, ""), "id\tnota\n1\ta \"b\" c|d\n2\t\n");
+        assert_eq!(format_rows(&v, ExportFormat::Tsv, ""), "id\tnote\n1\ta \"b\" c|d\n2\t\n");
         assert_eq!(
             format_rows(&v, ExportFormat::SqlInsert, "[dbo].[t]"),
-            "INSERT INTO [dbo].[t] (\"id\", \"nota\") VALUES ('1', 'a \"b\"\tc|d');\nINSERT INTO [dbo].[t] (\"id\", \"nota\") VALUES ('2', NULL);\n"
+            "INSERT INTO [dbo].[t] (\"id\", \"note\") VALUES ('1', 'a \"b\"\tc|d');\nINSERT INTO [dbo].[t] (\"id\", \"note\") VALUES ('2', NULL);\n"
         );
-        assert_eq!(format_rows(&v, ExportFormat::Markdown, ""), "| id | nota |\n| --- | --- |\n| 1 | a \"b\"\tc\\|d |\n| 2 |  |\n");
+        assert_eq!(format_rows(&v, ExportFormat::Markdown, ""), "| id | note |\n| --- | --- |\n| 1 | a \"b\"\tc\\|d |\n| 2 |  |\n");
     }
 }

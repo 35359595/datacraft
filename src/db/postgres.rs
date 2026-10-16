@@ -1,7 +1,7 @@
-//! Driver PostgreSQL sobre `tokio-postgres` (sin TLS).
+//! PostgreSQL driver on top of `tokio-postgres` (no TLS).
 //!
-//! Se usa el protocolo simple: los valores llegan ya como texto y admite
-//! varias sentencias separadas por `;` en una sola llamada.
+//! It uses the simple protocol: values already arrive as text and it accepts
+//! several `;`-separated statements in a single call.
 
 use std::time::{Duration, Instant};
 
@@ -10,21 +10,22 @@ use futures_util::TryStreamExt;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use super::{ColumnInfo, ConnectionConfig, ObjectKind, ResultSet, SchemaInfo, TableInfo};
+use crate::i18n::trf;
 
 pub struct PgSession {
     client: Client,
 }
 
-/// Traduce un error de tokio-postgres a un mensaje legible (mensaje + detalle + pista).
+/// Turns a tokio-postgres error into a readable message (message + detail + hint).
 fn pg_error(e: tokio_postgres::Error) -> anyhow::Error {
     match e.as_db_error() {
         Some(db) => {
             let mut msg = format!("{}: {}", db.severity(), db.message());
             if let Some(detail) = db.detail() {
-                msg.push_str(&format!("\nDetalle: {detail}"));
+                msg.push_str(&trf("\nDetail: {detail}", &[("detail", &detail)]));
             }
             if let Some(hint) = db.hint() {
-                msg.push_str(&format!("\nSugerencia: {hint}"));
+                msg.push_str(&trf("\nHint: {hint}", &[("hint", &hint)]));
             }
             anyhow!(msg)
         }
@@ -46,7 +47,7 @@ impl PgSession {
         }
 
         let (client, connection) = pg.connect(NoTls).await.map_err(pg_error)?;
-        // La conexión es la que realmente lee/escribe el socket; debe vivir en su propia tarea.
+        // The connection is what actually reads/writes the socket; it must live in its own task.
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -72,7 +73,7 @@ impl PgSession {
     }
 
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
-        // Si algo falla, `tx` se suelta sin commit y tokio-postgres hace ROLLBACK.
+        // If anything fails, `tx` is dropped without commit and tokio-postgres issues a ROLLBACK.
         let tx = self.client.transaction().await.map_err(pg_error)?;
         let mut total = 0;
         for stmt in statements {
@@ -95,7 +96,7 @@ impl PgSession {
         let mut stream = std::pin::pin!(self.client.simple_query_raw(sql).await.map_err(pg_error)?);
 
         let mut results = Vec::new();
-        // Result set en curso (abierto por un RowDescription).
+        // Result set in progress (opened by a RowDescription).
         let mut current: Option<ResultSet> = None;
         let mut start = Instant::now();
 
@@ -135,7 +136,7 @@ impl PgSession {
                 _ => {}
             }
         }
-        // Por si el servidor no envió CommandComplete tras la descripción.
+        // In case the server didn't send CommandComplete after the description.
         if let Some(mut rs) = current {
             rs.elapsed = start.elapsed();
             results.push(rs);
@@ -187,10 +188,10 @@ impl PgSession {
             }
             let Some(t) = s.tables.last_mut() else { continue };
 
-            // Tabla sin columnas visibles: el LEFT JOIN deja la columna a NULL.
+            // Table without visible columns: the LEFT JOIN leaves the column NULL.
             let Ok(Some(column)) = row.try_get(3) else { continue };
             let data_type = match get(4) {
-                // Para arrays y tipos de usuario information_schema da poco detalle.
+                // information_schema gives little detail for arrays and user-defined types.
                 "ARRAY" => format!("{}[]", get(5).trim_start_matches('_')),
                 "USER-DEFINED" => get(5).to_string(),
                 other => other.to_string(),
@@ -208,8 +209,8 @@ impl PgSession {
 
 #[cfg(test)]
 mod tests {
-    //! Tests contra un PostgreSQL real. Se ejecutan con `cargo test -- --ignored` y las variables:
-    //! DATACRAFT_PG_HOST (obligatoria; sin ella se omite), DATACRAFT_PG_PORT (5432), DATACRAFT_PG_USER (postgres),
+    //! Tests against a real PostgreSQL. Run them with `cargo test -- --ignored` and the variables:
+    //! DATACRAFT_PG_HOST (required; skipped without it), DATACRAFT_PG_PORT (5432), DATACRAFT_PG_USER (postgres),
     //! DATACRAFT_PG_PASSWORD, DATACRAFT_PG_DB (postgres).
 
     use super::*;
@@ -221,25 +222,25 @@ mod tests {
 
     async fn session() -> Option<PgSession> {
         let Ok(host) = std::env::var("DATACRAFT_PG_HOST") else {
-            eprintln!("DATACRAFT_PG_HOST no definida: se omite el test de PostgreSQL");
+            eprintln!("DATACRAFT_PG_HOST not set: skipping the PostgreSQL test");
             return None;
         };
         let mut cfg = ConnectionConfig::new(1, Driver::Postgres);
         cfg.host = host;
-        cfg.port = env("DATACRAFT_PG_PORT", "5432").parse().expect("puerto");
+        cfg.port = env("DATACRAFT_PG_PORT", "5432").parse().expect("port");
         cfg.user = env("DATACRAFT_PG_USER", "postgres");
         cfg.password = env("DATACRAFT_PG_PASSWORD", "");
         cfg.database = env("DATACRAFT_PG_DB", "postgres");
-        Some(PgSession::connect(&cfg).await.expect("conexión"))
+        Some(PgSession::connect(&cfg).await.expect("connection"))
     }
 
     #[tokio::test]
     #[ignore]
-    async fn tipos_variados() {
+    async fn mixed_types() {
         let Some(mut s) = session().await else { return };
         let rs = s
             .execute(
-                "SELECT 42::int AS i, 12.50::numeric(10,2) AS n, 'hola'::text AS t, true AS b, \
+                "SELECT 42::int AS i, 12.50::numeric(10,2) AS n, 'hello'::text AS t, true AS b, \
                  DATE '2026-10-16' AS d, '6f1c1b1e-0000-4000-8000-000000000001'::uuid AS u, NULL::int AS z",
                 100,
             )
@@ -253,7 +254,7 @@ mod tests {
             [
                 Some("42"),
                 Some("12.50"),
-                Some("hola"),
+                Some("hello"),
                 Some("t"),
                 Some("2026-10-16"),
                 Some("6f1c1b1e-0000-4000-8000-000000000001"),
@@ -264,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn ddl_dml_varias_sentencias_e_introspeccion() {
+    async fn ddl_dml_multiple_statements_and_introspection() {
         let Some(mut s) = session().await else { return };
         s.execute("DROP SCHEMA IF EXISTS dc_test CASCADE; CREATE SCHEMA dc_test", 10).await.unwrap();
         let rs = s
@@ -290,7 +291,7 @@ mod tests {
 
         s.execute("CREATE VIEW dc_test.v AS SELECT id FROM dc_test.items", 10).await.unwrap();
         let schemas = s.introspect().await.unwrap();
-        let sch = schemas.iter().find(|s| s.name == "dc_test").expect("esquema");
+        let sch = schemas.iter().find(|s| s.name == "dc_test").expect("schema");
         assert_eq!(sch.tables.len(), 2);
         let items = &sch.tables[0];
         assert_eq!(items.name, "items");
@@ -302,8 +303,8 @@ mod tests {
         assert_eq!(sch.tables[1].kind, ObjectKind::View);
         assert!(!schemas.iter().any(|s| s.name == "pg_catalog" || s.name == "information_schema"));
 
-        let err = s.execute("SELECT * FROM dc_test.no_existe", 10).await.unwrap_err();
-        assert!(err.to_string().contains("no_existe"), "{err}");
+        let err = s.execute("SELECT * FROM dc_test.missing", 10).await.unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
         s.execute("DROP SCHEMA dc_test CASCADE", 10).await.unwrap();
     }
 }

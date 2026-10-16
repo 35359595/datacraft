@@ -1,11 +1,12 @@
-//! Hilo de fondo con runtime tokio. La UI envía `Request`s y recoge `Response`s
-//! con `Worker::poll` en cada frame; el worker pide repintado al terminar cada tarea.
+//! Background thread with a tokio runtime. The UI sends `Request`s and collects `Response`s
+//! with `Worker::poll` every frame; the worker requests a repaint when each task finishes.
 //!
-//! Cada conexión puede tener varias bases de datos. SQL Server y SQLite usan una única
-//! sesión (con `USE [db]` antes de cada operación en SQL Server); PostgreSQL abre una
-//! sesión por base, porque una conexión de PG no puede cambiar de base.
+//! Each connection can have several databases. SQL Server and SQLite use a single
+//! session (with `USE [db]` before each operation on SQL Server); PostgreSQL opens one
+//! session per database, because a PG connection cannot switch databases.
 
 use crate::db::{ConnectionConfig, DatabaseInfo, Driver, ResultSet, SchemaInfo, Session};
+use crate::i18n::{tr, trf};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -16,17 +17,17 @@ pub type ConnId = u64;
 pub type ConsoleId = u64;
 
 pub enum Request {
-    /// Abre (o reabre) la conexión, lista sus bases y carga el esquema de la base por defecto.
+    /// Opens (or reopens) the connection, lists its databases and loads the default database's schema.
     Connect(ConnectionConfig),
-    /// Solo prueba la conexión y la cierra.
+    /// Only tests the connection and closes it.
     Test(ConnectionConfig),
     Disconnect(ConnId),
-    /// Vuelve a listar las bases y recarga la base por defecto.
+    /// Lists the databases again and reloads the default one.
     Refresh(ConnId),
-    /// Carga (o recarga) el esquema de una base concreta.
+    /// Loads (or reloads) the schema of a specific database.
     LoadDatabase { conn: ConnId, db: String },
-    /// Ejecuta sentencias en orden; se detiene en el primer error.
-    /// `db`: base en la que ejecutar (`None` = la base por defecto de la conexión).
+    /// Runs statements in order; stops at the first error.
+    /// `db`: database to run them in (`None` = the connection's default database).
     Execute {
         conn: ConnId,
         db: Option<String>,
@@ -34,7 +35,7 @@ pub enum Request {
         statements: Vec<String>,
         max_rows: usize,
     },
-    /// Guarda cambios del editor de datos (sentencias de `edit::change_sql`) en una transacción.
+    /// Saves data editor changes (statements from `edit::change_sql`) in one transaction.
     ApplyChanges {
         conn: ConnId,
         db: Option<String>,
@@ -44,22 +45,22 @@ pub enum Request {
 }
 
 pub enum Response {
-    /// `databases` en orden; la por defecto lleva `current = true` y su esquema cargado.
+    /// `databases` in order; the default one has `current = true` and its schema loaded.
     Connected { conn: ConnId, databases: Vec<DatabaseInfo> },
     ConnectFailed { conn: ConnId, error: String },
     TestResult { conn: ConnId, result: Result<(), String> },
     Disconnected(ConnId),
-    /// Respuesta a `Refresh`: misma forma que `Connected`.
+    /// Reply to `Refresh`: same shape as `Connected`.
     Refreshed { conn: ConnId, databases: Vec<DatabaseInfo> },
     DatabaseLoaded { conn: ConnId, db: String, result: Result<Vec<SchemaInfo>, String> },
-    /// `results` contiene lo ejecutado antes del error (si lo hubo).
+    /// `results` holds what ran before the error (if there was one).
     Executed {
         console: ConsoleId,
         results: Vec<ResultSet>,
         error: Option<String>,
         elapsed: std::time::Duration,
     },
-    /// Resultado de `ApplyChanges`: filas modificadas o error (y entonces no se guardó nada).
+    /// Result of `ApplyChanges`: modified rows or an error (in which case nothing was saved).
     ChangesApplied { console: ConsoleId, result: Result<u64, String> },
 }
 
@@ -83,8 +84,8 @@ impl Worker {
                 rt.block_on(async move {
                     let state = Arc::new(State::default());
                     while let Some(req) = req_rx.recv().await {
-                        // La generación se sella aquí, en orden de llegada: un Disconnect
-                        // posterior a un Connect invalida ese Connect aunque termine después.
+                        // The epoch is stamped here, in arrival order: a Disconnect after a
+                        // Connect invalidates that Connect even if it finishes later.
                         let epoch = state.bump_if_lifecycle(&req);
                         let state = state.clone();
                         let out = resp_tx.clone();
@@ -114,19 +115,19 @@ impl Worker {
 
 type SharedSession = Arc<Mutex<Session>>;
 
-/// Conexión abierta: configuración (con contraseña, solo en memoria) y sus sesiones.
+/// Open connection: settings (with password, in memory only) and its sessions.
 struct Live {
     cfg: ConnectionConfig,
-    /// Base por defecto (la de la sesión principal).
+    /// Default database (that of the main session).
     default_db: String,
-    /// Clave "" = sesión principal. En PostgreSQL, además, una sesión por base extra.
+    /// Key "" = main session. On PostgreSQL, also one session per extra database.
     sessions: HashMap<String, SharedSession>,
 }
 
 #[derive(Default)]
 struct State {
     live: Mutex<HashMap<ConnId, Live>>,
-    /// Generación por conexión: cambia con cada Connect/Disconnect.
+    /// Epoch per connection: changes with every Connect/Disconnect.
     epochs: std::sync::Mutex<HashMap<ConnId, u64>>,
 }
 
@@ -148,14 +149,14 @@ impl State {
         epochs.get(&conn).copied().unwrap_or_default()
     }
 
-    /// Sesión con la que operar sobre `db` y el nombre de base a pasar al driver.
-    /// En PostgreSQL abre (y guarda) una sesión nueva si la base no es la por defecto.
+    /// Session to operate on `db` with, and the database name to pass to the driver.
+    /// On PostgreSQL it opens (and keeps) a new session if the database isn't the default one.
     async fn session_for(&self, conn: ConnId, db: Option<&str>) -> anyhow::Result<(SharedSession, String)> {
         let (cfg, default_db, main, existing) = {
             let live = self.live.lock().await;
-            let l = live.get(&conn).ok_or_else(|| anyhow::anyhow!("La conexión no está abierta"))?;
+            let l = live.get(&conn).ok_or_else(|| anyhow::anyhow!(tr("The connection is not open")))?;
             let target = db.filter(|d| !d.is_empty()).unwrap_or(&l.default_db).to_string();
-            let main = l.sessions.get("").cloned().ok_or_else(|| anyhow::anyhow!("La conexión no está abierta"))?;
+            let main = l.sessions.get("").cloned().ok_or_else(|| anyhow::anyhow!(tr("The connection is not open")))?;
             let existing = l.sessions.get(&target).cloned();
             (l.cfg.clone(), l.default_db.clone(), main, existing)
         };
@@ -171,7 +172,7 @@ impl State {
         let epoch = self.current_epoch(conn);
         let session = Arc::new(Mutex::new(Session::connect(&extra_cfg).await?));
         let mut live = self.live.lock().await;
-        // Si mientras tanto se desconectó, no se guarda (la sesión se cierra al soltarla).
+        // If it was disconnected meanwhile, don't keep it (the session closes when dropped).
         if self.current_epoch(conn) == epoch
             && let Some(l) = live.get_mut(&conn)
         {
@@ -181,13 +182,13 @@ impl State {
         Ok((session, target))
     }
 
-    /// Quita la sesión si sigue siendo la misma (se perdió la conexión).
+    /// Removes the session if it is still the same one (the connection was lost).
     async fn forget(&self, conn: ConnId, session: &SharedSession) {
         let mut live = self.live.lock().await;
         let Some(l) = live.get_mut(&conn) else { return };
         let key = l.sessions.iter().find(|(_, s)| Arc::ptr_eq(s, session)).map(|(k, _)| k.clone());
         match key.as_deref() {
-            // Sin sesión principal la conexión entera queda cerrada.
+            // Without the main session the whole connection is closed.
             Some("") => {
                 live.remove(&conn);
             }
@@ -207,7 +208,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             match connect_and_load(&cfg).await {
                 Ok((session, default_db, databases)) => {
                     let mut live = state.live.lock().await;
-                    // Desconectada o reconectada mientras tanto: esta sesión sobra.
+                    // Disconnected or reconnected meanwhile: this session is not needed.
                     if state.current_epoch(conn) != epoch {
                         return vec![];
                     }
@@ -273,7 +274,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             let mut out = vec![Response::ChangesApplied { console, result }];
             if lost {
                 state.forget(conn, &session).await;
-                out.push(Response::ConnectFailed { conn, error: "Conexión perdida".into() });
+                out.push(Response::ConnectFailed { conn, error: tr("Connection lost").into() });
             }
             out
         }
@@ -310,10 +311,10 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             drop(s);
             let mut out = vec![Response::Executed { console, results, error: error.clone(), elapsed: start.elapsed() }];
             if lost {
-                // Se olvida la sesión rota; la UI reconectará en la siguiente ejecución.
+                // Forget the broken session; the UI will reconnect on the next run.
                 state.forget(conn, &session).await;
                 let detail = error.unwrap_or_default();
-                out.push(Response::ConnectFailed { conn, error: format!("Conexión perdida. {detail}") });
+                out.push(Response::ConnectFailed { conn, error: trf("Connection lost. {detail}", &[("detail", &detail)]) });
             }
             out
         }
@@ -327,7 +328,7 @@ async fn connect_and_load(cfg: &ConnectionConfig) -> anyhow::Result<(Session, St
     Ok((session, default_db, databases))
 }
 
-/// Lista de bases con el esquema de la por defecto ya cargado.
+/// List of databases with the default one's schema already loaded.
 async fn load_databases(session: &mut Session, default_db: &str) -> anyhow::Result<Vec<DatabaseInfo>> {
     let mut names = session.list_databases().await?;
     if !names.iter().any(|n| n == default_db) {

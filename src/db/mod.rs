@@ -1,7 +1,7 @@
-//! Capa de acceso a datos: tipos comunes y despacho a cada driver.
+//! Data access layer: common types and dispatch to each driver.
 //!
-//! Todos los drivers convierten los valores a texto (`Cell`) para que la UI
-//! no tenga que conocer los tipos nativos de cada motor.
+//! Every driver converts values to text (`Cell`) so the UI doesn't need to
+//! know each engine's native types.
 
 pub mod mssql;
 pub mod postgres;
@@ -37,8 +37,8 @@ impl Driver {
     }
 }
 
-/// Configuración persistida de una conexión. La contraseña NO se guarda aquí,
-/// va al llavero de macOS (ver `config.rs`) y se rellena en `password` en memoria.
+/// Persisted connection settings. The password is NOT stored here: it goes to the
+/// macOS Keychain (see `config.rs`) and is filled into `password` in memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectionConfig {
@@ -51,9 +51,9 @@ pub struct ConnectionConfig {
     pub user: String,
     #[serde(skip)]
     pub password: String,
-    /// Ruta del fichero para SQLite.
+    /// File path for SQLite.
     pub file_path: String,
-    /// SQL Server: aceptar certificados autofirmados.
+    /// SQL Server: accept self-signed certificates.
     pub trust_cert: bool,
 }
 
@@ -88,25 +88,25 @@ impl ConnectionConfig {
     }
 }
 
-/// Valor de una celda ya formateado. `None` = NULL.
+/// Already formatted cell value. `None` = NULL.
 pub type Cell = Option<String>;
 
-/// Resultado de UNA sentencia.
+/// Result of ONE statement.
 #[derive(Debug, Clone, Default)]
 pub struct ResultSet {
-    /// Sentencia que lo produjo (para el título de la pestaña de resultados).
+    /// Statement that produced it (for the title of the results tab).
     pub statement: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Cell>>,
-    /// Filas afectadas (DML) si el driver lo sabe.
+    /// Affected rows (DML) if the driver knows them.
     pub affected: Option<u64>,
-    /// true si se cortaron filas por llegar a `max_rows`.
+    /// true if rows were cut off on reaching `max_rows`.
     pub truncated: bool,
     pub elapsed: Duration,
 }
 
 impl ResultSet {
-    /// Sentencias sin columnas (INSERT, CREATE...).
+    /// Statements without columns (INSERT, CREATE...).
     pub fn is_command(&self) -> bool {
         self.columns.is_empty()
     }
@@ -139,21 +139,24 @@ pub struct SchemaInfo {
     pub tables: Vec<TableInfo>,
 }
 
-/// Base de datos del servidor. `schemas` es `None` hasta que se carga (al expandirla).
+/// Server database. `schemas` is `None` until it is loaded (when expanded).
 #[derive(Debug, Clone)]
 pub struct DatabaseInfo {
     pub name: String,
-    /// Base por defecto de la conexión.
+    /// Default database of the connection.
     pub current: bool,
     pub schemas: Option<Vec<SchemaInfo>>,
 }
 
-/// Error estándar cuando un cambio no afecta exactamente a una fila.
+/// Standard error when a change does not affect exactly one row.
 pub(crate) fn not_single_row(n: u64, stmt: &str) -> anyhow::Error {
-    anyhow::anyhow!("La sentencia afectó a {n} filas (se esperaba 1); no se ha guardado nada:\n{stmt}")
+    anyhow::anyhow!(crate::i18n::trf(
+        "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}",
+        &[("n", &n), ("stmt", &stmt)]
+    ))
 }
 
-/// Sesión abierta contra un motor concreto.
+/// Open session against a specific engine.
 pub enum Session {
     Postgres(postgres::PgSession),
     Sqlite(sqlite::SqliteSession),
@@ -169,8 +172,8 @@ impl Session {
         })
     }
 
-    /// Ejecuta UNA sentencia (o un lote T-SQL) y devuelve uno o varios result sets.
-    /// Cada result set guarda como mucho `max_rows` filas.
+    /// Runs ONE statement (or a T-SQL batch) and returns one or more result sets.
+    /// Each result set keeps at most `max_rows` rows.
     pub async fn execute(&mut self, sql: &str, max_rows: usize) -> anyhow::Result<Vec<ResultSet>> {
         match self {
             Session::Postgres(s) => s.execute(sql, max_rows).await,
@@ -179,7 +182,7 @@ impl Session {
         }
     }
 
-    /// Base a la que está conectada la sesión al abrirla.
+    /// Database the session is connected to when opened.
     pub async fn current_database(&mut self) -> anyhow::Result<String> {
         match self {
             Session::Postgres(s) => s.current_database().await,
@@ -188,7 +191,7 @@ impl Session {
         }
     }
 
-    /// Bases visibles en el servidor (SQLite: solo "main").
+    /// Databases visible on the server (SQLite: just "main").
     pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
         match self {
             Session::Postgres(s) => s.list_databases().await,
@@ -197,13 +200,13 @@ impl Session {
         }
     }
 
-    /// Esquema de `db`. En PostgreSQL la sesión ya debe estar conectada a esa base.
+    /// Schema of `db`. On PostgreSQL the session must already be connected to that database.
     pub async fn introspect_database(&mut self, db: &str) -> anyhow::Result<Vec<SchemaInfo>> {
         self.use_database(db).await?;
         self.introspect().await
     }
 
-    /// SQL Server: `USE [db]`. En los demás motores no hace nada (cada sesión es de una base).
+    /// SQL Server: `USE [db]`. A no-op on the other engines (each session is bound to one database).
     pub async fn use_database(&mut self, db: &str) -> anyhow::Result<()> {
         match self {
             Session::MsSql(s) if !db.is_empty() => s.use_database(db).await,
@@ -211,9 +214,9 @@ impl Session {
         }
     }
 
-    /// Aplica cambios del editor de datos en UNA transacción. Cada sentencia debe afectar
-    /// exactamente a una fila; si alguna falla o afecta a 0 o varias, se deshace todo.
-    /// Devuelve el total de filas modificadas.
+    /// Applies data editor changes in ONE transaction. Each statement must affect exactly
+    /// one row; if any fails or affects 0 or several, everything is rolled back.
+    /// Returns the total number of modified rows.
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
         match self {
             Session::Postgres(s) => s.apply_changes(statements).await,
@@ -222,7 +225,7 @@ impl Session {
         }
     }
 
-    /// true si la conexión se ha perdido (socket cerrado, error de protocolo...).
+    /// true if the connection has been lost (socket closed, protocol error...).
     pub fn is_closed(&self) -> bool {
         match self {
             Session::Postgres(s) => s.is_closed(),
@@ -231,7 +234,7 @@ impl Session {
         }
     }
 
-    /// Esquemas, tablas/vistas y columnas (sin objetos de sistema).
+    /// Schemas, tables/views and columns (no system objects).
     pub async fn introspect(&mut self) -> anyhow::Result<Vec<SchemaInfo>> {
         match self {
             Session::Postgres(s) => s.introspect().await,
@@ -240,7 +243,7 @@ impl Session {
         }
     }
 
-    /// Nombre cualificado y entrecomillado según el dialecto, p.ej. `"public"."users"` o `[dbo].[users]`.
+    /// Qualified name quoted for the dialect, e.g. `"public"."users"` or `[dbo].[users]`.
     pub fn quote_table(driver: Driver, schema: &str, table: &str) -> String {
         match driver {
             Driver::Postgres => format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\"")),

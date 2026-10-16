@@ -1,41 +1,45 @@
-//! Menú nativo de la barra de menús de macOS (crate `muda`).
+//! Native macOS menu bar menu (`muda` crate).
 //!
-//! **Estrategia de atajos:** el menú nativo es quien dispara las acciones. Un acelerador de
-//! menú consume la pulsación en `-[NSApplication sendEvent:]` antes de que llegue a la vista
-//! de winit, así que egui nunca ve esa tecla (no hay doble ejecución) y los atajos duplicados
-//! de egui quedan muertos: hay que quitarlos de `DataCraftApp::shortcuts`.
+//! **Shortcut strategy:** the native menu is what triggers the actions. A menu accelerator
+//! consumes the key press in `-[NSApplication sendEvent:]` before it reaches the winit view,
+//! so egui never sees that key (no double execution) and egui's duplicate shortcuts are
+//! dead: they must be removed from `DataCraftApp::shortcuts`.
 //!
-//! **Edición:** la vista de winit no implementa `copy:`/`paste:`/`undo:`…, y muda desactiva el
-//! autoenable de los menús, así que los `PredefinedMenuItem` de edición se comerían ⌘C/⌘V sin
-//! que nadie los atendiera y egui dejaría de copiar/pegar. Por eso Edición usa ítems propios y
-//! [`NativeMenu::poll`] reenvía la acción a egui tal y como la generaría egui-winit: `Event::Copy`
-//! / `Event::Cut`, `ViewportCommand::RequestPaste` (egui-winit lee el portapapeles y emite
-//! `Event::Paste` en el frame siguiente) y `Event::Key` con ⌘ para deshacer, rehacer y
-//! seleccionar todo. Para que esos eventos lleguen en el mismo frame, llamar a `poll` desde
-//! `App::logic` (antes de pintar la UI).
+//! **Edit:** the winit view doesn't implement `copy:`/`paste:`/`undo:`…, and muda disables
+//! menu autoenabling, so the predefined edit `PredefinedMenuItem`s would swallow ⌘C/⌘V with
+//! nobody handling them and egui would stop copying/pasting. That's why Edit uses its own
+//! items and [`NativeMenu::poll`] forwards the action to egui just as egui-winit would
+//! generate it: `Event::Copy` / `Event::Cut`, `ViewportCommand::RequestPaste` (egui-winit
+//! reads the clipboard and emits `Event::Paste` on the next frame) and `Event::Key` with ⌘
+//! for undo, redo and select all. For those events to arrive in the same frame, call `poll`
+//! from `App::logic` (before painting the UI).
 //!
-//! **Salir:** ítem propio (no `terminate:`) para que la app cierre con
-//! `ViewportCommand::Close` y pueda guardar estado / avisar de cambios pendientes.
+//! **Quit:** own item (not `terminate:`) so the app closes with `ViewportCommand::Close`
+//! and can save state / warn about pending changes.
+//!
+//! **Language:** every label goes through [`tr`]; after changing the language call
+//! [`NativeMenu::relabel`].
 
+use crate::i18n::{tr, tr_ctx};
 use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{Receiver, channel};
 
-/// Acción elegida en el menú nativo.
+/// Action chosen in the native menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCommand {
     // DataCraft
     About,
     Settings,
     Quit,
-    // Archivo
+    // File
     NewConnection,
     NewConsole,
     OpenSql,
     SaveSqlAs,
     CloseTab,
-    // Edición (las gestiona `poll`; solo `Find` llega a la app)
+    // Edit (handled by `poll`; only `Find` reaches the app)
     Undo,
     Redo,
     Cut,
@@ -43,7 +47,7 @@ pub enum MenuCommand {
     Paste,
     SelectAll,
     Find,
-    // Ver
+    // View
     ToggleExplorer,
     ToggleResults,
     ThemeLight,
@@ -54,12 +58,12 @@ pub enum MenuCommand {
     FontBigger,
     FontSmaller,
     FontReset,
-    // Ejecutar
+    // Run
     Run,
     RunAll,
     SaveChanges,
     Reload,
-    // Ayuda
+    // Help
     Help,
 }
 
@@ -97,7 +101,7 @@ impl MenuCommand {
         Self::Help,
     ];
 
-    /// Id del ítem de muda (`Debug` del variante, único por construcción).
+    /// muda item id (the variant's `Debug`, unique by construction).
     fn id(self) -> String {
         format!("datacraft.{self:?}")
     }
@@ -106,13 +110,13 @@ impl MenuCommand {
         Self::ALL.into_iter().find(|c| c.id() == id)
     }
 
-    /// Comandos de edición que `poll` reenvía a egui en vez de devolverlos.
+    /// Edit commands that `poll` forwards to egui instead of returning them.
     fn is_text_edit(self) -> bool {
         matches!(self, Self::Undo | Self::Redo | Self::Cut | Self::Copy | Self::Paste | Self::SelectAll)
     }
 }
 
-/// Menú nativo instalado en NSApp. Mantenerlo vivo mientras dure la app.
+/// Native menu installed in NSApp. Keep it alive for the lifetime of the app.
 pub struct NativeMenu {
     _menu: Menu,
     ctx: egui::Context,
@@ -121,30 +125,59 @@ pub struct NativeMenu {
     theme_dark: CheckMenuItem,
     explorer: CheckMenuItem,
     results: CheckMenuItem,
-    /// Último estado sincronizado (dark, explorer, results) para no tocar AppKit cada frame.
+    /// Every translatable entry (menus, submenus and items) with the function that
+    /// returns its text in the active language; used by [`NativeMenu::relabel`].
+    labels: Vec<Labeled>,
+    /// Last synced state (dark, explorer, results) so AppKit isn't touched every frame.
     synced: Cell<Option<(bool, bool, bool)>>,
 }
 
+/// Menu entry whose text can be changed after creation.
+enum Entry {
+    Item(MenuItem),
+    Check(CheckMenuItem),
+    Submenu(Submenu),
+    Predefined(PredefinedMenuItem),
+}
+
+/// An entry and its label (a `tr("…")` call, re-evaluated on each relabel).
+struct Labeled {
+    entry: Entry,
+    text: fn() -> &'static str,
+}
+
+impl Labeled {
+    fn apply(&self) {
+        let text = (self.text)();
+        match &self.entry {
+            Entry::Item(i) => i.set_text(text),
+            Entry::Check(c) => c.set_text(text),
+            Entry::Submenu(s) => s.set_text(text),
+            Entry::Predefined(p) => p.set_text(text),
+        }
+    }
+}
+
 impl NativeMenu {
-    /// Crea e instala el menú en NSApp. Llamar una vez, desde el hilo principal y con la app
-    /// ya lanzada (p.ej. en `DataCraftApp::new` con `&cc.egui_ctx`): sustituye al menú por
-    /// defecto de winit. Devuelve `None` si no se está en el hilo principal o si falla.
+    /// Creates the menu and installs it in NSApp. Call it once, from the main thread and with
+    /// the app already launched (e.g. in `DataCraftApp::new` with `&cc.egui_ctx`): it replaces
+    /// winit's default menu. Returns `None` when not on the main thread or if it fails.
     pub fn install(ctx: &egui::Context) -> Option<Self> {
         if std::thread::current().name() != Some("main") {
             return None;
         }
-        let (menu, theme_light, theme_dark, explorer, results) = match build() {
-            Ok(m) => m,
+        let built = match build() {
+            Ok(b) => b,
             Err(e) => {
-                eprintln!("menú nativo: {e}");
+                eprintln!("native menu: {e}");
                 return None;
             }
         };
-        menu.init_for_nsapp();
+        built.menu.init_for_nsapp();
 
         let (tx, rx) = channel();
         let repaint = ctx.clone();
-        // Solo se puede fijar una vez por proceso (OnceLock en muda).
+        // Can only be set once per process (OnceLock in muda).
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             if let Some(cmd) = MenuCommand::from_id(e.id().as_ref()) {
                 let _ = tx.send(cmd);
@@ -152,15 +185,25 @@ impl NativeMenu {
             }
         }));
 
-        Some(Self { _menu: menu, ctx: ctx.clone(), rx, theme_light, theme_dark, explorer, results, synced: Cell::new(None) })
+        Some(Self {
+            _menu: built.menu,
+            ctx: ctx.clone(),
+            rx,
+            theme_light: built.theme_light,
+            theme_dark: built.theme_dark,
+            explorer: built.explorer,
+            results: built.results,
+            labels: built.labels,
+            synced: Cell::new(None),
+        })
     }
 
-    /// Comandos pulsados desde el último frame (no bloquea). Los de edición (deshacer, rehacer,
-    /// cortar, copiar, pegar, seleccionar todo) se reenvían a egui aquí y no se devuelven.
+    /// Commands clicked since the last frame (non-blocking). Edit commands (undo, redo,
+    /// cut, copy, paste, select all) are forwarded to egui here and not returned.
     pub fn poll(&self) -> Vec<MenuCommand> {
         let mut out = Vec::new();
         for cmd in self.rx.try_iter() {
-            // Un clic en un CheckMenuItem invierte su check: resincronizar en el próximo `sync`.
+            // A click on a CheckMenuItem toggles its check: resync on the next `sync`.
             self.synced.set(None);
             if cmd.is_text_edit() {
                 forward_edit(&self.ctx, cmd);
@@ -171,7 +214,7 @@ impl NativeMenu {
         out
     }
 
-    /// Sincroniza los checks con el estado de la app (barato: solo toca AppKit si cambia).
+    /// Syncs the checks with the app state (cheap: only touches AppKit when it changes).
     pub fn sync(&self, dark: bool, explorer_visible: bool, results_visible: bool) {
         let state = (dark, explorer_visible, results_visible);
         if self.synced.get() == Some(state) {
@@ -183,11 +226,20 @@ impl NativeMenu {
         self.results.set_checked(results_visible);
         self.synced.set(Some(state));
     }
+
+    /// Sets the text of every menu, submenu and item again in the active language.
+    ///
+    /// Call it from the main thread right after `crate::i18n::set_lang` so the menu bar
+    /// follows the language chosen in the app (the labels are only translated when built).
+    /// Accelerators, checks and ids don't change.
+    pub fn relabel(&self) {
+        for l in &self.labels {
+            l.apply();
+        }
+    }
 }
 
-
-
-/// Reenvía a egui una acción de edición como si viniera del teclado.
+/// Forwards an edit action to egui as if it came from the keyboard.
 fn forward_edit(ctx: &egui::Context, cmd: MenuCommand) {
     use egui::{Event, Key, Modifiers as M};
     let cmd_mods = M::MAC_CMD | M::COMMAND;
@@ -196,7 +248,7 @@ fn forward_edit(ctx: &egui::Context, cmd: MenuCommand) {
         MenuCommand::Copy => Event::Copy,
         MenuCommand::Cut => Event::Cut,
         MenuCommand::Paste => {
-            // egui-winit lee el portapapeles y emite `Event::Paste` en el frame siguiente.
+            // egui-winit reads the clipboard and emits `Event::Paste` on the next frame.
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             ctx.request_repaint();
             return;
@@ -209,120 +261,139 @@ fn forward_edit(ctx: &egui::Context, cmd: MenuCommand) {
     ctx.input_mut(|i| i.events.push(event));
 }
 
-type Built = (Menu, CheckMenuItem, CheckMenuItem, CheckMenuItem, CheckMenuItem);
+struct Built {
+    menu: Menu,
+    theme_light: CheckMenuItem,
+    theme_dark: CheckMenuItem,
+    explorer: CheckMenuItem,
+    results: CheckMenuItem,
+    labels: Vec<Labeled>,
+}
+
+type Label = fn() -> &'static str;
 
 fn build() -> muda::Result<Built> {
+    let labels = RefCell::new(Vec::new());
+    let keep = |entry: Entry, text: Label| labels.borrow_mut().push(Labeled { entry, text });
+
     let cmd = Modifiers::META;
     let acc = |mods: Modifiers, code: Code| Some(Accelerator::new(mods, code));
-    let item = |c: MenuCommand, text: &str, a: Option<Accelerator>| MenuItem::with_id(c.id(), text, true, a);
+    let item = |c: MenuCommand, text: Label, a: Option<Accelerator>| {
+        let i = MenuItem::with_id(c.id(), text(), true, a);
+        keep(Entry::Item(i.clone()), text);
+        i
+    };
     let check = |c: MenuCommand, text: &str| CheckMenuItem::with_id(c.id(), text, true, false, None);
+    let predefined = |p: PredefinedMenuItem, text: Label| {
+        keep(Entry::Predefined(p.clone()), text);
+        p
+    };
+    let submenu = |text: Label, items: &[&dyn muda::IsMenuItem]| -> muda::Result<Submenu> {
+        let s = Submenu::with_items(text(), true, items)?;
+        keep(Entry::Submenu(s.clone()), text);
+        Ok(s)
+    };
     let sep = PredefinedMenuItem::separator;
 
     let app_menu = Submenu::with_items(
         "DataCraft",
         true,
         &[
-            &item(MenuCommand::About, "Acerca de DataCraft", None),
+            &item(MenuCommand::About, || tr("About DataCraft"), None),
             &sep(),
-            &item(MenuCommand::Settings, "Ajustes…", acc(cmd, Code::Comma)),
+            &item(MenuCommand::Settings, || tr("Settings…"), acc(cmd, Code::Comma)),
             &sep(),
-            &PredefinedMenuItem::services(Some("Servicios")),
+            &predefined(PredefinedMenuItem::services(Some(tr("Services"))), || tr("Services")),
             &sep(),
-            &PredefinedMenuItem::hide(Some("Ocultar DataCraft")),
-            &PredefinedMenuItem::hide_others(Some("Ocultar otros")),
-            &PredefinedMenuItem::show_all(Some("Mostrar todo")),
+            &predefined(PredefinedMenuItem::hide(Some(tr("Hide DataCraft"))), || tr("Hide DataCraft")),
+            &predefined(PredefinedMenuItem::hide_others(Some(tr("Hide Others"))), || tr("Hide Others")),
+            &predefined(PredefinedMenuItem::show_all(Some(tr("Show All"))), || tr("Show All")),
             &sep(),
-            &item(MenuCommand::Quit, "Salir de DataCraft", acc(cmd, Code::KeyQ)),
+            &item(MenuCommand::Quit, || tr("Quit DataCraft"), acc(cmd, Code::KeyQ)),
         ],
     )?;
 
-    let file_menu = Submenu::with_items(
-        "Archivo",
-        true,
+    let file_menu = submenu(
+        || tr("File"),
         &[
-            &item(MenuCommand::NewConnection, "Nueva conexión…", None),
-            &item(MenuCommand::NewConsole, "Nueva consola", acc(cmd | Modifiers::SHIFT, Code::KeyN)),
-            &item(MenuCommand::OpenSql, "Abrir script SQL…", acc(cmd, Code::KeyO)),
-            &item(MenuCommand::SaveSqlAs, "Guardar consola como…", acc(cmd | Modifiers::SHIFT, Code::KeyS)),
+            &item(MenuCommand::NewConnection, || tr("New connection…"), None),
+            &item(MenuCommand::NewConsole, || tr("New console"), acc(cmd | Modifiers::SHIFT, Code::KeyN)),
+            &item(MenuCommand::OpenSql, || tr("Open SQL script…"), acc(cmd, Code::KeyO)),
+            &item(MenuCommand::SaveSqlAs, || tr("Save console as…"), acc(cmd | Modifiers::SHIFT, Code::KeyS)),
             &sep(),
-            &item(MenuCommand::CloseTab, "Cerrar pestaña", acc(cmd, Code::KeyW)),
+            &item(MenuCommand::CloseTab, || tr("Close tab"), acc(cmd, Code::KeyW)),
         ],
     )?;
 
-    let edit_menu = Submenu::with_items(
-        "Edición",
-        true,
+    let edit_menu = submenu(
+        || tr_ctx("menu", "Edit"),
         &[
-            &item(MenuCommand::Undo, "Deshacer", acc(cmd, Code::KeyZ)),
-            &item(MenuCommand::Redo, "Rehacer", acc(cmd | Modifiers::SHIFT, Code::KeyZ)),
+            &item(MenuCommand::Undo, || tr("Undo"), acc(cmd, Code::KeyZ)),
+            &item(MenuCommand::Redo, || tr("Redo"), acc(cmd | Modifiers::SHIFT, Code::KeyZ)),
             &sep(),
-            &item(MenuCommand::Cut, "Cortar", acc(cmd, Code::KeyX)),
-            &item(MenuCommand::Copy, "Copiar", acc(cmd, Code::KeyC)),
-            &item(MenuCommand::Paste, "Pegar", acc(cmd, Code::KeyV)),
-            &item(MenuCommand::SelectAll, "Seleccionar todo", acc(cmd, Code::KeyA)),
+            &item(MenuCommand::Cut, || tr("Cut"), acc(cmd, Code::KeyX)),
+            &item(MenuCommand::Copy, || tr("Copy"), acc(cmd, Code::KeyC)),
+            &item(MenuCommand::Paste, || tr("Paste"), acc(cmd, Code::KeyV)),
+            &item(MenuCommand::SelectAll, || tr("Select all"), acc(cmd, Code::KeyA)),
             &sep(),
-            &item(MenuCommand::Find, "Buscar…", acc(cmd, Code::KeyF)),
+            &item(MenuCommand::Find, || tr("Find…"), acc(cmd, Code::KeyF)),
         ],
     )?;
 
+    // Product names: the same in every language.
     let theme_light = check(MenuCommand::ThemeLight, "Islands Light");
     let theme_dark = check(MenuCommand::ThemeDark, "Islands Dark");
     let explorer = check(MenuCommand::ToggleExplorer, "Database Explorer");
-    let results = check(MenuCommand::ToggleResults, "Panel de resultados");
-    let theme_menu = Submenu::with_items("Tema", true, &[&theme_light, &theme_dark])?;
-    let zoom_menu = Submenu::with_items(
-        "Zoom IDE",
-        true,
+    let results = check(MenuCommand::ToggleResults, tr("Results panel"));
+    keep(Entry::Check(results.clone()), || tr("Results panel"));
+    let theme_menu = submenu(|| tr("Theme"), &[&theme_light, &theme_dark])?;
+    let zoom_menu = submenu(
+        || tr("IDE zoom"),
         &[
-            &item(MenuCommand::ZoomIn, "Acercar", acc(cmd, Code::Equal)),
-            &item(MenuCommand::ZoomOut, "Alejar", acc(cmd, Code::Minus)),
-            &item(MenuCommand::ZoomReset, "Restablecer", acc(cmd, Code::Digit0)),
+            &item(MenuCommand::ZoomIn, || tr("Zoom In"), acc(cmd, Code::Equal)),
+            &item(MenuCommand::ZoomOut, || tr("Zoom Out"), acc(cmd, Code::Minus)),
+            &item(MenuCommand::ZoomReset, || tr("Reset"), acc(cmd, Code::Digit0)),
         ],
     )?;
-    let font_menu = Submenu::with_items(
-        "Fuente del editor",
-        true,
+    let font_menu = submenu(
+        || tr("Editor font"),
         &[
-            &item(MenuCommand::FontBigger, "Aumentar", acc(cmd | Modifiers::ALT, Code::Equal)),
-            &item(MenuCommand::FontSmaller, "Reducir", acc(cmd | Modifiers::ALT, Code::Minus)),
-            &item(MenuCommand::FontReset, "Restablecer", None),
+            &item(MenuCommand::FontBigger, || tr("Increase"), acc(cmd | Modifiers::ALT, Code::Equal)),
+            &item(MenuCommand::FontSmaller, || tr("Decrease"), acc(cmd | Modifiers::ALT, Code::Minus)),
+            &item(MenuCommand::FontReset, || tr("Reset"), None),
         ],
     )?;
-    let view_menu = Submenu::with_items(
-        "Ver",
-        true,
-        &[&explorer, &results, &sep(), &theme_menu, &zoom_menu, &font_menu],
-    )?;
+    let view_menu = submenu(|| tr("View"), &[&explorer, &results, &sep(), &theme_menu, &zoom_menu, &font_menu])?;
 
-    let run_menu = Submenu::with_items(
-        "Ejecutar",
-        true,
+    let run_menu = submenu(
+        || tr("Run"),
         &[
-            &item(MenuCommand::Run, "Ejecutar sentencia", acc(cmd, Code::Enter)),
-            &item(MenuCommand::RunAll, "Ejecutar todo", acc(cmd | Modifiers::SHIFT, Code::Enter)),
+            &item(MenuCommand::Run, || tr("Run statement"), acc(cmd, Code::Enter)),
+            &item(MenuCommand::RunAll, || tr("Run all"), acc(cmd | Modifiers::SHIFT, Code::Enter)),
             &sep(),
-            &item(MenuCommand::SaveChanges, "Guardar cambios del grid", acc(cmd, Code::KeyS)),
-            &item(MenuCommand::Reload, "Recargar datos", acc(cmd, Code::KeyR)),
+            &item(MenuCommand::SaveChanges, || tr("Save grid changes"), acc(cmd, Code::KeyS)),
+            &item(MenuCommand::Reload, || tr("Reload data"), acc(cmd, Code::KeyR)),
         ],
     )?;
 
-    let window_menu = Submenu::with_items(
-        "Ventana",
-        true,
+    let window_menu = submenu(
+        || tr("Window"),
         &[
-            &PredefinedMenuItem::minimize(Some("Minimizar")),
+            &predefined(PredefinedMenuItem::minimize(Some(tr("Minimize"))), || tr("Minimize")),
             &PredefinedMenuItem::maximize(Some("Zoom")),
             &sep(),
-            &PredefinedMenuItem::bring_all_to_front(Some("Traer todo al frente")),
+            &predefined(PredefinedMenuItem::bring_all_to_front(Some(tr("Bring All to Front"))), || {
+                tr("Bring All to Front")
+            }),
         ],
     )?;
     window_menu.set_as_windows_menu_for_nsapp();
 
-    let help_menu = Submenu::with_items("Ayuda", true, &[&item(MenuCommand::Help, "Ayuda de DataCraft", None)])?;
+    let help_menu = submenu(|| tr("Help"), &[&item(MenuCommand::Help, || tr("DataCraft Help"), None)])?;
     help_menu.set_as_help_menu_for_nsapp();
 
     let menu = Menu::with_items(&[&app_menu, &file_menu, &edit_menu, &view_menu, &run_menu, &window_menu, &help_menu])?;
-    Ok((menu, theme_light, theme_dark, explorer, results))
+    Ok(Built { menu, theme_light, theme_dark, explorer, results, labels: labels.into_inner() })
 }
 
 #[cfg(test)]
@@ -334,6 +405,6 @@ mod tests {
         for c in MenuCommand::ALL {
             assert_eq!(MenuCommand::from_id(&c.id()), Some(c));
         }
-        assert_eq!(MenuCommand::from_id("otro"), None);
+        assert_eq!(MenuCommand::from_id("other"), None);
     }
 }

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Compila en release y genera target/release/DataCraft.app (opcional: --install copia a /Applications).
+# Builds in release mode and generates target/release/DataCraft.app (optional: --install copies it to /Applications).
 set -euo pipefail
 cd "${0:A:h}/.."
 source "$HOME/.cargo/env" 2>/dev/null || true
@@ -27,7 +27,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleDevelopmentRegion</key><string>es</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleLocalizations</key><array><string>en</string><string>es</string></array>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -45,20 +46,20 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Firma: con un certificado estable el llavero reconoce cada compilación nueva como la misma
-# app y no vuelve a pedir permiso para las contraseñas. Sin él, firma ad hoc (cambia en cada build).
+# Signing: with a stable certificate the Keychain recognizes every new build as the same app
+# and doesn't ask for password access again. Without it, ad hoc signing (changes on every build).
 IDENTITY="${DATACRAFT_SIGN_IDENTITY:-DataCraft}"
 if security find-certificate -c "$IDENTITY" >/dev/null 2>&1 \
    && codesign --force --deep --identifier app.datacraft --sign "$IDENTITY" "$APP" 2>/dev/null; then
-  echo "Firmado con el certificado «$IDENTITY»"
+  echo "Signed with the \"$IDENTITY\" certificate"
 else
   codesign --force --deep --identifier app.datacraft --sign - "$APP"
-  echo "Aviso: firmado ad hoc; el llavero pedirá permiso tras cada instalación (crea el certificado «$IDENTITY»)"
+  echo "Warning: ad hoc signature; the Keychain will ask for permission after every install (create the \"$IDENTITY\" certificate)"
 fi
-echo "Generado $APP"
+echo "Generated $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
   rm -rf /Applications/DataCraft.app
   cp -R "$APP" /Applications/
-  echo "Instalado en /Applications/DataCraft.app"
+  echo "Installed at /Applications/DataCraft.app"
 fi

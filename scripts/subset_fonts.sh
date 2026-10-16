@@ -1,6 +1,6 @@
 #!/bin/zsh
-# Recorta Inter y JetBrains Mono (OFL) a los rangos Unicode útiles y sin hinting,
-# que egui no usa. Origen: las fuentes que trae DataGrip, o las pasadas en $1.
+# Subsets Inter and JetBrains Mono (OFL) to the useful Unicode ranges, without hinting
+# (egui doesn't use it). Source: the fonts bundled with DataGrip, or the ones given in $1.
 set -euo pipefail
 cd "${0:A:h}/.."
 SRC="${1:-/Applications/DataGrip.app/Contents/jbr/Contents/Home/lib/fonts}"

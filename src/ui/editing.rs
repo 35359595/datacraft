@@ -1,25 +1,26 @@
-//! Edición de datos en el grid (lógica pura, sin UI): cambios pendientes, detección de
-//! consultas editables sobre una única tabla y conversión a `edit::Change`.
+//! Grid data editing (pure logic, no UI): pending changes, detection of editable
+//! single-table queries and conversion to `edit::Change`.
 
 use crate::db::{Cell, ColumnInfo, ObjectKind, ResultSet, SchemaInfo};
 use crate::edit::{Change, is_lossy_display};
+use crate::i18n::{tr, trf};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Tabla destino de un resultado editable.
+/// Target table of an editable result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditTarget {
     pub schema: String,
     pub table: String,
-    /// Nombre real (en la tabla) de cada columna del resultado.
+    /// Real name (in the table) of each result column.
     pub col_names: Vec<String>,
-    /// Columnas del resultado que identifican una fila (PK o, sin PK, todas las no binarias).
+    /// Result columns that identify a row (the PK or, without a PK, all non-binary ones).
     pub key_cols: Vec<usize>,
-    /// Columnas binarias: no se editan (el grid las muestra en hex).
+    /// Binary columns: not editable (the grid shows them in hex).
     pub binary_cols: Vec<bool>,
     pub has_pk: bool,
 }
 
-/// Fila del grid: original del result set o nueva (índice en `EditState::inserted`).
+/// Grid row: original from the result set or new (index into `EditState::inserted`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
 pub enum RowRef {
     Existing(usize),
@@ -33,22 +34,22 @@ struct Snapshot {
     deleted: BTreeSet<usize>,
 }
 
-/// Cambios pendientes de un result set. Las filas existentes se indexan por su posición
-/// ORIGINAL en `ResultSet::rows` (no por la posición visual tras ordenar).
+/// Pending changes of a result set. Existing rows are indexed by their ORIGINAL position
+/// in `ResultSet::rows` (not by the visual position after sorting).
 #[derive(Clone, Debug, Default)]
 pub struct EditState {
-    /// (fila original, columna) -> valor nuevo.
+    /// (original row, column) -> new value.
     pub changes: BTreeMap<(usize, usize), Cell>,
-    /// Filas nuevas; `None` = columna sin tocar (no va en el INSERT).
+    /// New rows; `None` = untouched column (left out of the INSERT).
     pub inserted: Vec<Vec<Option<Cell>>>,
-    /// Filas originales marcadas para borrar.
+    /// Original rows marked for deletion.
     pub deleted: BTreeSet<usize>,
     history: Vec<Snapshot>,
 }
 
 const MAX_HISTORY: usize = 500;
 
-/// Tipos que el grid muestra como hex y no se pueden editar como texto.
+/// Types the grid shows as hex and that cannot be edited as text.
 pub fn is_binary_type(data_type: &str) -> bool {
     let t = data_type.to_lowercase();
     ["blob", "binary", "bytea", "image", "rowversion"].iter().any(|k| t.contains(k))
@@ -67,7 +68,7 @@ impl EditState {
         Snapshot { changes: self.changes.clone(), inserted: self.inserted.clone(), deleted: self.deleted.clone() }
     }
 
-    /// Guarda el estado actual para poder deshacer el siguiente cambio.
+    /// Saves the current state so the next change can be undone.
     fn checkpoint(&mut self) {
         let s = self.snapshot();
         self.history.push(s);
@@ -97,12 +98,12 @@ impl EditState {
         }
     }
 
-    /// Descarta todo, también el historial (tras guardar o al recargar).
+    /// Discards everything, history included (after saving or reloading).
     pub fn clear(&mut self) {
         *self = Self::default();
     }
 
-    /// Valor actual de una celda. `None` = celda de una fila nueva sin tocar (DEFAULT).
+    /// Current value of a cell. `None` = untouched cell of a new row (DEFAULT).
     pub fn current(&self, rs: &ResultSet, row: RowRef, col: usize) -> Option<Cell> {
         match row {
             RowRef::Existing(r) => match self.changes.get(&(r, col)) {
@@ -124,7 +125,7 @@ impl EditState {
         matches!(row, RowRef::Existing(r) if self.deleted.contains(&r))
     }
 
-    /// true si la fila se puede identificar (su clave no tiene valores recortados).
+    /// true if the row can be identified (its key has no truncated values).
     pub fn row_identifiable(&self, rs: &ResultSet, target: &EditTarget, row: RowRef) -> bool {
         match row {
             RowRef::New(_) => true,
@@ -149,8 +150,8 @@ impl EditState {
         }
     }
 
-    /// Asigna un valor. Si coincide con el original, la celda deja de estar modificada.
-    /// Devuelve true si cambió algo.
+    /// Sets a value. If it matches the original, the cell is no longer modified.
+    /// Returns true if anything changed.
     pub fn set_value(&mut self, rs: &ResultSet, row: RowRef, col: usize, value: Cell) -> bool {
         match row {
             RowRef::Existing(r) => {
@@ -181,7 +182,7 @@ impl EditState {
         }
     }
 
-    /// Deshace los cambios de una celda (o el borrado de su fila).
+    /// Reverts the changes of a cell (or the deletion of its row).
     pub fn revert_cell(&mut self, row: RowRef, col: usize) -> bool {
         match row {
             RowRef::Existing(r) => {
@@ -207,14 +208,14 @@ impl EditState {
         }
     }
 
-    /// Añade una fila vacía al final. Devuelve su índice en `inserted`.
+    /// Appends an empty row. Returns its index in `inserted`.
     pub fn add_row(&mut self, n_cols: usize) -> usize {
         self.checkpoint();
         self.inserted.push(vec![None; n_cols]);
         self.inserted.len() - 1
     }
 
-    /// Marca filas existentes para borrar y quita las nuevas. Devuelve true si cambió algo.
+    /// Marks existing rows for deletion and removes new ones. Returns true if anything changed.
     pub fn delete_rows(&mut self, rs: &ResultSet, target: &EditTarget, rows: &[RowRef]) -> bool {
         let existing: Vec<usize> = rows
             .iter()
@@ -243,32 +244,32 @@ impl EditState {
         true
     }
 
-    /// Número de sentencias que generará el guardado.
+    /// Number of statements the save will generate.
     pub fn pending_count(&self) -> usize {
         let updated: BTreeSet<usize> =
             self.changes.keys().map(|(r, _)| *r).filter(|r| !self.deleted.contains(r)).collect();
         updated.len() + self.inserted.len() + self.deleted.len()
     }
 
-    /// Cambios en orden: updates, inserts y deletes.
+    /// Changes in order: updates, inserts and deletes.
     pub fn build_changes(&self, rs: &ResultSet, target: &EditTarget) -> Result<Vec<Change>, String> {
         let key_of = |r: usize| -> Result<Vec<(String, Cell)>, String> {
-            let vals = rs.rows.get(r).ok_or_else(|| format!("Fila {} inexistente", r + 1))?;
+            let vals = rs.rows.get(r).ok_or_else(|| trf("Row {n} does not exist", &[("n", &(r + 1))]))?;
             target
                 .key_cols
                 .iter()
                 .map(|&k| {
-                    let v = vals.get(k).cloned().ok_or_else(|| "Columna clave inexistente".to_string())?;
+                    let v = vals.get(k).cloned().ok_or_else(|| tr("Key column does not exist").to_string())?;
                     if is_lossy_display(&v) {
-                        return Err(format!("La fila {} no se puede identificar (valor binario recortado)", r + 1));
+                        return Err(trf("Row {n} cannot be identified (truncated binary value)", &[("n", &(r + 1))]));
                     }
-                    let name = target.col_names.get(k).cloned().ok_or_else(|| "Columna clave inexistente".to_string())?;
+                    let name = target.col_names.get(k).cloned().ok_or_else(|| tr("Key column does not exist").to_string())?;
                     Ok((name, v))
                 })
                 .collect()
         };
         if target.key_cols.is_empty() && (!self.changes.is_empty() || !self.deleted.is_empty()) {
-            return Err("La tabla no tiene columnas con las que identificar las filas".into());
+            return Err(tr("The table has no columns to identify the rows").into());
         }
         let mut out = Vec::new();
         let mut by_row: BTreeMap<usize, Vec<(String, Cell)>> = BTreeMap::new();
@@ -276,7 +277,7 @@ impl EditState {
             if self.deleted.contains(r) {
                 continue;
             }
-            let name = target.col_names.get(*c).cloned().ok_or_else(|| "Columna inexistente".to_string())?;
+            let name = target.col_names.get(*c).cloned().ok_or_else(|| tr("Column does not exist").to_string())?;
             by_row.entry(*r).or_default().push((name, v.clone()));
         }
         for (r, set) in by_row {
@@ -297,9 +298,9 @@ impl EditState {
     }
 }
 
-// ---------------------------------------------------------------- consulta editable
+// ---------------------------------------------------------------- editable query
 
-/// Tabla de una consulta trivial (`SELECT cols FROM t [WHERE…] [ORDER BY…]`).
+/// Table of a trivial query (`SELECT cols FROM t [WHERE…] [ORDER BY…]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryTable {
     pub schema: Option<String>,
@@ -309,7 +310,7 @@ pub struct QueryTable {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(String),
-    /// Identificador entrecomillado ("x", [x], `x`).
+    /// Quoted identifier ("x", [x], `x`).
     Quoted(String),
     Str,
     Num,
@@ -405,14 +406,14 @@ fn ident(t: &Tok) -> Option<&str> {
     }
 }
 
-/// Palabras que hacen que una consulta deje de ser "trivial sobre una tabla".
+/// Words that make a query no longer "trivial over one table".
 const NOT_TRIVIAL: &[&str] = &[
     "JOIN", "GROUP", "HAVING", "DISTINCT", "UNION", "INTERSECT", "EXCEPT", "INTO", "WITH", "SELECT", "APPLY", "PIVOT",
     "UNPIVOT", "OVER", "WINDOW", "LATERAL", "RETURNING", "FOR",
 ];
 
-/// Detecta `SELECT [TOP n] (* | col, …) FROM [esquema.]tabla [alias] [WHERE …] [ORDER BY …]
-/// [LIMIT/OFFSET/FETCH …]`. Devuelve la tabla, o `None` si la consulta no es de ese tipo.
+/// Detects `SELECT [TOP n] (* | col, …) FROM [schema.]table [alias] [WHERE …] [ORDER BY …]
+/// [LIMIT/OFFSET/FETCH …]`. Returns the table, or `None` if the query is not of that kind.
 pub fn single_table_query(sql: &str) -> Option<QueryTable> {
     let mut toks = tokenize(sql)?;
     while toks.last() == Some(&Tok::Punct(';')) {
@@ -426,7 +427,7 @@ pub fn single_table_query(sql: &str) -> Option<QueryTable> {
         return None;
     }
     i += 1;
-    // El resto no puede contener otra SELECT ni construcciones de varias tablas.
+    // The rest cannot contain another SELECT or multi-table constructs.
     if toks[i..].iter().any(|t| NOT_TRIVIAL.iter().any(|k| is_kw(t, k))) {
         return None;
     }
@@ -446,7 +447,7 @@ pub fn single_table_query(sql: &str) -> Option<QueryTable> {
             _ => return None,
         }
     }
-    // Lista de columnas: `*`, `t.*`, `col`, `t.col` separadas por comas.
+    // Column list: `*`, `t.*`, `col`, `t.col` separated by commas.
     loop {
         let start = i;
         loop {
@@ -490,7 +491,7 @@ pub fn single_table_query(sql: &str) -> Option<QueryTable> {
     if parts.len() > 3 {
         return None;
     }
-    // Alias opcional.
+    // Optional alias.
     let clause_kw = ["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH"];
     if let Some(t) = toks.get(i)
         && !clause_kw.iter().any(|k| is_kw(t, k))
@@ -501,7 +502,7 @@ pub fn single_table_query(sql: &str) -> Option<QueryTable> {
         ident(toks.get(i)?)?;
         i += 1;
     }
-    // Lo que queda solo pueden ser cláusulas de filtro/orden/límite, sin más tablas.
+    // What remains can only be filter/order/limit clauses, with no more tables.
     match toks.get(i) {
         None => {}
         Some(t) if clause_kw.iter().any(|k| is_kw(t, k)) => {}
@@ -512,14 +513,14 @@ pub fn single_table_query(sql: &str) -> Option<QueryTable> {
     Some(QueryTable { schema, table })
 }
 
-/// Construye el destino de edición de un resultado sobre `schema.table` (ya resuelta).
-/// Devuelve el motivo si no es editable.
+/// Builds the edit target of a result over `schema.table` (already resolved).
+/// Returns the reason if it is not editable.
 pub fn target_for(result_cols: &[String], schema: &str, kind: ObjectKind, table: &str, columns: &[ColumnInfo]) -> Result<EditTarget, String> {
     if kind != ObjectKind::Table {
-        return Err("Las vistas son de solo lectura".into());
+        return Err(tr("Views are read-only").into());
     }
     if result_cols.is_empty() {
-        return Err("Sin columnas".into());
+        return Err(tr("No columns").into());
     }
     let mut col_names = Vec::with_capacity(result_cols.len());
     let mut binary_cols = Vec::with_capacity(result_cols.len());
@@ -528,9 +529,9 @@ pub fn target_for(result_cols: &[String], schema: &str, kind: ObjectKind, table:
             .iter()
             .find(|c| c.name == *rc)
             .or_else(|| columns.iter().find(|c| c.name.eq_ignore_ascii_case(rc)))
-            .ok_or_else(|| format!("La columna «{rc}» no pertenece a {table}"))?;
+            .ok_or_else(|| trf("Column “{column}” does not belong to {table}", &[("column", rc), ("table", &table)]))?;
         if col_names.contains(&found.name) {
-            return Err(format!("La columna «{rc}» aparece dos veces"));
+            return Err(trf("Column “{column}” appears twice", &[("column", rc)]));
         }
         col_names.push(found.name.clone());
         binary_cols.push(is_binary_type(&found.data_type));
@@ -543,7 +544,7 @@ pub fn target_for(result_cols: &[String], schema: &str, kind: ObjectKind, table:
             let idx = col_names
                 .iter()
                 .position(|n| *n == c.name)
-                .ok_or_else(|| format!("El resultado no incluye la clave primaria «{}»", c.name))?;
+                .ok_or_else(|| trf("The result does not include the primary key “{column}”", &[("column", &c.name)]))?;
             keys.push(idx);
         }
         keys
@@ -551,15 +552,15 @@ pub fn target_for(result_cols: &[String], schema: &str, kind: ObjectKind, table:
         (0..col_names.len()).filter(|&i| !binary_cols[i]).collect()
     };
     if key_cols.is_empty() {
-        return Err("No hay columnas con las que identificar las filas".into());
+        return Err(tr("There are no columns to identify the rows").into());
     }
     Ok(EditTarget { schema: schema.to_string(), table: table.to_string(), col_names, key_cols, binary_cols, has_pk })
 }
 
-/// Destino de edición de un resultado de consola, si la consulta es trivial sobre una tabla
-/// conocida de `schemas`.
+/// Edit target of a console result, if the query is trivial over a table known in
+/// `schemas`.
 pub fn console_target(statement: &str, result_cols: &[String], schemas: &[SchemaInfo]) -> Result<EditTarget, String> {
-    let q = single_table_query(statement).ok_or_else(|| "Consulta de solo lectura (no es un SELECT simple sobre una tabla)".to_string())?;
+    let q = single_table_query(statement).ok_or_else(|| tr("Read-only query (not a simple SELECT over one table)").to_string())?;
     let mut found = Vec::new();
     for s in schemas {
         if q.schema.as_deref().is_some_and(|x| !x.eq_ignore_ascii_case(&s.name)) {
@@ -571,7 +572,7 @@ pub fn console_target(statement: &str, result_cols: &[String], schemas: &[Schema
             }
         }
     }
-    // Varias coincidencias: preferir la exacta y luego el esquema por defecto.
+    // Several matches: prefer the exact one, then the default schema.
     if found.len() > 1 {
         let exact: Vec<_> = found.iter().copied().filter(|(_, t)| t.name == q.table).collect();
         if !exact.is_empty() {
@@ -587,8 +588,8 @@ pub fn console_target(statement: &str, result_cols: &[String], schemas: &[Schema
     }
     match found.as_slice() {
         [(s, t)] => target_for(result_cols, &s.name, t.kind, &t.name, &t.columns),
-        [] => Err(format!("Tabla «{}» desconocida", q.table)),
-        _ => Err(format!("Tabla «{}» ambigua", q.table)),
+        [] => Err(trf("Unknown table “{table}”", &[("table", &q.table)])),
+        _ => Err(trf("Ambiguous table “{table}”", &[("table", &q.table)])),
     }
 }
 
@@ -614,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn consultas_triviales() {
+    fn trivial_queries() {
         let q = |s: &str| single_table_query(s);
         assert_eq!(q("SELECT * FROM users"), Some(QueryTable { schema: None, table: "users".into() }));
         assert_eq!(q("select id, name from public.users where id > 3 order by name desc, id;"), Some(QueryTable { schema: Some("public".into()), table: "users".into() }));
@@ -634,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn destino_de_consola() {
+    fn console_target_resolution() {
         let schemas = vec![SchemaInfo {
             name: "main".into(),
             tables: vec![TableInfo { name: "users".into(), kind: ObjectKind::Table, columns: vec![col("id", true), col("name", false)] }],
@@ -647,16 +648,16 @@ mod tests {
     }
 
     #[test]
-    fn construye_cambios_en_orden() {
+    fn builds_changes_in_order() {
         let rs = rs(vec![vec![Some("1"), Some("a")], vec![Some("2"), None]]);
         let t = target(true);
         let mut st = EditState::default();
         assert!(st.set_value(&rs, RowRef::Existing(1), 1, Some("b".into())));
-        // Volver al original elimina el cambio.
+        // Going back to the original removes the change.
         assert!(st.set_value(&rs, RowRef::Existing(0), 1, Some("z".into())));
         assert!(st.set_value(&rs, RowRef::Existing(0), 1, Some("a".into())));
         let n = st.add_row(2);
-        st.set_value(&rs, RowRef::New(n), 1, Some("nuevo".into()));
+        st.set_value(&rs, RowRef::New(n), 1, Some("new".into()));
         st.add_row(2);
         st.delete_rows(&rs, &t, &[RowRef::Existing(0)]);
         let ch = st.build_changes(&rs, &t).unwrap();
@@ -665,13 +666,13 @@ mod tests {
             ch,
             vec![
                 Change::Update { key: vec![kv("id", Some("2"))], set: vec![kv("name", Some("b"))] },
-                Change::Insert { values: vec![kv("name", Some("nuevo"))] },
+                Change::Insert { values: vec![kv("name", Some("new"))] },
                 Change::Insert { values: vec![] },
                 Change::Delete { key: vec![kv("id", Some("1"))] },
             ]
         );
         assert_eq!(st.pending_count(), 4);
-        // Deshacer quita el borrado; revertir todo deja el estado limpio.
+        // Undo removes the deletion; reverting everything leaves a clean state.
         assert!(st.undo());
         assert!(st.deleted.is_empty());
         st.revert_all();
@@ -681,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn sin_pk_usa_todas_las_columnas_y_evita_lossy() {
+    fn without_pk_uses_all_columns_and_avoids_lossy() {
         let rs = rs(vec![vec![Some("1"), Some("0xABCD…")], vec![Some("2"), Some("x")]]);
         let t = target(false);
         assert!(!t.has_pk);
@@ -702,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn revertir_celda_y_filas_nuevas() {
+    fn revert_cell_and_new_rows() {
         let rs = rs(vec![vec![Some("1"), Some("a")]]);
         let t = target(true);
         let mut st = EditState::default();

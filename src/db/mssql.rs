@@ -1,4 +1,4 @@
-//! Driver SQL Server sobre `tiberius` (TDS 7.3, TLS con rustls).
+//! SQL Server driver on top of `tiberius` (TDS 7.3, TLS with rustls).
 
 use std::time::{Duration, Instant};
 
@@ -11,19 +11,21 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::{Cell, ColumnInfo, ConnectionConfig, ObjectKind, ResultSet, SchemaInfo, TableInfo};
 use crate::db::sqlite::hex_preview;
+use crate::i18n::{tr, trf};
 
 pub struct MsSession {
     client: Client<Compat<TcpStream>>,
-    /// Se marca ante errores de E/S o de protocolo: la conexión ya no sirve.
+    /// Set on I/O or protocol errors: the connection is no longer usable.
     broken: bool,
 }
 
-/// Mensaje legible para los errores del servidor (sin el `Debug` de tiberius).
+/// Readable message for server errors (without tiberius' `Debug`).
 fn ms_error(e: tiberius::error::Error) -> anyhow::Error {
     match e {
-        tiberius::error::Error::Server(t) => {
-            anyhow!("Error {} (nivel {}, línea {}): {}", t.code(), t.class(), t.line(), t.message())
-        }
+        tiberius::error::Error::Server(t) => anyhow!(trf(
+            "Error {code} (level {level}, line {line}): {message}",
+            &[("code", &t.code()), ("level", &t.class()), ("line", &t.line()), ("message", &t.message())]
+        )),
         other => anyhow!(other.to_string()),
     }
 }
@@ -41,7 +43,7 @@ impl MsSession {
         }
         config.application_name("DataCraft");
         config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
-        // Cifrado siempre que el servidor lo admita; el certificado solo se valida si no se confía en él.
+        // Always encrypt when the server supports it; the certificate is only validated when it isn't trusted.
         config.encryption(EncryptionLevel::Required);
         if cfg.trust_cert {
             config.trust_cert();
@@ -49,8 +51,8 @@ impl MsSession {
 
         let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(config.get_addr()))
             .await
-            .map_err(|_| anyhow!("Tiempo de espera agotado conectando a {host}:{port}"))?
-            .with_context(|| format!("No se pudo conectar a {host}:{port}"))?;
+            .map_err(|_| anyhow!(trf("Timed out connecting to {host}:{port}", &[("host", &host), ("port", &port)])))?
+            .with_context(|| trf("Could not connect to {host}:{port}", &[("host", &host), ("port", &port)]))?;
         tcp.set_nodelay(true)?;
 
         let client = Client::connect(config, tcp.compat_write()).await.map_err(ms_error)?;
@@ -61,7 +63,7 @@ impl MsSession {
         match run(&mut self.client, sql, max_rows).await {
             Ok(results) => Ok(results),
             Err(e) => {
-                // Los errores del servidor (sintaxis, permisos...) no invalidan la conexión.
+                // Server errors (syntax, permissions...) don't invalidate the connection.
                 if !matches!(e, tiberius::error::Error::Server(_)) {
                     self.broken = true;
                 }
@@ -72,10 +74,10 @@ impl MsSession {
 
     pub async fn current_database(&mut self) -> anyhow::Result<String> {
         let rows = self.scalar_strings("SELECT DB_NAME()").await?;
-        rows.into_iter().next().ok_or_else(|| anyhow!("El servidor no devolvió la base actual"))
+        rows.into_iter().next().ok_or_else(|| anyhow!(tr("The server did not return the current database")))
     }
 
-    /// Bases ONLINE a las que el usuario tiene acceso, como en el explorador de DataGrip.
+    /// ONLINE databases the user has access to, as in DataGrip's explorer.
     pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
         self.scalar_strings(
             "SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' AND HAS_DBACCESS(name) = 1 ORDER BY name",
@@ -88,7 +90,7 @@ impl MsSession {
         self.execute(&sql, 0).await.map(|_| ())
     }
 
-    /// Primera columna de cada fila como texto.
+    /// First column of each row as text.
     async fn scalar_strings(&mut self, sql: &str) -> anyhow::Result<Vec<String>> {
         let rs = self.execute(sql, usize::MAX).await?;
         Ok(rs.into_iter().flat_map(|r| r.rows).filter_map(|row| row.into_iter().next().flatten()).collect())
@@ -203,7 +205,7 @@ impl MsSession {
     }
 }
 
-/// Tipo con longitud/precisión al estilo de SSMS: `nvarchar(50)`, `varchar(max)`, `decimal(10,2)`.
+/// Type with length/precision in SSMS style: `nvarchar(50)`, `varchar(max)`, `decimal(10,2)`.
 fn type_label(data_type: &str, max_len: Option<i64>, precision: Option<i64>, scale: Option<i64>) -> String {
     match data_type {
         "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" => match max_len {
@@ -229,7 +231,7 @@ async fn run(
     let mut stream = client.simple_query(sql).await?;
 
     let mut results: Vec<ResultSet> = Vec::new();
-    // Hay que consumir el stream entero aunque se trunque: si no, la conexión queda a medias.
+    // The whole stream must be consumed even when truncating; otherwise the connection is left half-read.
     while let Some(item) = stream.try_next().await? {
         match item {
             QueryItem::Metadata(meta) => {
@@ -256,13 +258,13 @@ async fn run(
 
     match results.last_mut() {
         Some(rs) => rs.elapsed = start.elapsed(),
-        // DML/DDL: simple_query no informa de filas afectadas.
+        // DML/DDL: simple_query doesn't report affected rows.
         None => results.push(ResultSet { statement, elapsed: start.elapsed(), ..Default::default() }),
     }
     Ok(results)
 }
 
-/// Convierte un valor de tiberius a texto. `None` = NULL.
+/// Converts a tiberius value to text. `None` = NULL.
 fn cell(data: &ColumnData<'static>) -> Cell {
     match data {
         ColumnData::U8(v) => v.map(|x| x.to_string()),
@@ -288,7 +290,7 @@ fn cell(data: &ColumnData<'static>) -> Cell {
     }
 }
 
-/// `numeric(18,0)` debe verse `42`, no `42.0` como hace el `Display` de tiberius.
+/// `numeric(18,0)` must show as `42`, not `42.0` as tiberius' `Display` does.
 fn numeric_text(n: tiberius::numeric::Numeric) -> String {
     let scale = u32::from(n.scale());
     let sign = if n.value() < 0 { "-" } else { "" };
@@ -309,15 +311,15 @@ fn date_cell<'a, T: FromSql<'a>>(data: &'a ColumnData<'static>, fmt: impl Fn(T) 
 
 #[cfg(test)]
 mod tests {
-    //! Tests contra un SQL Server real (NO destructivos: solo tablas temporales #tmp y SELECTs).
-    //! Se ejecutan con `cargo test -- --ignored` y las variables de entorno
+    //! Tests against a real SQL Server (NON-destructive: only #tmp temporary tables and SELECTs).
+    //! Run them with `cargo test -- --ignored` and the environment variables
     //! DATACRAFT_MSSQL_HOST, DATACRAFT_MSSQL_PORT (1433), DATACRAFT_MSSQL_USER (sa),
-    //! DATACRAFT_MSSQL_PASSWORD y DATACRAFT_MSSQL_DB (master). Sin HOST el test se salta.
+    //! DATACRAFT_MSSQL_PASSWORD and DATACRAFT_MSSQL_DB (master). Without HOST the test is skipped.
     use super::numeric_text;
     use tiberius::numeric::Numeric;
 
     #[test]
-    fn numeric_formatea_escala() {
+    fn numeric_formats_scale() {
         assert_eq!(numeric_text(Numeric::new_with_scale(42, 0)), "42");
         assert_eq!(numeric_text(Numeric::new_with_scale(-1234, 2)), "-12.34");
         assert_eq!(numeric_text(Numeric::new_with_scale(-5, 1)), "-0.5");
@@ -330,22 +332,22 @@ mod tests {
 
     async fn session() -> Option<MsSession> {
         let Ok(host) = std::env::var("DATACRAFT_MSSQL_HOST") else {
-            eprintln!("DATACRAFT_MSSQL_HOST no definida: se omite el test de SQL Server");
+            eprintln!("DATACRAFT_MSSQL_HOST not set: skipping the SQL Server test");
             return None;
         };
         let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
         let mut cfg = ConnectionConfig::new(1, Driver::MsSql);
         cfg.host = host;
-        cfg.port = env("DATACRAFT_MSSQL_PORT", "1433").parse().expect("puerto");
+        cfg.port = env("DATACRAFT_MSSQL_PORT", "1433").parse().expect("port");
         cfg.user = env("DATACRAFT_MSSQL_USER", "sa");
         cfg.password = env("DATACRAFT_MSSQL_PASSWORD", "");
         cfg.database = env("DATACRAFT_MSSQL_DB", "master");
-        Some(MsSession::connect(&cfg).await.expect("conexión"))
+        Some(MsSession::connect(&cfg).await.expect("connection"))
     }
 
     #[tokio::test]
     #[ignore]
-    async fn bases_y_use() {
+    async fn databases_and_use() {
         let Some(mut s) = session().await else { return };
         let current = s.current_database().await.unwrap();
         let dbs = s.list_databases().await.unwrap();
@@ -354,7 +356,7 @@ mod tests {
         assert_eq!(s.current_database().await.unwrap(), "master");
         s.use_database(&current).await.unwrap();
         assert_eq!(s.current_database().await.unwrap(), current);
-        // Una transacción vacía en tabla temporal: commit y rollback no dejan nada abierto.
+        // Transactions on a temporary table: commit and rollback leave nothing open.
         s.execute("CREATE TABLE #dc_edit(id int PRIMARY KEY, v nvarchar(10)); INSERT INTO #dc_edit VALUES (1, N'a'), (2, N'b');", 10)
             .await
             .unwrap();
@@ -364,16 +366,16 @@ mod tests {
         assert_eq!(rs[0].rows[0][0].as_deref(), Some("x"));
         assert_eq!(rs[1].rows[0][0].as_deref(), Some("0"));
         s.execute("DROP TABLE #dc_edit", 0).await.unwrap();
-        println!("bases: {dbs:?}");
+        println!("databases: {dbs:?}");
     }
 
     #[tokio::test]
     #[ignore]
-    async fn tipos_variados() {
+    async fn mixed_types() {
         let Some(mut s) = session().await else { return };
         let rs = s
             .execute(
-                "SELECT CAST(42 AS int) AS i, CAST(12.5 AS decimal(10,2)) AS n, N'hola' AS t, \
+                "SELECT CAST(42 AS int) AS i, CAST(12.5 AS decimal(10,2)) AS n, N'hello' AS t, \
                  CAST(1 AS bit) AS b, CAST('2026-10-16' AS date) AS d, \
                  CAST('2026-10-16T10:20:30.5' AS datetime2(3)) AS dt, \
                  CAST('2026-10-16T10:20:30+02:00' AS datetimeoffset(0)) AS dto, \
@@ -392,7 +394,7 @@ mod tests {
             [
                 Some("42"),
                 Some("12.50"),
-                Some("hola"),
+                Some("hello"),
                 Some("true"),
                 Some("2026-10-16"),
                 Some("2026-10-16 10:20:30.500"),
@@ -409,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn tabla_temporal_varios_resultados_e_introspeccion() {
+    async fn temp_table_multiple_results_and_introspection() {
         let Some(mut s) = session().await else { return };
         let rs = s
             .execute("CREATE TABLE #dc_tmp (id int PRIMARY KEY, name nvarchar(20) NULL)", 10)
@@ -435,9 +437,9 @@ mod tests {
         assert!(rs[1].rows.is_empty() && rs[1].columns == ["id"]);
         assert_eq!(rs[2].rows[0][0].as_deref(), Some("3"));
 
-        // La conexión sigue usable tras truncar y tras un error.
-        let err = s.execute("SELECT * FROM dbo.datacraft_no_existe_xyz", 10).await.unwrap_err();
-        assert!(err.to_string().contains("datacraft_no_existe_xyz"), "{err}");
+        // The connection stays usable after truncating and after an error.
+        let err = s.execute("SELECT * FROM dbo.datacraft_missing_xyz", 10).await.unwrap_err();
+        assert!(err.to_string().contains("datacraft_missing_xyz"), "{err}");
         s.execute("DROP TABLE #dc_tmp", 10).await.unwrap();
 
         let schemas = s.introspect().await.unwrap();

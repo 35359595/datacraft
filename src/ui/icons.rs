@@ -1,5 +1,5 @@
-//! Iconos lineales dibujados con el `Painter`, al estilo de los iconos "new UI" de JetBrains
-//! (trazo fino de ~1.3 px sobre una rejilla de 16x16). No se usa ningún SVG externo.
+//! Line icons drawn with the `Painter`, in the style of the JetBrains "new UI" icons
+//! (thin ~1.3 px stroke on a 16x16 grid). No external SVG is used.
 
 use crate::db::Driver;
 use crate::ui::theme::Palette;
@@ -53,8 +53,8 @@ pub enum Ico {
 
 const W: f32 = 1.3;
 
-/// Pinta `ico` dentro de `rect` (se asume ~16x16). `color` es el color de trazo base;
-/// algunos iconos de objetos usan su propio color de la paleta.
+/// Paints `ico` inside `rect` (assumed ~16x16). `color` is the base stroke color;
+/// some object icons use their own palette color.
 pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palette, enabled: bool) {
     let s = rect.width() / 16.0;
     let o = rect.min;
@@ -77,7 +77,7 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
         }
         Ico::Schema => {
             let c = obj(p.schema_icon);
-            // Tres capas apiladas (rombos).
+            // Three stacked layers (diamonds).
             for (i, dy) in [0.0f32, 3.0, 6.0].iter().enumerate() {
                 let y = 4.0 + dy;
                 if i == 0 {
@@ -133,7 +133,7 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
         Ico::Minus => line(&[(2.5, 8.0), (13.5, 8.0)], color),
         Ico::Refresh => {
             arc(painter, at(8.0, 8.0), 5.2 * s, -PI * 0.25, PI * 1.5, st(color));
-            // Punta de flecha al final del arco (arriba), apuntando en el sentido de giro.
+            // Arrowhead at the end of the arc (top), pointing in the direction of rotation.
             let tip = at(8.0, 2.8);
             painter.add(Shape::line(vec![tip + vec2(-2.6, -2.6) * s, tip, tip + vec2(-2.6, 2.6) * s], st(color)));
         }
@@ -188,7 +188,7 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
             line(&[(10.3, 10.3), (14.0, 14.0)], color);
         }
         Ico::Properties => {
-            // Deslizadores (propiedades del data source).
+            // Sliders (data source properties).
             for (y, k) in [(4.0, 10.5), (8.0, 5.0), (12.0, 9.0)] {
                 line(&[(1.5, y), (14.5, y)], color);
                 painter.circle_filled(at(k, y), 2.0 * s, p.island_bg);
@@ -312,7 +312,7 @@ fn arc(painter: &Painter, c: Pos2, r: f32, a0: f32, a1: f32, stroke: Stroke) {
     painter.add(Shape::line(pts, stroke));
 }
 
-/// Cilindro (icono de base de datos): `top` es la y del centro de la elipse superior.
+/// Cylinder (database icon): `top` is the y of the center of the top ellipse.
 fn cylinder(painter: &Painter, cx: f32, top: f32, rx: f32, ry: f32, h: f32, c: Color32) {
     let stroke = Stroke::new(W, c);
     let ellipse = |cy: f32, from: f32, to: f32| -> Vec<Pos2> {

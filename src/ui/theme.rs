@@ -1,6 +1,6 @@
-//! Tema visual "Islands" (Light / Dark) tomado de los temas de DataGrip 2026.2
-//! (`ManyIslandsLight.theme.json`, `ManyIslandsDark.theme.json` y los esquemas de editor
-//! "Light" / "Dark"), fuentes Inter + JetBrains Mono y helpers de pintado comunes.
+//! "Islands" visual theme (Light / Dark) taken from the DataGrip 2026.2 themes
+//! (`ManyIslandsLight.theme.json`, `ManyIslandsDark.theme.json` and the "Light" / "Dark"
+//! editor schemes), Inter + JetBrains Mono fonts and common painting helpers.
 
 use crate::ui::icons::{self, Ico};
 use egui::{
@@ -13,7 +13,7 @@ const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// `#RRGGBBAA` al estilo de los temas de IntelliJ (alfa no premultiplicado).
+/// `#RRGGBBAA` as in IntelliJ themes (non-premultiplied alpha).
 const fn hexa(rgba: u32) -> Color32 {
     let a = rgba & 0xFF;
     Color32::from_rgba_premultiplied(
@@ -24,7 +24,7 @@ const fn hexa(rgba: u32) -> Color32 {
     )
 }
 
-/// Paleta usada por los componentes propios. Cada campo indica la clave del tema de origen.
+/// Palette used by the custom components. Each field names the source theme key.
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub dark: bool,
@@ -32,17 +32,17 @@ pub struct Palette {
     pub main_bg: Color32,
     /// Island.borderColor / ToolWindow.background / editor-bg.
     pub island_bg: Color32,
-    /// editor-border (borde sutil de las islas y separadores internos).
+    /// editor-border (subtle island border and inner separators).
     pub island_border: Color32,
     /// text-default.
     pub text: Color32,
     /// text-muted (StatusBar.Widget.foreground, Breadcrumbs).
     pub text_muted: Color32,
-    /// text-secondary (infoForeground: contadores, tipos de columna).
+    /// text-secondary (infoForeground: counters, column types).
     pub muted: Color32,
     /// text-disabled.
     pub disabled: Color32,
-    /// Color de los iconos lineales (gris "new UI").
+    /// Line icon color ("new UI" gray).
     pub icon: Color32,
     /// toolbar-bg-hovered.
     pub hover: Color32,
@@ -65,30 +65,30 @@ pub struct Palette {
     pub accent: Color32,
     /// Table.gridColor.
     pub grid: Color32,
-    /// Fondo de cabecera de tabla.
+    /// Table header background.
     pub header_bg: Color32,
     /// Popup.background.
     pub popup_bg: Color32,
     /// Popup.borderColor.
     pub popup_border: Color32,
-    /// Fondo del botón activo de la franja de tool windows.
+    /// Background of the active button in the tool window stripe.
     pub stripe_selected: Color32,
-    /// List.Tag (badges del árbol).
+    /// List.Tag (tree badges).
     pub badge_bg: Color32,
     pub badge_fg: Color32,
-    // --- esquema de editor ---
+    // --- editor scheme ---
     pub editor_bg: Color32,
     pub gutter_fg: Color32,
     pub gutter_fg_caret: Color32,
     pub caret_row: Color32,
     pub editor_selection: Color32,
-    // --- estados ---
+    // --- states ---
     pub error: Color32,
     pub ok: Color32,
     pub warn: Color32,
     pub run: Color32,
     pub stop: Color32,
-    // --- iconos de objetos ---
+    // --- object icons ---
     pub db_icon: Color32,
     pub table_icon: Color32,
     pub view_icon: Color32,
@@ -97,12 +97,12 @@ pub struct Palette {
     pub column_icon: Color32,
     pub key_icon: Color32,
     pub project_badge: Color32,
-    // --- edición de datos (aproximados al grid de DataGrip) ---
-    /// Celda modificada pendiente de guardar.
+    // --- data editing (approximating the DataGrip grid) ---
+    /// Modified cell pending save.
     pub cell_modified: Color32,
-    /// Fila nueva pendiente de insertar.
+    /// New row pending insert.
     pub row_added: Color32,
-    /// Fila marcada para borrar.
+    /// Row marked for deletion.
     pub row_deleted: Color32,
 }
 
@@ -210,12 +210,12 @@ pub fn palette(dark: bool) -> Palette {
     if dark { DARK } else { LIGHT }
 }
 
-/// Paleta según el modo del `Ui`.
+/// Palette for the `Ui`'s mode.
 pub fn pal(ui: &Ui) -> Palette {
     palette(ui.visuals().dark_mode)
 }
 
-// ------------------------------------------------------------------ fuentes
+// ------------------------------------------------------------------ fonts
 
 pub const FONT_BOLD: &str = "bold";
 pub const FONT_MONO_BOLD: &str = "mono-bold";
@@ -229,8 +229,8 @@ pub fn mono_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FONT_MONO_BOLD.into()))
 }
 
-/// Inter (UI) y JetBrains Mono (editor y grid). Las fuentes por defecto de egui quedan
-/// como respaldo para símbolos y emoji.
+/// Inter (UI) and JetBrains Mono (editor and grid). egui's default fonts remain as
+/// fallback for symbols and emoji.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let add = |fonts: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
@@ -345,9 +345,9 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     });
 }
 
-/// Barras de scroll al estilo IntelliJ: finas, grises y redondeadas sobre un carril
-/// transparente. Flotan sobre el contenido (no cambian el layout) pero, cuando hay algo que
-/// desplazar, se ven siempre; se ensanchan al pasar el ratón por encima.
+/// IntelliJ-style scroll bars: thin, gray and rounded over a transparent track. They float
+/// over the content (no layout change) but are always visible when there is something to
+/// scroll; they widen on hover.
 pub fn scroll_style() -> egui::style::ScrollStyle {
     egui::style::ScrollStyle {
         floating: true,
@@ -357,7 +357,7 @@ pub fn scroll_style() -> egui::style::ScrollStyle {
         bar_inner_margin: 2.0,
         bar_outer_margin: 2.0,
         handle_min_length: 24.0,
-        // Color del texto (no `bg_fill`, que en Islands Light es blanco como la isla).
+        // Text color (not `bg_fill`, which in Islands Light is white like the island).
         foreground_color: true,
         dormant_background_opacity: 0.0,
         active_background_opacity: 0.0,
@@ -369,20 +369,20 @@ pub fn scroll_style() -> egui::style::ScrollStyle {
     }
 }
 
-/// Mezcla un color translúcido sobre uno opaco.
+/// Blends a translucent color over an opaque one.
 pub fn blend(base: Color32, over: Color32) -> Color32 {
     let a = over.a() as f32 / 255.0;
     if a <= 0.0 {
         return base;
     }
-    // `over` está premultiplicado.
+    // `over` is premultiplied.
     let mix = |b: u8, o: u8| (b as f32 * (1.0 - a) + o as f32).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(mix(base.r(), over.r()), mix(base.g(), over.g()), mix(base.b(), over.b()))
 }
 
-// ------------------------------------------------------------------ helpers de widgets
+// ------------------------------------------------------------------ widget helpers
 
-/// Botón de icono de barra de herramientas (ActionButton): 26x26, hover redondeado.
+/// Toolbar icon button (ActionButton): 26x26, rounded hover.
 pub fn icon_button(ui: &mut Ui, ico: Ico, enabled: bool, tooltip: &str) -> Response {
     icon_button_sized(ui, ico, enabled, tooltip, 26.0)
 }
@@ -400,7 +400,7 @@ pub fn icon_button_sized(ui: &mut Ui, ico: Ico, enabled: bool, tooltip: &str, si
     if tooltip.is_empty() { resp } else { resp.on_hover_text(tooltip) }
 }
 
-/// Botón plano de texto (con chevron opcional) al estilo MainToolbar.Dropdown.
+/// Flat text button (with optional chevron) in the MainToolbar.Dropdown style.
 pub fn flat_button(ui: &mut Ui, leading: Option<Ico>, text: &str, font: FontId, chevron: bool, enabled: bool) -> Response {
     let p = pal(ui);
     let color = if enabled { p.text } else { p.disabled };
@@ -435,14 +435,14 @@ pub fn flat_button(ui: &mut Ui, leading: Option<Ico>, text: &str, font: FontId, 
     resp
 }
 
-/// Separador vertical fino de barra de herramientas.
+/// Thin vertical toolbar separator.
 pub fn toolbar_separator(ui: &mut Ui) {
     let p = pal(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(9.0, 18.0), Sense::hover());
     ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0, if p.dark { hex(0x393B40) } else { hex(0xDDDFE4) }));
 }
 
-/// Botón primario azul (Button.default).
+/// Blue primary button (Button.default).
 pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
     let p = pal(ui);
     ui.add(
@@ -454,12 +454,12 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
     )
 }
 
-/// Botón secundario (borde control-border).
+/// Secondary button (control-border outline).
 pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Button::new(text).corner_radius(6).min_size(vec2(72.0, 28.0)))
 }
 
-/// Badge redondeado gris (List.Tag).
+/// Rounded gray badge (List.Tag).
 pub fn paint_badge(ui: &Ui, left_center: egui::Pos2, text: &str) -> Rect {
     let p = pal(ui);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(11.0), p.badge_fg);
@@ -472,14 +472,14 @@ pub fn paint_badge(ui: &Ui, left_center: egui::Pos2, text: &str) -> Rect {
     rect
 }
 
-/// Marco de una "isla": tarjeta redondeada con el fondo de tool window.
+/// "Island" frame: rounded card with the tool window background.
 pub fn island_frame(p: &Palette) -> egui::Frame {
     egui::Frame::NONE.fill(p.island_bg).corner_radius(CornerRadius::same(10))
 }
 
-/// Isla que ocupa exactamente todo el espacio disponible del `ui` (p.ej. un panel
-/// redimensionable): el contenido se recorta dentro y nunca agranda la isla ni el panel, así
-/// que las esquinas redondeadas y el hueco entre islas se mantienen a cualquier tamaño.
+/// Island that fills exactly all the available space of `ui` (e.g. a resizable panel):
+/// the content is clipped inside and never grows the island or the panel, so the rounded
+/// corners and the gap between islands are kept at any size.
 pub fn fixed_island<R>(ui: &mut Ui, p: &Palette, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     let rect = ui.available_rect_before_wrap();
     ui.painter().rect_filled(rect, CornerRadius::same(10), p.island_bg);
@@ -490,7 +490,7 @@ pub fn fixed_island<R>(ui: &mut Ui, p: &Palette, add_contents: impl FnOnce(&mut 
     r
 }
 
-/// Fila de alto fijo que no puede ensanchar a su padre: lo que no cabe se recorta.
+/// Fixed-height row that cannot widen its parent: whatever does not fit is clipped.
 pub fn clipped_row<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width().max(0.0), height));
     let mut child =
@@ -501,16 +501,16 @@ pub fn clipped_row<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut U
     r
 }
 
-/// Lado de una fila partida con `split_row`.
+/// Side of a row split with `split_row`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
     Right,
 }
 
-/// Fila con un grupo a la izquierda y otro alineado a la derecha que nunca se pisan:
-/// primero se dibuja la derecha (que tiene prioridad) y la izquierda ocupa lo que sobra,
-/// recortada si no cabe. `add` se llama dos veces, una por lado.
+/// Row with a left group and a right-aligned group that never overlap: the right side is
+/// drawn first (it has priority) and the left one takes what is left, clipped if it does
+/// not fit. `add` is called twice, once per side.
 pub fn split_row(ui: &mut Ui, mut add: impl FnMut(&mut Ui, Side)) {
     let rect = ui.available_rect_before_wrap();
     let clip = ui.clip_rect();
@@ -528,11 +528,11 @@ pub fn split_row(ui: &mut Ui, mut add: impl FnMut(&mut Ui, Side)) {
     ui.advance_cursor_after_rect(rect);
 }
 
-/// Mitad del hueco entre islas (Island.borderWidth = 6).
+/// Half the gap between islands (Island.borderWidth = 6).
 pub const ISLAND_GAP: i8 = 3;
 
-/// Pestaña redondeada (EditorTabs / pestañas de tool window). Devuelve la respuesta de la
-/// pestaña y si se pulsó su "×".
+/// Rounded tab (EditorTabs / tool window tabs). Returns the tab's response and whether its
+/// "×" was clicked.
 pub fn tab(ui: &mut Ui, selected: bool, ico: Option<Ico>, text: &str, closable: bool) -> (Response, bool) {
     let p = pal(ui);
     let font = FontId::proportional(13.0);

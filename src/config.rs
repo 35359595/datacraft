@@ -1,5 +1,5 @@
-//! Persistencia de conexiones en `~/Library/Application Support/DataCraft/connections.json`.
-//! Las contraseñas se guardan en el llavero de macOS, nunca en el JSON.
+//! Connection persistence in `~/Library/Application Support/DataCraft/connections.json`.
+//! Passwords are stored in the macOS Keychain, never in the JSON.
 
 use crate::db::ConnectionConfig;
 use std::path::PathBuf;
@@ -26,10 +26,10 @@ pub fn load_connections() -> Vec<ConnectionConfig> {
     let mut list: Vec<ConnectionConfig> = match serde_json::from_str(&text) {
         Ok(list) => list,
         Err(e) => {
-            // No perder las conexiones: se aparta el fichero ilegible antes de que se sobrescriba.
+            // Don't lose the connections: set the unreadable file aside before it gets overwritten.
             let backup = file.with_extension("json.bak");
             let _ = std::fs::copy(&file, &backup);
-            eprintln!("connections.json ilegible ({e}); copia en {}", backup.display());
+            eprintln!("unreadable connections.json ({e}); copy at {}", backup.display());
             Vec::new()
         }
     };
@@ -43,7 +43,7 @@ pub fn load_connections() -> Vec<ConnectionConfig> {
 
 pub fn save_connections(list: &[ConnectionConfig]) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir())?;
-    // Escritura atómica: un cierre a mitad no deja el fichero truncado.
+    // Atomic write: quitting halfway doesn't leave a truncated file.
     let file = connections_file();
     let tmp = file.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(list)?)?;

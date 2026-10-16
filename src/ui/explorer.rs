@@ -1,8 +1,9 @@
-//! Panel "Database Explorer": árbol de conexiones, bases de datos, esquemas, tablas y columnas
-//! (estilo Islands).
+//! "Database Explorer" panel: tree of connections, databases, schemas, tables and columns
+//! (Islands style).
 
 use crate::app::{ConnState, ConnStatus};
 use crate::db::{DatabaseInfo, Driver, ObjectKind, SchemaInfo, TableInfo};
+use crate::i18n::tr;
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, pal};
 use crate::worker::ConnId;
@@ -15,13 +16,13 @@ pub struct ExplorerState {
     pub show_filter: bool,
     pub expanded: HashSet<String>,
     pub selected: Option<String>,
-    /// Tabla seleccionada (para los botones de la barra de herramientas).
+    /// Selected table (for the toolbar buttons).
     pub selected_table: Option<TableRef>,
-    /// true si el último clic fue dentro del panel (selección "con foco" en azul).
+    /// true if the last click was inside the panel ("focused" selection in blue).
     pub focused: bool,
-    /// Ancho de las filas del árbol en este frame (el visible o el de la fila más larga).
+    /// Width of the tree rows in this frame (the visible one or that of the longest row).
     row_width: f32,
-    /// Ancho que necesita la fila más larga dibujada en este frame (scroll horizontal).
+    /// Width needed by the longest row drawn in this frame (horizontal scroll).
     widest_row: f32,
 }
 
@@ -41,9 +42,9 @@ pub enum ExplorerAction {
     Edit(ConnId),
     Duplicate(ConnId),
     Delete(ConnId),
-    /// Nueva consola en la conexión (y la base, si se abre desde una base).
+    /// New console on the connection (and the database, if opened from a database).
     NewConsole(ConnId, Option<String>),
-    /// Cargar el esquema de una base al expandirla.
+    /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     OpenTable(TableRef),
     GenerateSelect(TableRef),
@@ -67,9 +68,9 @@ struct RowSpec<'a> {
     expanded: bool,
     icon: Ico,
     label: &'a str,
-    /// Badge redondeado gris tras el nombre (p.ej. número de tablas).
+    /// Rounded gray badge after the name (e.g. number of tables).
     badge: Option<&'a str>,
-    /// Texto secundario en gris (contadores, tipos).
+    /// Gray secondary text (counters, types).
     detail: Option<(&'a str, egui::Color32)>,
     status: Option<egui::Color32>,
     label_color: Option<egui::Color32>,
@@ -160,7 +161,7 @@ fn table_matches(t: &TableInfo, f: &str) -> bool {
     f.is_empty() || t.name.to_lowercase().contains(f)
 }
 
-/// Base de la fila seleccionada (si es una base o algo dentro de ella).
+/// Database of the selected row (if it is a database or something inside one).
 fn selected_db(state: &ExplorerState, conns: &[ConnState]) -> Option<String> {
     let key = state.selected.as_deref()?;
     let (kind, rest) = key.split_once(':')?;
@@ -170,7 +171,7 @@ fn selected_db(state: &ExplorerState, conns: &[ConnState]) -> Option<String> {
     let conn = conn_of_key(key)?;
     let c = conns.iter().find(|c| c.cfg.id == conn)?;
     let after = rest.split_once(':')?.1;
-    // La base puede contener ':'; se busca la más larga que encaje.
+    // The database name may contain ':'; the longest match wins.
     c.databases
         .iter()
         .filter(|d| after == d.name || after.starts_with(&format!("{}:", d.name)))
@@ -178,16 +179,16 @@ fn selected_db(state: &ExplorerState, conns: &[ConnState]) -> Option<String> {
         .map(|d| d.name.clone())
 }
 
-/// Conexión de la fila seleccionada (si la hay).
+/// Connection of the selected row (if any).
 fn selected_conn(state: &ExplorerState) -> Option<ConnId> {
     state.selected.as_deref().and_then(conn_of_key)
 }
 
-/// Cabecera de la tool window + barra de iconos.
+/// Tool window header + icon bar.
 fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: &mut Vec<ExplorerAction>) {
     let p = pal(ui);
     ui.add_space(4.0);
-    // Filas recortadas: con el panel estrecho no pueden ensanchar la isla.
+    // Clipped rows: with a narrow panel they cannot widen the island.
     theme::clipped_row(ui, 30.0, |ui| {
         ui.add_space(14.0);
         let title_w = (ui.available_width() - 66.0).max(0.0);
@@ -197,22 +198,22 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             ui.spacing_mut().item_spacing.x = 2.0;
-            if theme::icon_button(ui, Ico::Minus, true, "Ocultar").clicked() {
+            if theme::icon_button(ui, Ico::Minus, true, tr("Hide")).clicked() {
                 actions.push(ExplorerAction::Hide);
             }
-            let more = theme::icon_button(ui, Ico::MoreVert, true, "Opciones");
+            let more = theme::icon_button(ui, Ico::MoreVert, true, tr("Options"));
             egui::Popup::menu(&more).show(|ui| {
-                if ui.button("Nueva conexión…").clicked() {
+                if ui.button(tr("New Connection…")).clicked() {
                     actions.push(ExplorerAction::NewConnection);
                     ui.close();
                 }
-                if ui.button("Expandir conexiones").clicked() {
+                if ui.button(tr("Expand Connections")).clicked() {
                     for c in conns {
                         state.expanded.insert(format!("c:{}", c.cfg.id));
                     }
                     ui.close();
                 }
-                if ui.button("Contraer todo").clicked() {
+                if ui.button(tr("Collapse All")).clicked() {
                     state.expanded.clear();
                     ui.close();
                 }
@@ -230,45 +231,45 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
     theme::clipped_row(ui, 30.0, |ui| {
         ui.add_space(10.0);
         ui.spacing_mut().item_spacing.x = 1.0;
-        if theme::icon_button(ui, Ico::Plus, true, "Nueva conexión").clicked() {
+        if theme::icon_button(ui, Ico::Plus, true, tr("New Connection")).clicked() {
             actions.push(ExplorerAction::NewConnection);
         }
-        if theme::icon_button(ui, Ico::Properties, sel_conn.is_some(), "Propiedades del data source").clicked()
+        if theme::icon_button(ui, Ico::Properties, sel_conn.is_some(), tr("Data Source Properties")).clicked()
             && let Some(id) = sel_conn
         {
             actions.push(ExplorerAction::Edit(id));
         }
         theme::toolbar_separator(ui);
-        if theme::icon_button(ui, Ico::Refresh, !conns.is_empty(), "Refrescar").clicked() {
+        if theme::icon_button(ui, Ico::Refresh, !conns.is_empty(), tr("Refresh")).clicked() {
             for c in conns {
                 if matches!(c.status, ConnStatus::Connected) && sel_conn.is_none_or(|id| id == c.cfg.id) {
                     actions.push(ExplorerAction::Refresh(c.cfg.id));
                 }
             }
         }
-        if theme::icon_button(ui, Ico::Stop, active, "Desconectar").clicked()
+        if theme::icon_button(ui, Ico::Stop, active, tr("Disconnect")).clicked()
             && let Some(id) = sel_conn
         {
             actions.push(ExplorerAction::Disconnect(id));
         }
         theme::toolbar_separator(ui);
-        if theme::icon_button(ui, Ico::JumpToConsole, sel_conn.is_some(), "Ir a consola").clicked()
+        if theme::icon_button(ui, Ico::JumpToConsole, sel_conn.is_some(), tr("Jump to Console")).clicked()
             && let Some(id) = sel_conn
         {
             actions.push(ExplorerAction::NewConsole(id, selected_db(state, conns)));
         }
-        if theme::icon_button(ui, Ico::Table, table.is_some(), "Editar datos de la tabla").clicked()
+        if theme::icon_button(ui, Ico::Table, table.is_some(), tr("Edit Table Data")).clicked()
             && let Some(t) = table.clone()
         {
             actions.push(ExplorerAction::OpenTable(t));
         }
-        if theme::icon_button(ui, Ico::Ddl, table.is_some() && connected, "Generar DDL").clicked()
+        if theme::icon_button(ui, Ico::Ddl, table.is_some() && connected, tr("Generate DDL")).clicked()
             && let Some(t) = table.clone()
         {
             actions.push(ExplorerAction::GenerateDdl(t));
         }
         theme::toolbar_separator(ui);
-        let eye = theme::icon_button(ui, Ico::Eye, true, "Filtrar tablas");
+        let eye = theme::icon_button(ui, Ico::Eye, true, tr("Filter Tables"));
         if state.show_filter {
             ui.painter().rect_stroke(eye.rect, 6.0, Stroke::new(1.0, p.control_border), egui::StrokeKind::Inside);
         }
@@ -286,7 +287,7 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
             let w = (ui.available_width() - 12.0).max(40.0);
             ui.add(
                 egui::TextEdit::singleline(&mut state.filter)
-                    .hint_text("Filtrar tablas…")
+                    .hint_text(tr("Filter tables…"))
                     .desired_width(w)
                     .margin(vec2(8.0, 4.0)),
             );
@@ -309,9 +310,9 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
 
     let filter = state.filter.trim().to_lowercase();
 
-    // El árbol ocupa todo lo que queda bajo la cabecera, con scroll vertical y horizontal.
-    // Llega hasta el borde de la isla, igual que el grid, para que las barras horizontales
-    // de ambos paneles queden a la misma altura.
+    // The tree fills everything below the header, with vertical and horizontal scroll.
+    // It reaches the island's edge, like the grid, so the horizontal bars of both panels
+    // line up.
     let max_h = ui.available_height().max(0.0);
     let viewport_w = ui.available_width();
     egui::ScrollArea::both()
@@ -320,16 +321,16 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState]) -> Vec<
         .max_height(max_h)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            // Todas las filas con el mismo ancho: el visible o el de la fila más larga del
-            // frame anterior, para que el resaltado cubra toda la fila al desplazarse.
+            // All rows share the same width: the visible one or that of the longest row in
+            // the previous frame, so the highlight covers the whole row when scrolling.
             state.row_width = viewport_w.max(state.widest_row);
             state.widest_row = 0.0;
             if conns.is_empty() {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Crea un data source con Alt+Insert").color(p.muted));
+                    ui.label(RichText::new(tr("Create a data source with Alt+Insert")).color(p.muted));
                     ui.add_space(6.0);
-                    if theme::primary_button(ui, "Nueva conexión…").clicked() {
+                    if theme::primary_button(ui, tr("New Connection…")).clicked() {
                         actions.push(ExplorerAction::NewConnection);
                     }
                 });
@@ -362,9 +363,9 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
     let open = state.expanded.contains(&ckey) || (filtering && any_table);
     let (dot, detail) = match &c.status {
         ConnStatus::Disconnected => (None, None),
-        ConnStatus::Connecting => (Some(p.warn), Some(("conectando…", p.muted))),
+        ConnStatus::Connecting => (Some(p.warn), Some((tr("connecting…"), p.muted))),
         ConnStatus::Connected => (Some(p.ok), None),
-        ConnStatus::Error(_) => (Some(p.error), Some(("error", p.error))),
+        ConnStatus::Error(_) => (Some(p.error), Some((tr("error"), p.error))),
     };
     let badge = (!c.databases.is_empty()).then(|| c.databases.len().to_string());
     let row = tree_row(
@@ -397,34 +398,34 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
     }
     resp.context_menu(|ui| {
         let connected = matches!(c.status, ConnStatus::Connected);
-        if ui.add_enabled(!connected, egui::Button::new("Conectar")).clicked() {
+        if ui.add_enabled(!connected, egui::Button::new(tr("Connect"))).clicked() {
             actions.push(ExplorerAction::Connect(id));
             state.expanded.insert(ckey.clone());
             ui.close();
         }
-        if ui.add_enabled(!matches!(c.status, ConnStatus::Disconnected), egui::Button::new("Desconectar")).clicked() {
+        if ui.add_enabled(!matches!(c.status, ConnStatus::Disconnected), egui::Button::new(tr("Disconnect"))).clicked() {
             actions.push(ExplorerAction::Disconnect(id));
             ui.close();
         }
-        if ui.add_enabled(connected, egui::Button::new("Refrescar")).clicked() {
+        if ui.add_enabled(connected, egui::Button::new(tr("Refresh"))).clicked() {
             actions.push(ExplorerAction::Refresh(id));
             ui.close();
         }
         ui.separator();
-        if ui.button("Nueva consola").clicked() {
+        if ui.button(tr("New Console")).clicked() {
             actions.push(ExplorerAction::NewConsole(id, None));
             ui.close();
         }
         ui.separator();
-        if ui.button("Propiedades…").clicked() {
+        if ui.button(tr("Properties…")).clicked() {
             actions.push(ExplorerAction::Edit(id));
             ui.close();
         }
-        if ui.button("Duplicar").clicked() {
+        if ui.button(tr("Duplicate")).clicked() {
             actions.push(ExplorerAction::Duplicate(id));
             ui.close();
         }
-        if ui.button(RichText::new("Eliminar…").color(p.error)).clicked() {
+        if ui.button(RichText::new(tr("Delete…")).color(p.error)).clicked() {
             actions.push(ExplorerAction::Delete(id));
             ui.close();
         }
@@ -440,7 +441,7 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
     }
 }
 
-/// Mensaje de error en rojo bajo un nodo.
+/// Red error message below a node.
 fn error_line(ui: &mut Ui, depth: usize, msg: &str) {
     let p = pal(ui);
     ui.horizontal(|ui| {
@@ -470,15 +471,15 @@ fn database_rows(
     let open = state.expanded.contains(&dkey) || (filtering && has_match);
     let loading = c.loading.contains(&d.name);
     let sqlite = c.cfg.driver == Driver::Sqlite;
-    // SQLite: un único esquema "main" igual que la base; se muestran sus tablas directamente.
+    // SQLite: a single "main" schema, same as the database; its tables are shown directly.
     let flat = sqlite && d.schemas.as_ref().is_some_and(|ss| ss.len() == 1);
     let badge = d.schemas.as_ref().map(|ss| {
         if flat { ss.iter().map(|s| s.tables.len()).sum::<usize>().to_string() } else { ss.len().to_string() }
     });
     let detail = if loading {
-        Some(("cargando…", p.muted))
+        Some((tr("loading…"), p.muted))
     } else if d.current && !sqlite {
-        Some(("por defecto", p.muted))
+        Some((tr("default"), p.muted))
     } else {
         None
     };
@@ -506,16 +507,16 @@ fn database_rows(
     }
     let db_name = d.name.clone();
     row.resp.context_menu(|ui| {
-        if ui.button("Nueva consola").clicked() {
+        if ui.button(tr("New Console")).clicked() {
             actions.push(ExplorerAction::NewConsole(id, Some(db_name.clone())));
             ui.close();
         }
         let connected = matches!(c.status, ConnStatus::Connected);
-        if ui.add_enabled(connected && !loading, egui::Button::new("Recargar esquema")).clicked() {
+        if ui.add_enabled(connected && !loading, egui::Button::new(tr("Reload Schema"))).clicked() {
             actions.push(ExplorerAction::LoadDatabase(id, db_name.clone()));
             ui.close();
         }
-        if ui.button("Copiar nombre").clicked() {
+        if ui.button(tr("Copy Name")).clicked() {
             ui.ctx().copy_text(db_name.clone());
             ui.close();
         }
@@ -531,7 +532,7 @@ fn database_rows(
             ui.horizontal(|ui| {
                 ui.add_space(12.0 + 2.0 * INDENT + 20.0);
                 ui.add(egui::Spinner::new().size(12.0).color(p.muted));
-                ui.label(RichText::new("cargando…").small().color(p.muted));
+                ui.label(RichText::new(tr("loading…")).small().color(p.muted));
             });
         }
         return;
@@ -603,7 +604,7 @@ fn schema_rows(
     }
 }
 
-/// Carpetas "tables" / "views" de un esquema y sus objetos.
+/// "tables" / "views" folders of a schema and their objects.
 #[allow(clippy::too_many_arguments)]
 fn object_groups(
     ui: &mut Ui,
@@ -689,24 +690,24 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         toggle(state, &tkey, open);
     }
     row.resp.context_menu(|ui| {
-        if ui.button("Editar datos").clicked() {
+        if ui.button(tr("Edit Data")).clicked() {
             actions.push(ExplorerAction::OpenTable(tref.clone()));
             ui.close();
         }
-        if ui.button("Copiar nombre").clicked() {
+        if ui.button(tr("Copy Name")).clicked() {
             ui.ctx().copy_text(t.name.clone());
             ui.close();
         }
         ui.separator();
-        if ui.button("Generar SELECT").clicked() {
+        if ui.button(tr("Generate SELECT")).clicked() {
             actions.push(ExplorerAction::GenerateSelect(tref.clone()));
             ui.close();
         }
-        if ui.button("Generar INSERT").clicked() {
+        if ui.button(tr("Generate INSERT")).clicked() {
             actions.push(ExplorerAction::GenerateInsert(tref.clone()));
             ui.close();
         }
-        if ui.button("Generar DDL").clicked() {
+        if ui.button(tr("Generate DDL")).clicked() {
             actions.push(ExplorerAction::GenerateDdl(tref.clone()));
             ui.close();
         }
@@ -737,7 +738,7 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             },
         );
         row.resp.context_menu(|ui| {
-            if ui.button("Copiar nombre").clicked() {
+            if ui.button(tr("Copy Name")).clicked() {
                 ui.ctx().copy_text(col.name.clone());
                 ui.close();
             }
@@ -745,12 +746,12 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
     }
 }
 
-/// Clave del árbol de una tabla (para expandirla o seleccionarla desde fuera).
+/// Tree key of a table (to expand or select it from outside).
 pub fn table_key(t: &TableRef) -> String {
     format!("t:{}:{}:{}:{}", t.conn, t.db, t.schema, t.table)
 }
 
-/// Clave del árbol de una base.
+/// Tree key of a database.
 pub fn db_key(conn: ConnId, db: &str) -> String {
     format!("d:{conn}:{db}")
 }

@@ -1,8 +1,8 @@
-//! Driver SQLite sobre `rusqlite`.
+//! SQLite driver on top of `rusqlite`.
 //!
-//! `rusqlite::Connection` no es `Sync` y su API es bloqueante, así que la
-//! conexión vive tras un `Arc<Mutex<_>>` y todo el trabajo se hace en
-//! `spawn_blocking` para no bloquear el runtime de tokio.
+//! `rusqlite::Connection` is not `Sync` and its API is blocking, so the
+//! connection lives behind an `Arc<Mutex<_>>` and all work runs in
+//! `spawn_blocking` so the tokio runtime isn't blocked.
 
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Batch, Connection, OpenFlags};
 
 use super::{Cell, ColumnInfo, ConnectionConfig, ObjectKind, ResultSet, SchemaInfo, TableInfo};
+use crate::i18n::{tr, trf};
 
-/// Bytes de un BLOB que se muestran como hexadecimal antes de recortar.
+/// BLOB bytes shown as hexadecimal before truncating.
 const BLOB_PREVIEW: usize = 64;
 
 pub struct SqliteSession {
@@ -26,21 +27,21 @@ impl SqliteSession {
     pub async fn connect(cfg: &ConnectionConfig) -> anyhow::Result<Self> {
         let path = cfg.file_path.trim().to_string();
         if path.is_empty() {
-            anyhow::bail!("No se ha indicado el fichero de la base de datos SQLite");
+            anyhow::bail!(tr("No SQLite database file was specified"));
         }
         let conn = tokio::task::spawn_blocking(move || {
-            // Sin SQLITE_OPEN_CREATE: una ruta mal escrita no debe crear una BD vacía.
+            // No SQLITE_OPEN_CREATE: a mistyped path must not create an empty database.
             if !std::path::Path::new(&path).exists() {
-                anyhow::bail!("El fichero {path} no existe");
+                anyhow::bail!(trf("The file {path} does not exist", &[("path", &path)]));
             }
             let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-            Connection::open_with_flags(&path, flags).with_context(|| format!("No se pudo abrir {path}"))
+            Connection::open_with_flags(&path, flags).with_context(|| trf("Could not open {path}", &[("path", &path)]))
         })
         .await??;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
-    /// Ejecuta `f` con la conexión en un hilo bloqueante.
+    /// Runs `f` with the connection on a blocking thread.
     async fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
@@ -48,7 +49,7 @@ impl SqliteSession {
     {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|_| anyhow!("La conexión SQLite quedó inutilizable"))?;
+            let conn = conn.lock().map_err(|_| anyhow!(tr("The SQLite connection became unusable")))?;
             f(&conn)
         })
         .await?
@@ -62,7 +63,7 @@ impl SqliteSession {
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
         let statements = statements.to_vec();
         self.with_conn(move |conn| {
-            // Sin commit, el Drop de la transacción hace ROLLBACK.
+            // Without commit, the transaction's Drop issues a ROLLBACK.
             let tx = conn.unchecked_transaction()?;
             let mut total = 0;
             for stmt in &statements {
@@ -107,7 +108,7 @@ fn run_batch(conn: &Connection, sql: &str, max_rows: usize) -> anyhow::Result<Ve
             }
         } else {
             stmt.raw_execute()?;
-            // changes() conserva el valor del último DML, así que tras un DDL mentiría.
+            // changes() keeps the value of the last DML, so it would lie after a DDL.
             if is_dml(&rs.statement) {
                 rs.affected = Some(conn.changes());
             }
@@ -133,7 +134,7 @@ fn value_to_cell(v: ValueRef<'_>) -> Cell {
     }
 }
 
-/// `0x` + hexadecimal de los primeros bytes; añade "…" si el blob es más largo.
+/// `0x` + hex of the first bytes; appends "…" if the blob is longer.
 pub(crate) fn hex_preview(bytes: &[u8]) -> String {
     let shown = &bytes[..bytes.len().min(BLOB_PREVIEW)];
     let mut s = String::with_capacity(2 + shown.len() * 2 + 3);
@@ -186,15 +187,15 @@ mod tests {
     use super::*;
     use crate::db::Driver;
 
-    /// Base de datos en un fichero temporal que se borra al terminar.
+    /// Database in a temporary file that is removed afterwards.
     struct TempDb(std::path::PathBuf);
 
     impl TempDb {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!("datacraft_{name}_{}.db", std::process::id()));
             let _ = std::fs::remove_file(&path);
-            // El driver ya no crea ficheros: aquí hace de botón "Nueva…" del diálogo.
-            std::fs::File::create(&path).expect("crear fichero temporal");
+            // The driver no longer creates files: this plays the dialog's "New…" button.
+            std::fs::File::create(&path).expect("create temporary file");
             Self(path)
         }
 
@@ -212,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn sesiones_son_send() {
+    fn sessions_are_send() {
         fn assert_send<T: Send + 'static>() {}
         assert_send::<SqliteSession>();
         assert_send::<crate::db::postgres::PgSession>();
@@ -220,13 +221,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ruta_vacia_da_error() {
+    async fn empty_path_is_an_error() {
         let cfg = ConnectionConfig::new(1, Driver::Sqlite);
         assert!(SqliteSession::connect(&cfg).await.is_err());
     }
 
     #[tokio::test]
-    async fn apply_changes_es_atomico() {
+    async fn apply_changes_is_atomic() {
         let db = TempDb::new("apply");
         let mut s = db.open().await;
         s.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'b'),(4,'c');", 10)
@@ -234,10 +235,10 @@ mod tests {
             .unwrap();
         let ok = vec!["UPDATE t SET v = 'x' WHERE id = '1'".to_string(), "DELETE FROM t WHERE id = '4'".to_string()];
         assert_eq!(s.apply_changes(&ok).await.unwrap(), 2);
-        // La segunda afecta a 0 filas: se deshace también la primera.
+        // The second one affects 0 rows: the first one is rolled back too.
         let bad = vec!["UPDATE t SET v = 'y' WHERE id = '1'".to_string(), "UPDATE t SET v = 'z' WHERE id = '99'".to_string()];
         assert!(s.apply_changes(&bad).await.is_err());
-        // Clave no única (sin PK): afecta a 2 filas y se rechaza.
+        // Non-unique key (no PK): affects 2 rows and is rejected.
         assert!(s.apply_changes(&["UPDATE t SET v = 'w' WHERE v = 'b'".to_string()]).await.is_err());
         let rs = s.execute("SELECT id, v FROM t ORDER BY id", 10).await.unwrap();
         let rows: Vec<Vec<Option<String>>> = rs[0].rows.clone();
@@ -246,8 +247,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fichero_inexistente_no_se_crea() {
-        let path = std::env::temp_dir().join(format!("datacraft_noexiste_{}.db", std::process::id()));
+    async fn missing_file_is_not_created() {
+        let path = std::env::temp_dir().join(format!("datacraft_missing_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut cfg = ConnectionConfig::new(1, Driver::Sqlite);
         cfg.file_path = path.to_string_lossy().into_owned();
@@ -256,7 +257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ddl_no_hereda_filas_afectadas() {
+    async fn ddl_does_not_inherit_affected_rows() {
         let db = TempDb::new("ddl");
         let mut s = db.open().await;
         let rs = s.execute("CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3); CREATE TABLE u(y);", 10).await.unwrap();
@@ -265,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_insert_y_select() {
+    async fn create_insert_and_select() {
         let db = TempDb::new("crud");
         let mut s = db.open().await;
         let rs = s.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT, r REAL, b BLOB)", 10).await.unwrap();
@@ -273,19 +274,19 @@ mod tests {
         assert!(rs[0].is_command());
 
         let rs = s
-            .execute("INSERT INTO t (n, r, b) VALUES ('uno', 1.5, x'00FF'), (NULL, NULL, NULL)", 10)
+            .execute("INSERT INTO t (n, r, b) VALUES ('one', 1.5, x'00FF'), (NULL, NULL, NULL)", 10)
             .await
             .unwrap();
         assert_eq!(rs[0].affected, Some(2));
 
         let big = "AB".repeat(100);
-        s.execute(&format!("INSERT INTO t (n, b) VALUES ('grande', x'{big}')"), 10).await.unwrap();
+        s.execute(&format!("INSERT INTO t (n, b) VALUES ('big', x'{big}')"), 10).await.unwrap();
 
         let rs = s.execute("SELECT id, n, r, b FROM t ORDER BY id", 10).await.unwrap();
         assert_eq!(rs[0].columns, ["id", "n", "r", "b"]);
         assert!(!rs[0].truncated);
         let rows = &rs[0].rows;
-        assert_eq!(rows[0], [Some("1".into()), Some("uno".into()), Some("1.5".into()), Some("0x00FF".into())]);
+        assert_eq!(rows[0], [Some("1".into()), Some("one".into()), Some("1.5".into()), Some("0x00FF".into())]);
         assert_eq!(rows[1], [Some("2".into()), None, None, None]);
         let blob = rows[2][3].as_deref().unwrap();
         assert!(blob.starts_with("0xABAB") && blob.ends_with('…'));
@@ -293,7 +294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn varias_sentencias_y_max_rows() {
+    async fn multiple_statements_and_max_rows() {
         let db = TempDb::new("multi");
         let mut s = db.open().await;
         let rs = s
@@ -316,12 +317,12 @@ mod tests {
         assert!(rs[3].rows.is_empty() && !rs[3].truncated);
         assert_eq!(rs[4].affected, Some(2));
 
-        // Un error a mitad de lote se propaga.
-        assert!(s.execute("SELECT 1; SELECT * FROM no_existe", 10).await.is_err());
+        // An error halfway through the batch is propagated.
+        assert!(s.execute("SELECT 1; SELECT * FROM missing", 10).await.is_err());
     }
 
     #[tokio::test]
-    async fn introspeccion_con_pk_y_vistas() {
+    async fn introspection_with_pk_and_views() {
         let db = TempDb::new("schema");
         let mut s = db.open().await;
         s.execute(
@@ -336,7 +337,7 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].name, "main");
         let names: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
-        // sqlite_sequence (creada por AUTOINCREMENT) queda fuera.
+        // sqlite_sequence (created by AUTOINCREMENT) is left out.
         assert_eq!(names, ["emails", "pair", "users"]);
 
         let emails = &schemas[0].tables[0];

@@ -1,25 +1,27 @@
-//! Estado principal de la aplicación y composición de la interfaz (estilo DataGrip "Islands").
+//! Main application state and UI composition (DataGrip "Islands" style).
 //!
-//! Variable de entorno de depuración: `DATACRAFT_DEMO=<ruta.db>` arranca con una conexión
-//! SQLite temporal (no se guarda en `connections.json`) a ese fichero, la conecta, abre el
-//! editor de datos de su primera tabla y una consola con una consulta de ejemplo. En ese modo
-//! el estado de la UI se persiste en un directorio temporal (ver `main.rs`).
-//! `DATACRAFT_DEMO_DARK=1` fuerza Islands Dark y `DATACRAFT_DEMO_DIALOG=1` abre el diálogo
-//! de nueva conexión y `DATACRAFT_DEMO_TAB=console` deja activa la consola.
-//! `DATACRAFT_DEMO_ZOOM=<porcentaje>` fija el zoom del IDE (p.ej. 125).
-//! `DATACRAFT_DEMO_EDIT=cell|changes|preview` simula en memoria, sobre el editor de datos de la
-//! primera tabla, una celda en edición, varios cambios pendientes (celda modificada, NULL, fila
-//! nueva y fila marcada para borrar) o esos cambios con la ventana de previsualización abierta.
-//! Nunca se envían a la base de datos.
-//! `DATACRAFT_DEMO_EXPLORER_W=<pt>` fija el ancho del Database Explorer (150–700, sin
-//! redimensionar), `DATACRAFT_DEMO_WINDOW=<ancho>x<alto>` cambia el tamaño de la ventana al
-//! arrancar (permite bajar del mínimo normal) y `DATACRAFT_DEMO_MULTI=1` usa una consola con
-//! varias consultas, que se ejecutan con "Ejecutar todo" (una pestaña de resultados por cada una).
-//! `DATACRAFT_DEMO_FILTER=<columna>` abre el embudo de esa columna con su primer valor desmarcado.
+//! Debug environment variable: `DATACRAFT_DEMO=<path.db>` starts with a temporary SQLite
+//! connection (not saved to `connections.json`) to that file, connects it, opens the data
+//! editor of its first table and a console with a sample query. In that mode the UI state
+//! is persisted to a temporary directory (see `main.rs`).
+//! `DATACRAFT_DEMO_DARK=1` forces Islands Dark, `DATACRAFT_DEMO_DIALOG=1` opens the new
+//! connection dialog and `DATACRAFT_DEMO_TAB=console` leaves the console active.
+//! `DATACRAFT_DEMO_ZOOM=<percent>` sets the IDE zoom (e.g. 125).
+//! `DATACRAFT_DEMO_EDIT=cell|changes|preview` simulates in memory, on the data editor of the
+//! first table, a cell being edited, several pending changes (modified cell, NULL, new row
+//! and a row marked for deletion) or those changes with the preview window open.
+//! They are never sent to the database.
+//! `DATACRAFT_DEMO_EXPLORER_W=<pt>` fixes the Database Explorer width (150–700, not
+//! resizable), `DATACRAFT_DEMO_WINDOW=<width>x<height>` resizes the window at startup
+//! (may go below the normal minimum) and `DATACRAFT_DEMO_MULTI=1` uses a console with
+//! several queries, run with "Run all" (one result tab each).
+//! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked.
+//! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
 use crate::edit;
+use crate::i18n::{self, Lang, tr, trf};
 use crate::sql;
 use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
@@ -38,20 +40,20 @@ use std::time::Instant;
 const STORAGE_KEY: &str = "datacraft_ui_state";
 const DEFAULT_FONT_SIZE: f32 = 13.0;
 
-/// Pasos del zoom del IDE.
+/// IDE zoom steps.
 pub const ZOOM_STEPS: [f32; 11] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
 
-/// Siguiente paso de zoom por encima de `z`.
+/// Next zoom step above `z`.
 pub fn zoom_in(z: f32) -> f32 {
     ZOOM_STEPS.iter().copied().find(|s| *s > z + 0.001).unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
 }
 
-/// Paso de zoom anterior a `z`.
+/// Previous zoom step below `z`.
 pub fn zoom_out(z: f32) -> f32 {
     ZOOM_STEPS.iter().rev().copied().find(|s| *s < z - 0.001).unwrap_or(ZOOM_STEPS[0])
 }
 
-/// Zoom válido (dentro de 50%–200%; valores no finitos vuelven a 100%).
+/// Valid zoom (within 50%–200%; non-finite values go back to 100%).
 pub fn clamp_zoom(z: f32) -> f32 {
     if z.is_finite() { z.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]) } else { 1.0 }
 }
@@ -80,10 +82,10 @@ impl ConnStatus {
 
     fn label(&self) -> &'static str {
         match self {
-            ConnStatus::Disconnected => "desconectado",
-            ConnStatus::Connecting => "conectando…",
-            ConnStatus::Connected => "conectado",
-            ConnStatus::Error(_) => "error",
+            ConnStatus::Disconnected => tr("disconnected"),
+            ConnStatus::Connecting => tr("connecting…"),
+            ConnStatus::Connected => tr("connected"),
+            ConnStatus::Error(_) => tr("error"),
         }
     }
 }
@@ -91,11 +93,11 @@ impl ConnStatus {
 pub struct ConnState {
     pub cfg: ConnectionConfig,
     pub status: ConnStatus,
-    /// Bases del servidor (vacío si no está conectada).
+    /// Server databases (empty if not connected).
     pub databases: Vec<DatabaseInfo>,
-    /// Bases cuyo esquema se está cargando.
+    /// Databases whose schema is being loaded.
     pub loading: HashSet<String>,
-    /// Último error al cargar cada base.
+    /// Last error loading each database.
     pub db_errors: HashMap<String, String>,
 }
 
@@ -110,12 +112,12 @@ impl ConnState {
         self.db_errors.clear();
     }
 
-    /// Base por defecto de la conexión (si está conectada).
+    /// The connection's default database (if connected).
     pub fn default_db(&self) -> Option<&str> {
         self.databases.iter().find(|d| d.current).map(|d| d.name.as_str())
     }
 
-    /// Nombre real de `db` (`None` = la por defecto).
+    /// Actual name of `db` (`None` = the default one).
     pub fn resolve_db<'a>(&'a self, db: Option<&'a str>) -> Option<&'a str> {
         db.filter(|d| !d.is_empty()).or_else(|| self.default_db())
     }
@@ -125,7 +127,7 @@ impl ConnState {
         self.databases.iter().find(|d| d.name == name)
     }
 
-    /// Esquemas de `db` si ya están cargados.
+    /// Schemas of `db` if already loaded.
     pub fn schemas(&self, db: Option<&str>) -> Option<&[SchemaInfo]> {
         self.database(db)?.schemas.as_deref()
     }
@@ -142,25 +144,25 @@ impl ConnState {
     }
 }
 
-/// Acción que espera confirmación porque descartaría cambios sin guardar.
+/// Action awaiting confirmation because it would discard unsaved changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Discard {
     Close(u64),
     CloseAll,
     Reload(u64),
     Run(u64, bool),
-    /// Cerrar pestañas de resultados de una consola.
+    /// Close a console's result tabs.
     CloseResults(u64, CloseResults),
 }
 
-/// Ventana "Preview pending changes".
+/// "Preview pending changes" window.
 struct PreviewState {
     console: u64,
     view: usize,
     statements: Vec<String>,
     error: Option<String>,
     applying: bool,
-    /// false en un envío directo (⇧ / ⌘S): no se muestra la ventana.
+    /// false on a direct submit (⇧ / ⌘S): the window is not shown.
     visible: bool,
 }
 
@@ -176,10 +178,10 @@ struct PersistedConsole {
     title: String,
     text: String,
     conn: Option<u64>,
-    /// (esquema, tabla) si la pestaña es un editor de datos.
+    /// (schema, table) if the tab is a data editor.
     #[serde(default)]
     table: Option<(String, String)>,
-    /// Base de datos de la pestaña (`None` = la por defecto de la conexión).
+    /// The tab's database (`None` = the connection's default).
     #[serde(default)]
     db: Option<String>,
 }
@@ -187,7 +189,7 @@ struct PersistedConsole {
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Persisted {
-    /// Tema Islands Dark (por defecto Islands Light). Sustituye al antiguo `dark` (Darcula).
+    /// Islands Dark theme (Islands Light by default). Replaces the old `dark` (Darcula).
     islands_dark: bool,
     font_size: f32,
     max_rows: usize,
@@ -196,8 +198,10 @@ struct Persisted {
     console_counter: u64,
     show_explorer: bool,
     show_results: bool,
-    /// Zoom del IDE (1.0 = 100%).
+    /// IDE zoom (1.0 = 100%).
     zoom: f32,
+    /// Interface language (`None` = the system one).
+    lang: Option<Lang>,
 }
 
 impl Default for Persisted {
@@ -212,6 +216,7 @@ impl Default for Persisted {
             show_explorer: true,
             show_results: true,
             zoom: 1.0,
+            lang: None,
         }
     }
 }
@@ -219,7 +224,7 @@ impl Default for Persisted {
 pub struct DataCraftApp {
     worker: Worker,
     conns: Vec<ConnState>,
-    /// Pestañas del editor: consolas y editores de datos.
+    /// Editor tabs: consoles and data editors.
     consoles: Vec<Console>,
     active: usize,
     next_console_id: u64,
@@ -231,7 +236,7 @@ pub struct DataCraftApp {
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
-    /// Menú nativo de la barra de macOS (None si no se pudo instalar).
+    /// Native macOS menu bar (None if it could not be installed).
     native_menu: Option<crate::native_menu::NativeMenu>,
     show_explorer: bool,
     show_results: bool,
@@ -240,21 +245,23 @@ pub struct DataCraftApp {
     font_size: f32,
     max_rows: usize,
     status_msg: Option<(String, bool)>,
-    /// Último id de conexión entregado (para que los ids sean monótonos).
+    /// Last connection id handed out (so ids are monotonic).
     last_conn_id: u64,
-    /// Modo demo: abrir el editor de datos de la primera tabla al conectar.
+    /// Demo mode: open the first table's data editor on connect.
     demo_pending: bool,
-    /// Modo demo: cambios simulados a aplicar al cargar el editor de datos.
+    /// Demo mode: simulated changes to apply when the data editor loads.
     demo_edit: Option<DemoEdit>,
-    /// Zoom del IDE y el último aplicado al contexto.
+    /// IDE zoom and the last one applied to the context.
     zoom: f32,
     applied_zoom: Option<f32>,
     preview: Option<PreviewState>,
     confirm_discard: Option<Discard>,
-    /// Modo demo: ancho fijo del Database Explorer (`DATACRAFT_DEMO_EXPLORER_W`).
+    /// Demo mode: fixed Database Explorer width (`DATACRAFT_DEMO_EXPLORER_W`).
     demo_explorer_w: Option<f32>,
-    /// Modo demo: tamaño de ventana a aplicar en el primer frame (`DATACRAFT_DEMO_WINDOW`).
+    /// Demo mode: window size to apply on the first frame (`DATACRAFT_DEMO_WINDOW`).
     demo_window: Option<egui::Vec2>,
+    /// Language chosen by the user (`None` = follow the system).
+    lang: Option<Lang>,
 }
 
 impl DataCraftApp {
@@ -265,6 +272,14 @@ impl DataCraftApp {
         } else {
             cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default()
         };
+        // Before any text is created (native menu, first console...).
+        // Demo mode can force the language: DATACRAFT_DEMO_LANG=en|es.
+        let demo_lang = demo.as_ref().and(std::env::var("DATACRAFT_DEMO_LANG").ok()).and_then(|l| match l.as_str() {
+            "es" => Some(Lang::Es),
+            "en" => Some(Lang::En),
+            _ => None,
+        });
+        i18n::set_lang(demo_lang.or(persisted.lang).unwrap_or_else(Lang::system));
         let conns: Vec<ConnState> = if demo.is_some() {
             Vec::new()
         } else {
@@ -307,6 +322,7 @@ impl DataCraftApp {
             confirm_discard: None,
             demo_explorer_w: None,
             demo_window: None,
+            lang: persisted.lang,
         };
         for pc in persisted.consoles {
             let conn = pc.conn.filter(|id| app.conns.iter().any(|c| c.cfg.id == *id));
@@ -331,14 +347,14 @@ impl DataCraftApp {
         }
         theme::apply(&cc.egui_ctx, app.dark);
         app.applied_dark = Some(app.dark);
-        // El zoom por teclado lo gestiona la app (⌘= / ⌘- / ⌘0) para no aplicarlo dos veces.
+        // Keyboard zoom is handled by the app (⌘= / ⌘- / ⌘0) so it is not applied twice.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         cc.egui_ctx.set_zoom_factor(app.zoom);
         app.applied_zoom = Some(app.zoom);
         app
     }
 
-    /// Modo demo (`DATACRAFT_DEMO`): conexión SQLite temporal, consola y editor de datos.
+    /// Demo mode (`DATACRAFT_DEMO`): temporary SQLite connection, console and data editor.
     fn start_demo(&mut self, path: &str) {
         let id = self.next_conn_id();
         let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
@@ -371,7 +387,7 @@ impl DataCraftApp {
         }
         let idx = self.new_console(Some(id), None, text);
         self.run_console(idx, true);
-        // El editor de datos de la primera tabla se abre al llegar el esquema.
+        // The first table's data editor opens when the schema arrives.
         self.demo_pending = true;
     }
 
@@ -381,7 +397,7 @@ impl DataCraftApp {
         id
     }
 
-    /// Crea una consola y la activa. Devuelve su índice.
+    /// Creates a console and activates it. Returns its index.
     fn new_console(&mut self, conn: Option<ConnId>, title: Option<String>, text: String) -> usize {
         let id = self.alloc_console_id();
         let title = title.unwrap_or_else(|| {
@@ -416,11 +432,11 @@ impl DataCraftApp {
     fn persist_connections(&mut self) {
         let list: Vec<ConnectionConfig> = self.conns.iter().map(|c| c.cfg.clone()).collect();
         if let Err(e) = config::save_connections(&list) {
-            self.error(format!("No se pudieron guardar las conexiones: {e:#}"));
+            self.error(trf("Could not save the connections: {error}", &[("error", &format!("{e:#}"))]));
         }
     }
 
-    /// Tabla conocida de una base (para claves primarias, DDL y edición).
+    /// Known table of a database (for primary keys, DDL and editing).
     fn table_info(&self, conn: ConnId, db: Option<&str>, schema: &str, table: &str) -> Option<&TableInfo> {
         self.conn(conn)?.schemas(db)?.iter().find(|s| s.name == schema)?.tables.iter().find(|t| t.name == table)
     }
@@ -429,7 +445,7 @@ impl DataCraftApp {
         self.table_info(conn, db, schema, table).map(|t| t.columns.as_slice())
     }
 
-    /// Pide el esquema de una base al worker.
+    /// Asks the worker for a database's schema.
     fn load_database(&mut self, conn: ConnId, db: String) {
         let Some(c) = self.conn_mut(conn) else { return };
         if !matches!(c.status, ConnStatus::Connected) || c.loading.contains(&db) {
@@ -440,7 +456,7 @@ impl DataCraftApp {
         self.worker.send(Request::LoadDatabase { conn, db });
     }
 
-    /// Carga la base si aún no lo está (autocompletado y editores de datos).
+    /// Loads the database if not loaded yet (autocomplete and data editors).
     fn ensure_db_loaded(&mut self, conn: ConnId, db: Option<&str>) {
         let Some(c) = self.conn(conn) else { return };
         if !matches!(c.status, ConnStatus::Connected) {
@@ -455,7 +471,7 @@ impl DataCraftApp {
         }
     }
 
-    // ---------------------------------------------------------------- conexión
+    // ---------------------------------------------------------------- connection
 
     fn connect(&mut self, id: ConnId) {
         if let Some(c) = self.conn_mut(id) {
@@ -474,7 +490,7 @@ impl DataCraftApp {
             c.clear();
             self.worker.send(Request::Disconnect(id));
         }
-        // Lo que esperaba a esta conexión ya no se va a ejecutar.
+        // Whatever was waiting for this connection will no longer run.
         for console in self.consoles.iter_mut().filter(|c| c.conn == Some(id)) {
             if console.pending.take().is_some() {
                 console.run_started = None;
@@ -486,7 +502,7 @@ impl DataCraftApp {
         for resp in self.worker.poll() {
             match resp {
                 Response::Connected { conn, databases } => {
-                    // Respuesta obsoleta: la conexión se desconectó, editó o borró mientras conectaba.
+                    // Stale response: the connection was disconnected, edited or deleted while connecting.
                     if !self.conn(conn).is_some_and(|c| c.status == ConnStatus::Connecting) {
                         self.worker.send(Request::Disconnect(conn));
                         continue;
@@ -533,12 +549,12 @@ impl DataCraftApp {
                 Response::ConnectFailed { conn, error } => {
                     let was_connected = self.conn(conn).is_some_and(|c| c.status == ConnStatus::Connected);
                     if let Some(c) = self.conn_mut(conn) {
-                        // También si estaba conectada: la sesión se ha perdido y la próxima
-                        // ejecución volverá a conectar.
+                        // Also if it was connected: the session is lost and the next run
+                        // will reconnect.
                         c.status = ConnStatus::Error(error.clone());
                     }
                     if was_connected {
-                        self.error(format!("Conexión perdida: {error}"));
+                        self.error(trf("Connection lost: {error}", &[("error", &error)]));
                     }
                     for console in self.consoles.iter_mut().filter(|c| c.conn == Some(conn)) {
                         if console.pending.take().is_some() {
@@ -546,7 +562,7 @@ impl DataCraftApp {
                             console.log.push(OutputEntry {
                                 time: now(),
                                 statement: String::new(),
-                                message: format!("No se pudo conectar: {error}"),
+                                message: trf("Could not connect: {error}", &[("error", &error)]),
                                 is_error: true,
                             });
                             console.result_tab = ResultTab::Output;
@@ -600,8 +616,8 @@ impl DataCraftApp {
         }
     }
 
-    /// Lista de bases nueva tras refrescar: se conservan los esquemas ya cargados mientras
-    /// se vuelven a pedir.
+    /// New database list after a refresh: already loaded schemas are kept while they are
+    /// requested again.
     fn refreshed(&mut self, conn: ConnId, mut databases: Vec<DatabaseInfo>) {
         let Some(c) = self.conn_mut(conn) else { return };
         let mut reload = Vec::new();
@@ -627,11 +643,11 @@ impl DataCraftApp {
             self.load_database(conn, db);
         }
         self.recheck_edit_targets(conn);
-        self.info("Esquema actualizado");
+        self.info(tr("Schema refreshed"));
     }
 
-    /// Vuelve a decidir si son editables los resultados de solo lectura de una conexión
-    /// (p.ej. cuando llega el esquema de su base).
+    /// Decides again whether a connection's read-only results are editable
+    /// (e.g. when its database schema arrives).
     fn recheck_edit_targets(&mut self, conn: ConnId) {
         let ids: Vec<u64> = self.consoles.iter().filter(|c| c.conn == Some(conn)).map(|c| c.id).collect();
         for id in ids {
@@ -644,7 +660,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Decide qué resultados nuevos de una pestaña se pueden editar.
+    /// Decides which of a tab's new results can be edited.
     fn attach_edit_targets(&mut self, console: u64) {
         let Some(idx) = self.consoles.iter().position(|c| c.id == console) else { return };
         let c = &self.consoles[idx];
@@ -654,14 +670,14 @@ impl DataCraftApp {
                 continue;
             }
             let target = match (c.conn, &c.table) {
-                (None, _) => Err("Sin conexión".to_string()),
+                (None, _) => Err(tr("No connection").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
-                    None => Err("Estructura de la tabla aún no cargada".to_string()),
+                    None => Err(tr("Table structure not loaded yet").to_string()),
                 },
                 (Some(conn), None) => match self.conn(conn).and_then(|cs| cs.schemas(c.db.as_deref())) {
                     Some(schemas) => editing::console_target(&v.rs.statement, &v.rs.columns, schemas),
-                    None => Err("Esquema de la base aún no cargado".to_string()),
+                    None => Err(tr("Database schema not loaded yet").to_string()),
                 },
             };
             targets.push((i, target));
@@ -674,7 +690,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Modo demo: cambios simulados (nunca se guardan) sobre el primer editor de datos.
+    /// Demo mode: simulated changes (never saved) on the first data editor.
     fn apply_demo_edit(&mut self, console: u64) {
         let Some(kind) = self.demo_edit else { return };
         let Some(idx) = self.consoles.iter().position(|c| c.id == console && c.table.is_some()) else { return };
@@ -692,11 +708,11 @@ impl DataCraftApp {
         }
         if let Some(e) = v.edit.as_mut() {
             let t = e.target.clone();
-            e.state.set_value(&v.rs, RowRef::Existing(0), last, Some("editado".into()));
+            e.state.set_value(&v.rs, RowRef::Existing(0), last, Some("edited".into()));
             e.state.set_value(&v.rs, RowRef::Existing(2), 2.min(last), None);
-            e.state.set_value(&v.rs, RowRef::Existing(4), last, Some("nota nueva".into()));
+            e.state.set_value(&v.rs, RowRef::Existing(4), last, Some("new note".into()));
             let n = e.state.add_row(n_cols);
-            e.state.set_value(&v.rs, RowRef::New(n), last, Some("fila nueva".into()));
+            e.state.set_value(&v.rs, RowRef::New(n), last, Some("new row".into()));
             e.state.delete_rows(&v.rs, &t, &[RowRef::Existing(3)]);
         }
         if kind == DemoEdit::Preview {
@@ -705,14 +721,14 @@ impl DataCraftApp {
         }
     }
 
-    // ---------------------------------------------------------------- edición de datos
+    // ---------------------------------------------------------------- data editing
 
-    /// Abre la ventana de previsualización con el SQL de los cambios pendientes.
+    /// Opens the preview window with the SQL of the pending changes.
     fn open_preview(&mut self, idx: usize, view: usize) {
         self.prepare_changes(idx, view, true);
     }
 
-    /// Guarda los cambios pendientes sin mostrar el SQL (para eso está Preview).
+    /// Saves the pending changes without showing the SQL (that's what Preview is for).
     fn submit_now(&mut self, idx: usize, view: usize) {
         self.prepare_changes(idx, view, false);
         match self.preview.as_ref() {
@@ -723,7 +739,7 @@ impl DataCraftApp {
                 }
                 None => {
                     self.submit_preview();
-                    // Si no se pudo enviar (sin conexión, pestaña ocupada), se avisa y se descarta.
+                    // If it could not be sent (no connection, busy tab), report it and discard.
                     if let Some(pv) = self.preview.as_ref().filter(|p| !p.visible && !p.applying) {
                         let err = pv.error.clone().unwrap_or_default();
                         self.preview = None;
@@ -751,7 +767,7 @@ impl DataCraftApp {
         self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false, visible });
     }
 
-    /// Envía los cambios de la previsualización en una transacción.
+    /// Sends the preview's changes in a transaction.
     fn submit_preview(&mut self) {
         let Some(pv) = self.preview.as_ref() else { return };
         if pv.applying || pv.statements.is_empty() {
@@ -766,7 +782,7 @@ impl DataCraftApp {
         let connected = conn.and_then(|id| self.conn(id)).is_some_and(|c| matches!(c.status, ConnStatus::Connected));
         let Some(pv) = self.preview.as_mut() else { return };
         match conn {
-            _ if busy => pv.error = Some("La pestaña está ejecutando otra operación".into()),
+            _ if busy => pv.error = Some(tr("The tab is running another operation").into()),
             Some(conn) if connected => {
                 pv.applying = true;
                 pv.error = None;
@@ -776,7 +792,7 @@ impl DataCraftApp {
                 }
                 self.worker.send(Request::ApplyChanges { conn, db, console, statements });
             }
-            _ => pv.error = Some("La conexión no está abierta; conéctala y vuelve a intentarlo".into()),
+            _ => pv.error = Some(tr("The connection is not open; connect it and try again").into()),
         }
     }
 
@@ -794,14 +810,14 @@ impl DataCraftApp {
                 if preview_view.is_some() {
                     self.preview = None;
                 }
-                let msg = if n == 1 { "1 fila modificada".to_string() } else { format!("{n} filas modificadas") };
+                let msg = if n == 1 { tr("1 row modified").to_string() } else { trf("{n} rows modified", &[("n", &n)]) };
                 c.log.push(OutputEntry { time: now(), statement: String::new(), message: msg.clone(), is_error: false });
                 let vi = preview_view.or_else(|| c.edit_view_index());
                 if let Some(v) = vi.and_then(|i| c.results.get_mut(i)) {
                     v.discard_edits();
                 }
                 self.info(msg);
-                // Recarga los datos de esa pestaña.
+                // Reloads that tab's data.
                 let c = &mut self.consoles[idx];
                 if c.table.is_some() {
                     self.reload_table(idx);
@@ -816,7 +832,7 @@ impl DataCraftApp {
                 c.log.push(OutputEntry {
                     time: now(),
                     statement: String::new(),
-                    message: format!("No se guardaron los cambios: {e}"),
+                    message: trf("Changes were not saved: {error}", &[("error", &e)]),
                     is_error: true,
                 });
                 match self.preview.as_mut().filter(|p| p.console == console && p.visible) {
@@ -828,14 +844,14 @@ impl DataCraftApp {
                         if self.preview.as_ref().is_some_and(|p| p.console == console) {
                             self.preview = None;
                         }
-                        self.error(format!("No se guardaron los cambios: {e}"));
+                        self.error(trf("Changes were not saved: {error}", &[("error", &e)]));
                     }
                 }
             }
         }
     }
 
-    /// Cierra pestañas de resultados de una consola (pide confirmación si tienen cambios).
+    /// Closes a console's result tabs (asks for confirmation if they have changes).
     fn close_results(&mut self, idx: usize, which: CloseResults) {
         let Some(c) = self.consoles.get(idx).filter(|c| c.table.is_none() && !c.is_busy()) else { return };
         if self.guard(Discard::CloseResults(c.id, which)) {
@@ -847,7 +863,7 @@ impl DataCraftApp {
         let Some(c) = self.consoles.get_mut(idx).filter(|c| c.table.is_none()) else { return };
         let id = c.id;
         let removed = c.close_results(which);
-        // La previsualización de cambios guarda el índice de su vista.
+        // The changes preview keeps the index of its view.
         if let Some(pv) = self.preview.as_mut().filter(|p| p.console == id) {
             match console::remap_index(pv.view, &removed) {
                 Some(v) => pv.view = v,
@@ -856,7 +872,7 @@ impl DataCraftApp {
         }
     }
 
-    /// true si la acción puede seguir ya; si hay cambios sin guardar, pide confirmación.
+    /// true if the action can go ahead now; with unsaved changes, asks for confirmation.
     fn guard(&mut self, action: Discard) -> bool {
         let dirty = match action {
             Discard::CloseAll => self.consoles.iter().any(|c| c.has_pending_edits()),
@@ -871,7 +887,7 @@ impl DataCraftApp {
         !dirty
     }
 
-    /// Ejecuta una acción confirmada descartando los cambios pendientes.
+    /// Runs a confirmed action, discarding the pending changes.
     fn discard_and_do(&mut self, action: Discard) {
         match action {
             Discard::CloseAll => {
@@ -899,7 +915,7 @@ impl DataCraftApp {
         }
     }
 
-    // ---------------------------------------------------------------- ejecución
+    // ---------------------------------------------------------------- execution
 
     fn run_console(&mut self, idx: usize, all: bool) {
         let Some(console) = self.consoles.get(idx) else { return };
@@ -929,7 +945,7 @@ impl DataCraftApp {
         self.run_statements(idx, statements);
     }
 
-    /// Envía sentencias de la pestaña `idx`, conectando antes si hace falta.
+    /// Sends statements of tab `idx`, connecting first if needed.
     fn run_statements(&mut self, idx: usize, statements: Vec<String>) {
         let Some(console) = self.consoles.get(idx) else { return };
         if console.is_busy() {
@@ -941,7 +957,7 @@ impl DataCraftApp {
 
         let Some(console) = self.consoles.get_mut(idx) else { return };
         if statements.is_empty() {
-            console.log.push(OutputEntry { time: now(), statement: String::new(), message: "Nada que ejecutar".into(), is_error: true });
+            console.log.push(OutputEntry { time: now(), statement: String::new(), message: tr("Nothing to run").into(), is_error: true });
             console.result_tab = ResultTab::Output;
             return;
         }
@@ -949,7 +965,7 @@ impl DataCraftApp {
             console.log.push(OutputEntry {
                 time: now(),
                 statement: String::new(),
-                message: "Selecciona una conexión para la consola".into(),
+                message: tr("Select a connection for the console").into(),
                 is_error: true,
             });
             console.result_tab = ResultTab::Output;
@@ -972,7 +988,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Abre (o activa) el editor de datos de una tabla.
+    /// Opens (or activates) a table's data editor.
     fn open_table(&mut self, t: &TableRef) {
         let default_db = self.conn(t.conn).and_then(|c| c.default_db()).map(str::to_string);
         if let Some(i) = self.consoles.iter().position(|c| {
@@ -981,7 +997,7 @@ impl DataCraftApp {
                 && c.table.as_ref().is_some_and(|x| x.schema == t.schema && x.table == t.table)
         }) {
             self.active = i;
-            // Con cambios pendientes solo se activa (recargar los descartaría).
+            // With pending changes it is only activated (reloading would discard them).
             if !self.consoles[i].has_pending_edits() && !self.consoles[i].is_busy() {
                 self.reload_table(i);
             }
@@ -993,7 +1009,7 @@ impl DataCraftApp {
         self.reload_table(self.active);
     }
 
-    /// Recarga el editor de datos con sus filtros, limitando las filas en el propio SQL.
+    /// Reloads the data editor with its filters, limiting rows in the SQL itself.
     fn reload_table(&mut self, idx: usize) {
         let Some(c) = self.consoles.get(idx) else { return };
         let (Some(conn), Some(t)) = (c.conn, c.table.as_ref()) else { return };
@@ -1056,7 +1072,7 @@ impl DataCraftApp {
                     if let Some(c) = self.conn(id) {
                         let mut cfg = c.cfg.clone();
                         cfg.id = self.next_conn_id();
-                        cfg.name = format!("{} (copia)", cfg.name);
+                        cfg.name = trf("{name} (copy)", &[("name", &cfg.name)]);
                         config::store_password(cfg.id, &cfg.password);
                         self.conns.push(ConnState::new(cfg));
                         self.persist_connections();
@@ -1080,8 +1096,8 @@ impl DataCraftApp {
         }
     }
 
-    /// Ids monótonos: nunca se reutiliza el id de una conexión borrada (su contraseña en el
-    /// llavero o una respuesta tardía del worker podrían asociarse a la nueva).
+    /// Monotonic ids: a deleted connection's id is never reused (its keychain password or a
+    /// late worker response could be associated with the new one).
     fn next_conn_id(&mut self) -> u64 {
         let max = self.conns.iter().map(|c| c.cfg.id).max().unwrap_or(0).max(self.last_conn_id);
         let millis = std::time::SystemTime::now()
@@ -1115,7 +1131,7 @@ impl DataCraftApp {
             }
         }
         self.persist_connections();
-        self.info("Conexión guardada");
+        self.info(tr("Connection saved"));
     }
 
     fn delete_connection(&mut self, id: ConnId) {
@@ -1128,7 +1144,7 @@ impl DataCraftApp {
             c.pending = None;
             c.run_started = None;
         }
-        // Los editores de datos de esa conexión ya no tienen sentido.
+        // That connection's data editors no longer make sense.
         let active_id = self.consoles.get(self.active).map(|c| c.id);
         self.consoles.retain(|c| !(c.table.is_some() && c.conn.is_none()));
         self.active = active_id
@@ -1138,10 +1154,10 @@ impl DataCraftApp {
         self.persist_connections();
     }
 
-    // ---------------------------------------------------------------- ficheros
+    // ---------------------------------------------------------------- files
 
     fn open_sql_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new().set_title("Abrir script SQL").add_filter("SQL", &["sql"]).pick_file() else {
+        let Some(path) = rfd::FileDialog::new().set_title(tr("Open SQL script")).add_filter("SQL", &["sql"]).pick_file() else {
             return;
         };
         match std::fs::read_to_string(&path) {
@@ -1151,14 +1167,14 @@ impl DataCraftApp {
                 let i = self.new_console(conn, title, text);
                 self.consoles[i].db = db;
             }
-            Err(e) => self.error(format!("No se pudo abrir {}: {e}", path.display())),
+            Err(e) => self.error(trf("Could not open {path}: {error}", &[("path", &path.display()), ("error", &e)])),
         }
     }
 
     fn save_console_as(&mut self) {
         let Some(console) = self.consoles.get(self.active).filter(|c| c.table.is_none()) else { return };
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Guardar consola como")
+            .set_title(tr("Save console as"))
             .add_filter("SQL", &["sql"])
             .set_file_name(format!("{}.sql", console.title))
             .save_file()
@@ -1166,8 +1182,8 @@ impl DataCraftApp {
             return;
         };
         match std::fs::write(&path, &console.text) {
-            Ok(()) => self.info(format!("Guardado en {}", path.display())),
-            Err(e) => self.error(format!("No se pudo guardar: {e}")),
+            Ok(()) => self.info(trf("Saved to {path}", &[("path", &path.display())])),
+            Err(e) => self.error(trf("Could not save: {error}", &[("error", &e)])),
         }
     }
 
@@ -1200,8 +1216,8 @@ impl DataCraftApp {
     // ---------------------------------------------------------------- UI
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        // Zoom del IDE (⌘= / ⌘+ / ⌘- / ⌘0) y fuente del editor (⌥⌘= / ⌥⌘-). Las variantes con
-        // ⌥ van primero: `consume_key` ignora un ⌥ de más.
+        // IDE zoom (⌘= / ⌘+ / ⌘- / ⌘0) and editor font (⌥⌘= / ⌥⌘-). The ⌥ variants go
+        // first: `consume_key` ignores an extra ⌥.
         let (font_up, font_down, zoom_up, zoom_down, zoom_reset) = ctx.input_mut(|i| {
             let alt = Modifiers::COMMAND | Modifiers::ALT;
             let font_up = i.consume_key(alt, Key::Equals) || i.consume_key(alt, Key::Plus);
@@ -1257,7 +1273,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Hay un diálogo modal abierto: los atajos y comandos de ejecución se ignoran.
+    /// A modal dialog is open: shortcuts and run commands are ignored.
     fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.confirm_delete.is_some()
@@ -1284,8 +1300,8 @@ impl DataCraftApp {
         }
     }
 
-    /// Comandos del menú nativo de macOS. Sus aceleradores (⌘↩, ⌘S, ⌘=...) se los queda el
-    /// menú, así que los atajos equivalentes de `shortcuts` solo actúan si el menú no se instaló.
+    /// Native macOS menu commands. The menu takes their accelerators (⌘↩, ⌘S, ⌘=...), so the
+    /// equivalent shortcuts in `shortcuts` only act if the menu was not installed.
     fn menu_commands(&mut self, ctx: &egui::Context) {
         use crate::native_menu::MenuCommand as M;
         let Some(menu) = self.native_menu.as_ref() else { return };
@@ -1319,7 +1335,7 @@ impl DataCraftApp {
                 M::RunAll if !modal => self.run_console(self.active, true),
                 M::SaveChanges if !modal => self.save_active_changes(),
                 M::Reload if !modal => self.reload_active(),
-                // Sin web de ayuda: muestra la ventana de información de la app.
+                // No help website: shows the app info window.
                 M::Help => self.show_about = true,
                 _ => {}
             }
@@ -1329,36 +1345,36 @@ impl DataCraftApp {
         }
     }
 
-    /// Menú principal de la aplicación (bajo el widget de proyecto "DataCraft ⌄").
+    /// Main application menu (under the "DataCraft ⌄" project widget).
     fn app_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(220.0);
-        ui.menu_button("Archivo", |ui| {
-            if ui.button("Nuevo data source…").clicked() {
+        ui.menu_button(tr("File"), |ui| {
+            if ui.button(tr("New data source…")).clicked() {
                 self.open_new_connection_dialog();
                 ui.close();
             }
-            if ui.add(egui::Button::new("Nueva consola").shortcut_text("⇧⌘N")).clicked() {
+            if ui.add(egui::Button::new(tr("New console")).shortcut_text("⇧⌘N")).clicked() {
                 self.new_console_here();
                 ui.close();
             }
             ui.separator();
-            if ui.button("Abrir .sql…").clicked() {
+            if ui.button(tr("Open .sql…")).clicked() {
                 ui.close();
                 self.open_sql_file();
             }
             let can_save = self.consoles.get(self.active).is_some_and(|c| c.table.is_none());
-            if ui.add_enabled(can_save, egui::Button::new("Guardar consola como .sql…")).clicked() {
+            if ui.add_enabled(can_save, egui::Button::new(tr("Save console as .sql…"))).clicked() {
                 ui.close();
                 self.save_console_as();
             }
             ui.separator();
-            if ui.add(egui::Button::new("Salir").shortcut_text("⌘Q")).clicked() {
+            if ui.add(egui::Button::new(tr("Quit")).shortcut_text("⌘Q")).clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
-        ui.menu_button("Ver", |ui| self.view_menu(ui));
-        ui.menu_button("Ayuda", |ui| {
-            if ui.button("Acerca de DataCraft").clicked() {
+        ui.menu_button(tr("View"), |ui| self.view_menu(ui));
+        ui.menu_button(tr("Help"), |ui| {
+            if ui.button(tr("About DataCraft")).clicked() {
                 self.show_about = true;
                 ui.close();
             }
@@ -1367,7 +1383,7 @@ impl DataCraftApp {
 
     fn view_menu(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
-        ui.label(RichText::new("Tema").small().color(p.muted));
+        ui.label(RichText::new(tr("Theme")).small().color(p.muted));
         if ui.radio(!self.dark, "Islands Light").clicked() {
             self.dark = false;
             ui.close();
@@ -1378,32 +1394,49 @@ impl DataCraftApp {
         }
         ui.separator();
         ui.checkbox(&mut self.show_explorer, "Database Explorer");
-        ui.checkbox(&mut self.show_results, "Services (resultados)");
+        ui.checkbox(&mut self.show_results, tr("Services (results)"));
         ui.separator();
-        ui.menu_button(format!("Zoom IDE ({})", zoom_label(self.zoom)), |ui| self.zoom_menu(ui));
+        ui.menu_button(trf("IDE zoom ({zoom})", &[("zoom", &zoom_label(self.zoom))]), |ui| self.zoom_menu(ui));
+        ui.menu_button("Language / Idioma", |ui| {
+            for lang in Lang::ALL {
+                if ui.radio(i18n::lang() == lang, lang.native_name()).clicked() {
+                    self.set_language(lang);
+                    ui.close();
+                }
+            }
+        });
         ui.separator();
-        ui.label(RichText::new(format!("Fuente del editor: {:.0} pt", self.font_size)).small().color(p.muted));
-        if ui.add(egui::Button::new("Aumentar").shortcut_text("⌥⌘+")).clicked() {
+        ui.label(RichText::new(trf("Editor font: {size} pt", &[("size", &format!("{:.0}", self.font_size))])).small().color(p.muted));
+        if ui.add(egui::Button::new(tr("Increase")).shortcut_text("⌥⌘+")).clicked() {
             self.font_size = (self.font_size + 1.0).min(32.0);
         }
-        if ui.add(egui::Button::new("Reducir").shortcut_text("⌥⌘-")).clicked() {
+        if ui.add(egui::Button::new(tr("Decrease")).shortcut_text("⌥⌘-")).clicked() {
             self.font_size = (self.font_size - 1.0).max(8.0);
         }
-        if ui.button("Restablecer").clicked() {
+        if ui.button(tr("Reset")).clicked() {
             self.font_size = DEFAULT_FONT_SIZE;
         }
     }
 
-    /// Submenú "Zoom IDE": acercar, alejar, restablecer y pasos fijos.
+    /// Changes the interface language, remembers it and relabels the native menu.
+    fn set_language(&mut self, lang: Lang) {
+        i18n::set_lang(lang);
+        self.lang = Some(lang);
+        if let Some(menu) = self.native_menu.as_ref() {
+            menu.relabel();
+        }
+    }
+
+    /// "IDE zoom" submenu: zoom in, zoom out, reset and fixed steps.
     fn zoom_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(180.0);
-        if ui.add_enabled(self.zoom < ZOOM_STEPS[ZOOM_STEPS.len() - 1], egui::Button::new("Acercar").shortcut_text("⌘+")).clicked() {
+        if ui.add_enabled(self.zoom < ZOOM_STEPS[ZOOM_STEPS.len() - 1], egui::Button::new(tr("Zoom In")).shortcut_text("⌘+")).clicked() {
             self.zoom = zoom_in(self.zoom);
         }
-        if ui.add_enabled(self.zoom > ZOOM_STEPS[0], egui::Button::new("Alejar").shortcut_text("⌘-")).clicked() {
+        if ui.add_enabled(self.zoom > ZOOM_STEPS[0], egui::Button::new(tr("Zoom Out")).shortcut_text("⌘-")).clicked() {
             self.zoom = zoom_out(self.zoom);
         }
-        if ui.add(egui::Button::new("Restablecer (100%)").shortcut_text("⌘0")).clicked() {
+        if ui.add(egui::Button::new(tr("Reset (100%)")).shortcut_text("⌘0")).clicked() {
             self.zoom = 1.0;
             ui.close();
         }
@@ -1416,7 +1449,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Barra superior unificada con el título (toolbar principal).
+    /// Top bar unified with the title (main toolbar).
     fn title_bar(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
         let rect = ui.max_rect();
@@ -1433,11 +1466,11 @@ impl DataCraftApp {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
             ui.spacing_mut().item_spacing.x = 4.0;
-            // Hueco de los semáforos: 80 pt de pantalla, sea cual sea el zoom del IDE.
+            // Room for the traffic lights: 80 screen pt, whatever the IDE zoom.
             let zoom = ui.ctx().zoom_factor().max(0.1);
             ui.add_space(if fullscreen { 10.0 } else { 80.0 / zoom });
 
-            // Widget de proyecto: cuadrado morado con la inicial + nombre + chevron.
+            // Project widget: purple square with the initial + name + chevron.
             let font = theme::bold(13.0);
             let galley = ui.painter().layout_no_wrap("DataCraft".into(), font, p.text);
             let w = 8.0 + 20.0 + 8.0 + galley.size().x + 4.0 + 14.0 + 8.0;
@@ -1459,16 +1492,16 @@ impl DataCraftApp {
             );
             egui::Popup::menu(&resp).show(|ui| self.app_menu(ui));
 
-            // Selector de la conexión de la pestaña activa.
+            // Active tab's connection selector.
             let current = self.consoles.get(self.active).and_then(|c| c.conn).and_then(|id| self.conn(id));
             let active_db = self.consoles.get(self.active).and_then(|c| c.db.clone());
             let (ico, label) = match current {
                 Some(c) => (Ico::Driver(c.cfg.driver), c.summary().label(active_db.as_deref())),
-                None => (Ico::Database, "Sin conexión".into()),
+                None => (Ico::Database, tr("No connection").into()),
             };
             let busy = self.consoles.get(self.active).is_some_and(|c| c.is_busy() || c.table.is_some());
             let resp = theme::flat_button(ui, Some(ico), &label, FontId::proportional(13.0), true, true)
-                .on_hover_text("Data source de la pestaña activa");
+                .on_hover_text(tr("Data source of the active tab"));
             let mut chosen = None;
             let mut new_ds = false;
             egui::Popup::menu(&resp).show(|ui| {
@@ -1486,7 +1519,7 @@ impl DataCraftApp {
                 if !self.conns.is_empty() {
                     ui.separator();
                 }
-                if ui.button("Nuevo data source…").clicked() {
+                if ui.button(tr("New data source…")).clicked() {
                     new_ds = true;
                     ui.close();
                 }
@@ -1502,16 +1535,16 @@ impl DataCraftApp {
                 theme::Side::Right => {
                 ui.add_space(10.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let gear = theme::icon_button_sized(ui, Ico::Gear, true, "Ajustes", 30.0);
+                let gear = theme::icon_button_sized(ui, Ico::Gear, true, tr("Settings"), 30.0);
                 egui::Popup::menu(&gear).show(|ui| {
                     self.view_menu(ui);
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label("Máx. filas:");
+                        ui.label(tr("Max rows:"));
                         ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=1_000_000).speed(10));
                     });
                 });
-                if theme::icon_button_sized(ui, Ico::Search, true, "Buscar tablas", 30.0).clicked() {
+                if theme::icon_button_sized(ui, Ico::Search, true, tr("Search tables"), 30.0).clicked() {
                     self.show_explorer = true;
                     self.explorer.show_filter = !self.explorer.show_filter;
                 }
@@ -1520,7 +1553,7 @@ impl DataCraftApp {
         });
     }
 
-    /// Cambia la conexión de la consola activa (si no está ocupada).
+    /// Changes the active console's connection (if it is not busy).
     fn set_active_connection(&mut self, id: ConnId) {
         let needs_connect = self.conn(id).is_some_and(|c| matches!(c.status, ConnStatus::Disconnected | ConnStatus::Error(_)));
         if let Some(c) = self.consoles.get_mut(self.active) {
@@ -1539,7 +1572,7 @@ impl DataCraftApp {
         }
     }
 
-    /// Franja izquierda de tool windows.
+    /// Left tool window stripe.
     fn left_stripe(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
         let mut top = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Center)));
@@ -1548,7 +1581,7 @@ impl DataCraftApp {
         if stripe_button(&mut top, Ico::Database, self.show_explorer, "Database Explorer").clicked() {
             self.show_explorer = !self.show_explorer;
         }
-        let more = stripe_button(&mut top, Ico::More, false, "Más tool windows");
+        let more = stripe_button(&mut top, Ico::More, false, tr("More tool windows"));
         egui::Popup::menu(&more).show(|ui| {
             ui.checkbox(&mut self.show_explorer, "Database Explorer");
             ui.checkbox(&mut self.show_results, "Services");
@@ -1558,7 +1591,7 @@ impl DataCraftApp {
         bottom.spacing_mut().item_spacing.y = 4.0;
         bottom.add_space(4.0);
         let has_error = self.status_msg.as_ref().is_some_and(|(_, e)| *e);
-        let problems = stripe_button(&mut bottom, Ico::Problems, false, "Problemas");
+        let problems = stripe_button(&mut bottom, Ico::Problems, false, tr("Problems"));
         if problems.clicked()
             && let Some((msg, _)) = &self.status_msg
         {
@@ -1568,35 +1601,35 @@ impl DataCraftApp {
             let c = problems.rect.right_top() + vec2(-9.0, 9.0);
             bottom.painter().circle_filled(c, 3.0, palette(self.dark).error);
         }
-        if stripe_button(&mut bottom, Ico::Terminal, false, "Nueva consola (⇧⌘N)").clicked() {
+        if stripe_button(&mut bottom, Ico::Terminal, false, tr("New console (⇧⌘N)")).clicked() {
             self.new_console_here();
         }
-        if stripe_button(&mut bottom, Ico::Services, self.show_results, "Services (resultados)").clicked() {
+        if stripe_button(&mut bottom, Ico::Services, self.show_results, tr("Services (results)")).clicked() {
             self.show_results = !self.show_results;
         }
     }
 
-    /// Franja derecha (notificaciones y estructura).
+    /// Right stripe (notifications and structure).
     fn right_stripe(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
         let mut top = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Center)));
         top.spacing_mut().item_spacing.y = 4.0;
         top.add_space(2.0);
         let msg = self.status_msg.clone();
-        let bell = stripe_button(&mut top, Ico::Bell, false, "Notificaciones");
+        let bell = stripe_button(&mut top, Ico::Bell, false, tr("Notifications"));
         egui::Popup::menu(&bell).show(|ui| {
             ui.set_min_width(260.0);
             match &msg {
                 Some((m, err)) => {
                     let color = if *err { palette(self.dark).error } else { palette(self.dark).text };
                     ui.add(egui::Label::new(RichText::new(m).color(color)).wrap());
-                    if ui.button("Descartar").clicked() {
+                    if ui.button(tr("Dismiss")).clicked() {
                         self.status_msg = None;
                         ui.close();
                     }
                 }
                 None => {
-                    ui.label(RichText::new("Sin notificaciones").color(palette(self.dark).muted));
+                    ui.label(RichText::new(tr("No notifications")).color(palette(self.dark).muted));
                 }
             }
         });
@@ -1604,7 +1637,7 @@ impl DataCraftApp {
             let c = bell.rect.right_top() + vec2(-9.0, 9.0);
             top.painter().circle_filled(c, 3.0, palette(self.dark).accent);
         }
-        let structure = stripe_button(&mut top, Ico::Structure, false, "Estructura de la pestaña");
+        let structure = stripe_button(&mut top, Ico::Structure, false, tr("Tab structure"));
         egui::Popup::menu(&structure).show(|ui| {
             let cols = self.consoles.get(self.active).and_then(|c| {
                 let t = c.table.as_ref()?;
@@ -1617,7 +1650,7 @@ impl DataCraftApp {
                     }
                 }
                 None => {
-                    ui.label(RichText::new("Sin estructura").color(palette(self.dark).muted));
+                    ui.label(RichText::new(tr("No structure")).color(palette(self.dark).muted));
                 }
             }
         });
@@ -1630,7 +1663,7 @@ impl DataCraftApp {
                 theme::Side::Left => {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(12.0);
-            // Breadcrumbs de la pestaña activa.
+            // Active tab's breadcrumbs.
             let console = self.consoles.get(self.active);
             let conn = console.and_then(|c| c.conn).and_then(|id| self.conn(id));
             let mut crumbs: Vec<(Option<Ico>, String)> = vec![(None, "Database".into())];
@@ -1643,7 +1676,7 @@ impl DataCraftApp {
             if let Some(c) = console {
                 match &c.table {
                     Some(t) => {
-                        // SQLite: esquema "main" igual que la base (el explorador también lo omite).
+                        // SQLite: the "main" schema is the same as the database (the explorer omits it too).
                         if conn.is_none_or(|x| x.cfg.driver != Driver::Sqlite) {
                             crumbs.push((Some(Ico::Schema), t.schema.clone()));
                         }
@@ -1682,7 +1715,7 @@ impl DataCraftApp {
                 ui.add_space(6.0);
                 if (self.zoom - 1.0).abs() > 0.001 {
                     let resp = theme::flat_button(ui, None, &zoom_label(self.zoom), FontId::proportional(12.5), false, true)
-                        .on_hover_text("Zoom del IDE (⌘0 para restablecer)");
+                        .on_hover_text(tr("IDE zoom (⌘0 to reset)"));
                     egui::Popup::menu(&resp).show(|ui| self.zoom_menu(ui));
                     ui.add_space(4.0);
                 }
@@ -1695,7 +1728,7 @@ impl DataCraftApp {
                         .speed(10)
                         .prefix("max rows: "),
                 )
-                .on_hover_text("Máximo de filas por consulta (arrastra o haz doble clic para editar)");
+                .on_hover_text(tr("Maximum rows per query (drag or double-click to edit)"));
                 if let Some(c) = self.consoles.get(self.active) {
                     if c.table.is_none() {
                         let (l, col) = c.line_col();
@@ -1707,7 +1740,7 @@ impl DataCraftApp {
                         let text = if r.rs.is_command() {
                             results::affected_message(&r.rs)
                         } else {
-                            format!("{} filas · {}", r.row_count(), results::format_duration(r.rs.elapsed))
+                            trf("{n} rows · {time}", &[("n", &r.row_count()), ("time", &results::format_duration(r.rs.elapsed))])
                         };
                         ui.label(RichText::new(text).color(p.text_muted).size(12.5));
                     }
@@ -1715,7 +1748,7 @@ impl DataCraftApp {
                 if let Some((msg, is_err)) = &self.status_msg {
                     ui.add_space(8.0);
                     let color = if *is_err { p.error } else { p.text_muted };
-                    // El aviso no puede comerse toda la barra: como mucho un tercio.
+                    // The notice cannot take the whole bar: a third at most.
                     let max_w = (ui.available_width() / 3.0).max(80.0);
                     let resp = ui
                         .scope(|ui| {
@@ -1723,7 +1756,7 @@ impl DataCraftApp {
                             ui.add(egui::Label::new(RichText::new(msg).color(color).size(12.5)).truncate().sense(Sense::click()))
                         })
                         .inner;
-                    if resp.on_hover_text("Clic para descartar").clicked() {
+                    if resp.on_hover_text(tr("Click to dismiss")).clicked() {
                         self.status_msg = None;
                     }
                 }
@@ -1732,7 +1765,7 @@ impl DataCraftApp {
         });
     }
 
-    /// Pestañas del editor (arriba de la isla del editor).
+    /// Editor tabs (at the top of the editor island).
     fn editor_tabs(&mut self, ui: &mut Ui) {
         let mut close = None;
         let mut activate = None;
@@ -1789,11 +1822,11 @@ impl DataCraftApp {
                                 close = Some(i);
                             }
                             resp.context_menu(|ui| {
-                                if ui.add_enabled(c.table.is_none(), egui::Button::new("Renombrar")).clicked() {
+                                if ui.add_enabled(c.table.is_none(), egui::Button::new(tr("Rename"))).clicked() {
                                     start_rename = Some((c.id, c.title.clone()));
                                     ui.close();
                                 }
-                                if ui.button("Cerrar").clicked() {
+                                if ui.button(tr("Close")).clicked() {
                                     close = Some(i);
                                     ui.close();
                                 }
@@ -1804,13 +1837,13 @@ impl DataCraftApp {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
-                let more = theme::icon_button(ui, Ico::MoreVert, true, "Pestañas");
+                let more = theme::icon_button(ui, Ico::MoreVert, true, tr("Tabs"));
                 egui::Popup::menu(&more).show(|ui| {
-                    if ui.add(egui::Button::new("Nueva consola").shortcut_text("⇧⌘N")).clicked() {
+                    if ui.add(egui::Button::new(tr("New console")).shortcut_text("⇧⌘N")).clicked() {
                         new = true;
                         ui.close();
                     }
-                    if ui.add_enabled(!self.consoles.is_empty(), egui::Button::new("Cerrar todas")).clicked() {
+                    if ui.add_enabled(!self.consoles.is_empty(), egui::Button::new(tr("Close all"))).clicked() {
                         close_all = true;
                         ui.close();
                     }
@@ -1851,14 +1884,14 @@ impl DataCraftApp {
 
     fn central(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
-        // Carga diferida de editores de datos restaurados.
+        // Deferred loading of restored data editors.
         if let Some(c) = self.consoles.get(self.active)
             && c.table.as_ref().is_some_and(|t| !t.loaded)
             && !c.is_busy()
         {
             self.reload_table(self.active);
         }
-        // Esquema de la base de la pestaña (autocompletado, claves y edición).
+        // Schema of the tab's database (autocomplete, keys and editing).
         if let Some(c) = self.consoles.get(self.active)
             && let Some(conn) = c.conn
         {
@@ -1870,8 +1903,8 @@ impl DataCraftApp {
         let conn_list = self.conn_list();
 
         if is_console && self.show_results {
-            // El editor (pestañas + toolbar + unas líneas) siempre conserva su sitio: el panel
-            // de resultados no puede crecer por encima de lo que queda, ni con ventanas bajas.
+            // The editor (tabs + toolbar + a few lines) always keeps its room: the results
+            // panel cannot grow past what is left, even with short windows.
             let avail = ui.available_height();
             let max_results = (avail - 170.0).max(avail * 0.45).max(60.0);
             let min_results = 120.0_f32.min(max_results);
@@ -1906,11 +1939,11 @@ impl DataCraftApp {
             if self.consoles.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.label(RichText::new("No hay pestañas abiertas").color(p.muted));
+                    ui.label(RichText::new(tr("No open tabs")).color(p.muted));
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Nueva consola  ⇧⌘N").color(p.muted));
+                    ui.label(RichText::new(tr("New console  ⇧⌘N")).color(p.muted));
                     ui.add_space(8.0);
-                    if theme::primary_button(ui, "Nueva consola").clicked() {
+                    if theme::primary_button(ui, tr("New console")).clicked() {
                         self.new_console_here();
                     }
                 });
@@ -2002,13 +2035,13 @@ impl DataCraftApp {
             let mut decision = None;
             egui::Modal::new(egui::Id::new("confirm_delete")).frame(frame).show(ctx, |ui| {
                 ui.set_width(360.0);
-                ui.label(RichText::new("Eliminar data source").font(theme::bold(15.0)));
+                ui.label(RichText::new(tr("Delete data source")).font(theme::bold(15.0)));
                 ui.add_space(8.0);
-                ui.label(format!("¿Eliminar «{name}»? Esta acción no se puede deshacer."));
+                ui.label(trf("Delete “{name}”? This action cannot be undone.", &[("name", &name)]));
                 ui.add_space(16.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if theme::primary_button(ui, "Eliminar").clicked() {
+                    if theme::primary_button(ui, tr("Delete")).clicked() {
                         decision = Some(true);
                     }
                     if theme::secondary_button(ui, "Cancelar").clicked() {
@@ -2033,19 +2066,18 @@ impl DataCraftApp {
             let mut decision = None;
             egui::Modal::new(egui::Id::new("confirm_discard")).frame(frame).show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.label(RichText::new("Cambios sin guardar").font(theme::bold(15.0)));
+                ui.label(RichText::new(tr("Unsaved changes")).font(theme::bold(15.0)));
                 ui.add_space(8.0);
-                let what = match action {
-                    Discard::Close(_) | Discard::CloseAll => "Al cerrar la pestaña",
-                    Discard::Reload(_) => "Al recargar los datos",
-                    Discard::CloseResults(..) => "Al cerrar la pestaña de resultados",
-                    Discard::Run(..) => "Al volver a ejecutar",
-                };
-                ui.label(format!("{what} se perderán los cambios pendientes del grid."));
+                ui.label(match action {
+                    Discard::Close(_) | Discard::CloseAll => tr("Closing the tab will discard the pending grid changes."),
+                    Discard::Reload(_) => tr("Reloading the data will discard the pending grid changes."),
+                    Discard::CloseResults(..) => tr("Closing the result tab will discard the pending grid changes."),
+                    Discard::Run(..) => tr("Running again will discard the pending grid changes."),
+                });
                 ui.add_space(16.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if theme::primary_button(ui, "Descartar").clicked() {
+                    if theme::primary_button(ui, tr("Discard")).clicked() {
                         decision = Some(true);
                     }
                     if theme::secondary_button(ui, "Cancelar").clicked() {
@@ -2077,10 +2109,10 @@ impl DataCraftApp {
                     ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "D", theme::bold(24.0), egui::Color32::WHITE);
                     ui.add_space(8.0);
                     ui.label(RichText::new("DataCraft").font(theme::bold(17.0)));
-                    ui.label(RichText::new(format!("Versión {}", env!("CARGO_PKG_VERSION"))).color(p.muted));
+                    ui.label(RichText::new(trf("Version {version}", &[("version", &env!("CARGO_PKG_VERSION"))])).color(p.muted));
                     ui.add_space(8.0);
-                    ui.label("Cliente SQL ligero para PostgreSQL, SQL Server y SQLite.");
-                    ui.label(RichText::new("Hecho con Rust, egui y tokio").small().color(p.muted));
+                    ui.label(tr("Lightweight SQL client for PostgreSQL, SQL Server and SQLite."));
+                    ui.label(RichText::new(tr("Made with Rust, egui and tokio")).small().color(p.muted));
                     ui.add_space(14.0);
                     theme::primary_button(ui, "Cerrar").clicked()
                 })
@@ -2093,12 +2125,12 @@ impl DataCraftApp {
         if self.show_settings {
             let resp = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
                 ui.set_width(300.0);
-                ui.label(RichText::new("Ajustes").font(theme::bold(15.0)));
+                ui.label(RichText::new(tr("Settings")).font(theme::bold(15.0)));
                 ui.add_space(8.0);
                 self.view_menu(ui);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Máx. filas por consulta:");
+                    ui.label(tr("Max rows per query:"));
                     ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=1_000_000).speed(10));
                 });
                 ui.add_space(12.0);
@@ -2113,7 +2145,7 @@ impl DataCraftApp {
 }
 
 impl DataCraftApp {
-    /// Ventana modal "Preview pending changes".
+    /// "Preview pending changes" modal window.
     fn preview_dialog(&mut self, ctx: &egui::Context, frame: egui::Frame) {
         let Some(pv) = self.preview.as_ref().filter(|p| p.visible) else { return };
         let p = palette(self.dark);
@@ -2139,7 +2171,7 @@ impl DataCraftApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Preview pending changes").font(theme::bold(15.0)));
                 ui.add_space(8.0);
-                let count = if n == 1 { "1 cambio".to_string() } else { format!("{n} cambios") };
+                let count = if n == 1 { tr("1 change").to_string() } else { trf("{n} changes", &[("n", &n)]) };
                 ui.label(RichText::new(format!("{count} · {title}")).color(p.muted));
             });
             ui.add_space(10.0);
@@ -2174,13 +2206,13 @@ impl DataCraftApp {
             }
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if theme::secondary_button(ui, "Copiar SQL").clicked() {
+                if theme::secondary_button(ui, tr("Copy SQL")).clicked() {
                     ui.ctx().copy_text(sql_text.clone());
                 }
                 if applying {
                     ui.add_space(8.0);
                     ui.add(egui::Spinner::new().size(14.0).color(p.muted));
-                    ui.label(RichText::new("Guardando…").color(p.muted));
+                    ui.label(RichText::new(tr("Saving…")).color(p.muted));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -2190,7 +2222,7 @@ impl DataCraftApp {
                         }
                     });
                     ui.add_enabled_ui(!applying, |ui| {
-                        if theme::secondary_button(ui, "Cancel").clicked() {
+                        if theme::secondary_button(ui, tr("Cancel")).clicked() {
                             cancel = true;
                         }
                     });
@@ -2215,7 +2247,7 @@ enum Generate {
     Ddl,
 }
 
-/// Consulta del editor de datos con filtros y límite de filas en el propio SQL.
+/// Data editor query with filters and the row limit in the SQL itself.
 pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str, order_by: &str, max_rows: usize) -> String {
     let t = Session::quote_table(driver, schema, table);
     let mut sql = match driver {
@@ -2236,7 +2268,7 @@ pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str
     sql
 }
 
-/// DDL aproximado a partir de la información de columnas conocida.
+/// Approximate DDL from the known column information.
 fn ddl(driver: Driver, table: &str, columns: &[ColumnInfo]) -> String {
     let mut lines: Vec<String> = columns
         .iter()
@@ -2256,7 +2288,7 @@ fn ddl(driver: Driver, table: &str, columns: &[ColumnInfo]) -> String {
     format!("create table {table}\n(\n{}\n);", lines.join(",\n"))
 }
 
-/// Botón de la franja de tool windows (37x40 en DataGrip; aquí 30x30 dentro de 40 de ancho).
+/// Tool window stripe button (37x40 in DataGrip; here 30x30 within a 40 wide stripe).
 fn stripe_button(ui: &mut Ui, ico: Ico, active: bool, tooltip: &str) -> egui::Response {
     let p = theme::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
@@ -2296,7 +2328,7 @@ fn now() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
-/// Vuelca el resultado de una ejecución en la consola (pestañas + log).
+/// Puts a run's result into the console (tabs + log).
 fn apply_execution(
     c: &mut Console,
     results_in: Vec<crate::db::ResultSet>,
@@ -2309,11 +2341,11 @@ fn apply_execution(
     let time = now();
     for rs in &results_in {
         let message = if rs.is_command() {
-            format!("{} en {}", results::affected_message(rs), results::format_duration(rs.elapsed))
+            trf("{message} in {time}", &[("message", &results::affected_message(rs)), ("time", &results::format_duration(rs.elapsed))])
         } else {
-            let mut m = format!("{} filas recuperadas en {}", rs.rows.len(), results::format_duration(rs.elapsed));
+            let mut m = trf("{n} rows retrieved in {time}", &[("n", &rs.rows.len()), ("time", &results::format_duration(rs.elapsed))]);
             if rs.truncated {
-                m.push_str(" (limitado a max_rows)");
+                m.push_str(tr(" (limited to max_rows)"));
             }
             m
         };
@@ -2331,7 +2363,7 @@ fn apply_execution(
         c.log.push(OutputEntry {
             time,
             statement: String::new(),
-            message: format!("{} sentencias ejecutadas en {}", c.last_statements.len(), results::format_duration(elapsed)),
+            message: trf("{n} statements executed in {time}", &[("n", &c.last_statements.len()), ("time", &results::format_duration(elapsed))]),
             is_error: false,
         });
     }
@@ -2340,7 +2372,7 @@ fn apply_execution(
         c.log.drain(..extra);
     }
 
-    // Recarga tras guardar cambios: sustituye solo el resultado editado.
+    // Reload after saving changes: replaces only the edited result.
     let replace = c.replace_view.take();
     if let Some(i) = replace
         && error.is_none()
@@ -2379,7 +2411,7 @@ fn apply_execution(
 
 impl eframe::App for DataCraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Antes que nada: los comandos de edición del menú se inyectan como eventos de este frame.
+        // First of all: the menu's edit commands are injected as events of this frame.
         self.menu_commands(ctx);
         self.handle_responses();
         if self.applied_zoom != Some(self.zoom) {
@@ -2402,7 +2434,7 @@ impl eframe::App for DataCraftApp {
         let p = palette(self.dark);
         let bar = egui::Frame::NONE.fill(p.main_bg);
 
-        // Con zoom < 100% la barra no baja de 32 pt de pantalla (semáforos de macOS).
+        // With zoom < 100% the bar doesn't go below 32 screen pt (macOS traffic lights).
         let title_h = 40.0_f32.max(32.0 / ctx.zoom_factor().max(0.1));
         egui::Panel::top("title_bar")
             .exact_size(title_h)
@@ -2471,6 +2503,7 @@ impl eframe::App for DataCraftApp {
             show_explorer: self.show_explorer,
             show_results: self.show_results,
             zoom: self.zoom,
+            lang: self.lang,
         };
         eframe::set_value(storage, STORAGE_KEY, &state);
     }
@@ -2485,12 +2518,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pasos_de_zoom() {
+    fn zoom_steps() {
         assert_eq!(zoom_in(1.0), 1.1);
         assert_eq!(zoom_out(1.0), 0.9);
         assert_eq!(zoom_in(2.0), 2.0);
         assert_eq!(zoom_out(0.5), 0.5);
-        // Desde un valor intermedio va al paso más cercano en esa dirección.
+        // From an intermediate value it goes to the nearest step in that direction.
         assert_eq!(zoom_in(1.2), 1.25);
         assert_eq!(zoom_out(1.2), 1.1);
         assert_eq!(clamp_zoom(5.0), 2.0);

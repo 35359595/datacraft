@@ -1,6 +1,7 @@
-//! Diálogo modal para crear/editar una conexión.
+//! Modal dialog to create/edit a connection.
 
 use crate::db::{ConnectionConfig, Driver};
+use crate::i18n::{tr, trf};
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, palette};
 use egui::{RichText, Ui};
@@ -13,7 +14,7 @@ pub enum TestState {
 
 pub struct ConnectionDialog {
     pub cfg: ConnectionConfig,
-    /// true si se edita una conexión existente.
+    /// true when editing an existing connection.
     pub editing: bool,
     pub test: TestState,
     pub error: Option<String>,
@@ -28,7 +29,7 @@ pub enum DialogResult {
 impl ConnectionDialog {
     pub fn new_connection(id: u64) -> Self {
         let mut cfg = ConnectionConfig::new(id, Driver::Postgres);
-        // El id es una marca de tiempo: no se muestra en el nombre por defecto.
+        // The id is a timestamp: it is not shown in the default name.
         cfg.name = Driver::Postgres.label().to_string();
         Self { cfg, editing: false, test: TestState::Idle, error: None }
     }
@@ -62,11 +63,11 @@ impl ConnectionDialog {
 
     fn validate(&self) -> Result<(), String> {
         if self.cfg.name.trim().is_empty() {
-            return Err("El nombre es obligatorio".into());
+            return Err(tr("Name is required").into());
         }
         match self.cfg.driver {
-            Driver::Sqlite if self.cfg.file_path.trim().is_empty() => Err("Indica el fichero de la base de datos".into()),
-            Driver::Postgres | Driver::MsSql if self.cfg.host.trim().is_empty() => Err("El host es obligatorio".into()),
+            Driver::Sqlite if self.cfg.file_path.trim().is_empty() => Err(tr("Specify the database file").into()),
+            Driver::Postgres | Driver::MsSql if self.cfg.host.trim().is_empty() => Err(tr("Host is required").into()),
             _ => Ok(()),
         }
     }
@@ -81,7 +82,7 @@ impl ConnectionDialog {
             .stroke(egui::Stroke::new(1.0, p.popup_border));
         egui::Modal::new(egui::Id::new("connection_dialog")).frame(frame).show(ctx, |ui| {
             ui.set_width(500.0);
-            let title = if self.editing { "Propiedades del data source" } else { "Nuevo data source" };
+            let title = if self.editing { tr("Data Source Properties") } else { tr("New Data Source") };
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
                 icons::paint(ui.painter(), r, Ico::Driver(self.cfg.driver), p.icon, &p, true);
@@ -99,7 +100,7 @@ impl ConnectionDialog {
                 let testing = matches!(self.test, TestState::Testing);
                 let link = ui.add_enabled(
                     !testing,
-                    egui::Button::new(RichText::new("Probar conexión").color(p.accent)).frame(false),
+                    egui::Button::new(RichText::new(tr("Test Connection")).color(p.accent)).frame(false),
                 );
                 if link.clicked() {
                     match self.validate() {
@@ -116,13 +117,13 @@ impl ConnectionDialog {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if theme::primary_button(ui, "OK").clicked() {
+                    if theme::primary_button(ui, tr("OK")).clicked() {
                         match self.validate() {
                             Ok(()) => result = Some(DialogResult::Save(self.cfg.clone())),
                             Err(e) => self.error = Some(e),
                         }
                     }
-                    if theme::secondary_button(ui, "Cancelar").clicked() {
+                    if theme::secondary_button(ui, tr("Cancel")).clicked() {
                         result = Some(DialogResult::Cancel);
                     }
                 });
@@ -136,7 +137,7 @@ impl ConnectionDialog {
 
     fn form(&mut self, ui: &mut Ui) {
         egui::Grid::new("conn_form").num_columns(2).spacing([14.0, 10.0]).min_col_width(96.0).show(ui, |ui| {
-            ui.label("Nombre:");
+            ui.label(tr("Name:"));
             ui.add(egui::TextEdit::singleline(&mut self.cfg.name).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
             ui.end_row();
 
@@ -155,33 +156,33 @@ impl ConnectionDialog {
 
             match self.cfg.driver {
                 Driver::Sqlite => {
-                    ui.label("Fichero:");
+                    ui.label(tr("File:"));
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.file_path).margin(egui::vec2(8.0, 5.0)).desired_width(260.0));
-                        if ui.button("Examinar…").clicked()
+                        if ui.button(tr("Browse…")).clicked()
                             && let Some(p) = rfd::FileDialog::new()
-                                .set_title("Abrir base de datos SQLite")
+                                .set_title(tr("Open SQLite Database"))
                                 .add_filter("SQLite", &["db", "sqlite", "sqlite3", "db3"])
-                                .add_filter("Todos", &["*"])
+                                .add_filter(tr("All files"), &["*"])
                                 .pick_file()
                         {
                             self.cfg.file_path = p.to_string_lossy().into_owned();
                         }
-                        if ui.button("Nueva…").on_hover_text("Crear un fichero nuevo").clicked()
+                        if ui.button(tr("New…")).on_hover_text(tr("Create a new file")).clicked()
                             && let Some(p) = rfd::FileDialog::new()
-                                .set_title("Nueva base de datos SQLite")
+                                .set_title(tr("New SQLite Database"))
                                 .add_filter("SQLite", &["db", "sqlite", "sqlite3"])
-                                .set_file_name("nueva.db")
+                                .set_file_name(tr("new.db"))
                                 .save_file()
                         {
-                            // El driver ya no crea ficheros: se crea aquí vacío (SQLite lo
-                            // inicializa al abrirlo). Si ya existe se reutiliza.
+                            // The driver no longer creates files: it is created empty here (SQLite
+                            // initializes it on open). An existing file is reused.
                             match std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p) {
                                 Ok(_) => {
                                     self.cfg.file_path = p.to_string_lossy().into_owned();
                                     self.error = None;
                                 }
-                                Err(e) => self.error = Some(format!("No se pudo crear {}: {e}", p.display())),
+                                Err(e) => self.error = Some(trf("Could not create {path}: {error}", &[("path", &p.display()), ("error", &e)])),
                             }
                         }
                     });
@@ -191,26 +192,26 @@ impl ConnectionDialog {
                     ui.label("Host:");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.host).margin(egui::vec2(8.0, 5.0)).desired_width(250.0));
-                        ui.label("Puerto:");
+                        ui.label(tr("Port:"));
                         ui.add(egui::DragValue::new(&mut self.cfg.port).range(1..=65535).speed(0));
                     });
                     ui.end_row();
 
-                    ui.label("Base de datos:");
+                    ui.label(tr("Database:"));
                     ui.add(egui::TextEdit::singleline(&mut self.cfg.database).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
                     ui.end_row();
 
-                    ui.label("Usuario:");
+                    ui.label(tr("User:"));
                     ui.add(egui::TextEdit::singleline(&mut self.cfg.user).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
                     ui.end_row();
 
-                    ui.label("Contraseña:");
+                    ui.label(tr("Password:"));
                     ui.add(egui::TextEdit::singleline(&mut self.cfg.password).password(true).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
                     ui.end_row();
 
                     if self.cfg.driver == Driver::MsSql {
                         ui.label("");
-                        ui.checkbox(&mut self.cfg.trust_cert, "Confiar en el certificado del servidor");
+                        ui.checkbox(&mut self.cfg.trust_cert, tr("Trust server certificate"));
                         ui.end_row();
                     }
                 }
@@ -223,10 +224,10 @@ impl ConnectionDialog {
         match &self.test {
             TestState::Idle => {}
             TestState::Testing => {
-                ui.label(RichText::new("Probando conexión…").color(pal.muted));
+                ui.label(RichText::new(tr("Testing connection…")).color(pal.muted));
             }
             TestState::Done(Ok(())) => {
-                ui.label(RichText::new("✓ Conexión correcta").color(pal.ok));
+                ui.label(RichText::new(tr("✓ Connection succeeded")).color(pal.ok));
             }
             TestState::Done(Err(e)) => {
                 ui.add(egui::Label::new(RichText::new(e).color(pal.error)).wrap());

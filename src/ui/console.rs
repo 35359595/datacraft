@@ -1,7 +1,8 @@
-//! Pestañas del editor: consola SQL (editor con resaltado, numeración de líneas, autocompletado
-//! y resultados) y editor de datos de una tabla (toolbar, filtros WHERE / ORDER BY y grid).
+//! Editor tabs: SQL console (editor with highlighting, line numbers, autocompletion
+//! and results) and table data editor (toolbar, WHERE / ORDER BY filters and grid).
 
 use crate::db::{ColumnInfo, Driver, ObjectKind, SchemaInfo};
+use crate::i18n::{tr, trf};
 use crate::sql;
 use crate::ui::icons::{self, Ico};
 use crate::ui::results::{self, OutputEntry, ResultView};
@@ -20,17 +21,17 @@ pub enum ResultTab {
     Result(usize),
 }
 
-/// Qué pestañas de resultados cerrar (la de Output no se cierra nunca).
+/// Which result tabs to close (Output is never closed).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CloseResults {
     One(usize),
-    /// Todas menos esta.
+    /// All but this one.
     Others(usize),
     All,
 }
 
 impl CloseResults {
-    /// Índices (ascendentes) que se cierran de `n` resultados.
+    /// Indices (ascending) closed out of `n` results.
     pub fn indices(self, n: usize) -> Vec<usize> {
         match self {
             CloseResults::One(i) => (i < n).then_some(i).into_iter().collect(),
@@ -40,7 +41,7 @@ impl CloseResults {
     }
 }
 
-/// Nuevo índice de la vista `i` tras quitar `removed` (ascendentes); `None` si se quitó.
+/// New index of view `i` after removing `removed` (ascending); `None` if it was removed.
 pub fn remap_index(i: usize, removed: &[usize]) -> Option<usize> {
     if removed.contains(&i) {
         return None;
@@ -48,8 +49,8 @@ pub fn remap_index(i: usize, removed: &[usize]) -> Option<usize> {
     Some(i - removed.iter().filter(|&&r| r < i).count())
 }
 
-/// Pestaña activa tras quitar `removed`: si se cerró la activa, la que ocupa su sitio (o la
-/// última); sin resultados, Output.
+/// Active tab after removing `removed`: if the active one was closed, the one taking its place
+/// (or the last one); with no results, Output.
 pub fn tab_after_close(tab: ResultTab, removed: &[usize], remaining: usize) -> ResultTab {
     let ResultTab::Result(i) = tab else { return tab };
     if remaining == 0 {
@@ -80,7 +81,7 @@ struct CompletionItem {
 }
 
 struct Completion {
-    /// Posición (en chars) donde empieza el prefijo que se reemplaza.
+    /// Position (in chars) where the replaced prefix starts.
     start: usize,
     selected: usize,
     items: Vec<CompletionItem>,
@@ -92,53 +93,53 @@ pub struct Console {
     pub title: String,
     pub text: String,
     pub conn: Option<ConnId>,
-    /// Base de datos de la pestaña (`None` = la por defecto de la conexión).
+    /// Database of the tab (`None` = the connection's default).
     pub db: Option<String>,
     pub running: bool,
     pub run_started: Option<Instant>,
-    /// Sentencias a ejecutar cuando termine de conectar.
+    /// Statements to run once connected.
     pub pending: Option<Vec<String>>,
     pub last_statements: Vec<String>,
     pub results: Vec<ResultView>,
     pub log: Vec<OutputEntry>,
     pub result_tab: ResultTab,
-    /// Rango de selección (chars, ordenado) del último frame.
+    /// Selection range (chars, sorted) from the last frame.
     pub cursor: Option<(usize, usize)>,
     hl_cache: Option<(u64, LayoutJob)>,
     completion: Option<Completion>,
-    /// Si es Some, la pestaña es un editor de datos de tabla en vez de una consola.
+    /// If Some, the tab is a table data editor instead of a console.
     pub table: Option<TableTab>,
-    /// Tras guardar cambios: la próxima ejecución sustituye solo este resultado.
+    /// After saving changes: the next run replaces only this result.
     pub replace_view: Option<usize>,
-    /// Formato elegido en el selector "CSV ⌄" del editor de datos.
+    /// Format chosen in the data editor's "CSV ⌄" selector.
     pub export_format: results::ExportFormat,
 }
 
-/// Estado del editor de datos de una tabla.
+/// State of a table data editor.
 pub struct TableTab {
     pub schema: String,
     pub table: String,
     pub where_clause: String,
     pub order_by: String,
-    /// false hasta la primera carga (las pestañas restauradas cargan al activarse).
+    /// false until the first load (restored tabs load when activated).
     pub loaded: bool,
 }
 
-/// Acciones que la consola pide a la aplicación.
+/// Actions the console asks the app to perform.
 pub enum ConsoleAction {
     Run,
     RunAll,
-    /// Recargar los datos del editor de tabla (con los filtros actuales).
+    /// Reload the table editor data (with the current filters).
     Reload,
-    /// Generar el DDL de la tabla del editor de datos.
+    /// Generate the DDL of the data editor's table.
     Ddl,
     Connect(ConnId),
     Error(String),
-    /// Abrir la previsualización de cambios pendientes del resultado indicado.
+    /// Open the preview of the given result's pending changes.
     Preview(usize),
-    /// Guardar directamente los cambios pendientes del resultado indicado.
+    /// Save the given result's pending changes directly.
     Submit(usize),
-    /// Cerrar pestañas de resultados (la app confirma si tienen cambios sin guardar).
+    /// Close result tabs (the app confirms if they have unsaved changes).
     CloseResults(CloseResults),
 }
 
@@ -149,14 +150,14 @@ fn edit_action(a: results::EditAction, view: usize) -> ConsoleAction {
     }
 }
 
-/// Contexto de solo lectura que necesita la consola.
+/// Read-only context the console needs.
 pub struct ConsoleCtx<'a> {
     pub connections: &'a [ConnSummary],
     pub schemas: Option<&'a [SchemaInfo]>,
     pub driver: Driver,
     pub dark: bool,
     pub font_size: f32,
-    /// Columnas de la tabla abierta (editor de datos), para marcar claves primarias.
+    /// Columns of the open table (data editor), to mark primary keys.
     pub columns: Option<&'a [ColumnInfo]>,
 }
 
@@ -184,7 +185,7 @@ impl Console {
         }
     }
 
-    /// Pestaña de editor de datos para `schema.table`.
+    /// Data editor tab for `schema.table`.
     pub fn new_table(id: u64, conn: ConnId, db: Option<String>, schema: String, table: String) -> Self {
         let mut c = Self::new(id, table.clone(), String::new(), Some(conn));
         c.db = db;
@@ -196,8 +197,8 @@ impl Console {
         self.running || self.pending.is_some()
     }
 
-    /// Resultado cuyos cambios se editan ahora: el último en el editor de datos o el
-    /// resultado visible en una consola.
+    /// Result whose changes are being edited: the last one in the data editor or the
+    /// visible result in a console.
     pub fn edit_view_index(&self) -> Option<usize> {
         if self.table.is_some() {
             return self.results.len().checked_sub(1);
@@ -212,13 +213,13 @@ impl Console {
         self.results.iter().any(|r| r.is_dirty())
     }
 
-    /// true si alguna de las vistas que cerraría `which` tiene cambios sin guardar.
+    /// true if any of the views `which` would close has unsaved changes.
     pub fn closing_dirty(&self, which: CloseResults) -> bool {
         which.indices(self.results.len()).iter().any(|&i| self.results[i].is_dirty())
     }
 
-    /// Cierra pestañas de resultados y reajusta la activa y `replace_view`. Devuelve los
-    /// índices quitados (ascendentes) para que la app reajuste los suyos.
+    /// Closes result tabs and adjusts the active one and `replace_view`. Returns the
+    /// removed indices (ascending) so the app can adjust its own.
     pub fn close_results(&mut self, which: CloseResults) -> Vec<usize> {
         let removed = which.indices(self.results.len());
         for &i in removed.iter().rev() {
@@ -237,7 +238,7 @@ impl Console {
         }
     }
 
-    /// (línea, columna) 1-based del cursor del editor.
+    /// 1-based (line, column) of the editor cursor.
     pub fn line_col(&self) -> (usize, usize) {
         let c = self.cursor.map(|(_, b)| b).unwrap_or(0);
         let mut line = 1;
@@ -257,7 +258,7 @@ impl Console {
         egui::Id::new(("console_editor", self.id))
     }
 
-    /// Texto seleccionado (si lo hay).
+    /// Selected text (if any).
     pub fn selection(&self) -> Option<&str> {
         let (a, b) = self.cursor?;
         if a == b {
@@ -273,7 +274,7 @@ impl Console {
         char_to_byte(&self.text, c)
     }
 
-    /// Mueve el cursor del editor al final y añade texto.
+    /// Moves the editor cursor to the end and appends text.
     pub fn append_text(&mut self, ctx: &egui::Context, extra: &str) {
         if !self.text.is_empty() && !self.text.ends_with('\n') {
             self.text.push('\n');
@@ -295,7 +296,7 @@ impl Console {
         self.cursor = Some((a.min(b), a.max(b)));
     }
 
-    /// Toolbar + editor de una consola (va dentro de la isla del editor).
+    /// Toolbar + editor of a console (inside the editor island).
     pub fn show_console(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
         self.console_toolbar(ui, cx, &mut actions);
@@ -304,14 +305,14 @@ impl Console {
         actions
     }
 
-    /// Contenido de la isla de resultados de una consola.
+    /// Content of a console's results island.
     pub fn show_results(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
         self.results_ui(ui, cx, &mut actions);
         actions
     }
 
-    /// Editor de datos de una tabla: toolbar, fila de filtros y grid.
+    /// Table data editor: toolbar, filter row and grid.
     pub fn show_table(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
         let p = pal(ui);
@@ -348,7 +349,7 @@ impl Console {
                 actions.push(ConsoleAction::Error(err));
             }
         } else if self.is_busy() {
-            ui.centered_and_justified(|ui| ui.label(RichText::new("Cargando…").color(p.muted)));
+            ui.centered_and_justified(|ui| ui.label(RichText::new(tr("Loading…")).color(p.muted)));
         }
         actions
     }
@@ -358,39 +359,39 @@ impl Console {
             let p = pal(ui);
             ui.add_space(6.0);
             ui.add(egui::Spinner::new().size(14.0).color(p.muted));
-            let label = if self.pending.is_some() { "Conectando…" } else { "Ejecutando…" };
+            let label = if self.pending.is_some() { tr("Connecting…") } else { tr("Running…") };
             let secs = self.run_started.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
             ui.label(RichText::new(format!("{label} {secs:.1} s")).color(p.muted));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
-    /// Desplegable "Tx: Auto".
+    /// "Tx: Auto" dropdown.
     fn tx_dropdown(&self, ui: &mut Ui) {
         let resp = theme::flat_button(ui, None, "Tx: Auto", FontId::proportional(13.0), true, true)
-            .on_hover_text("Modo de transacción");
+            .on_hover_text(tr("Transaction mode"));
         egui::Popup::menu(&resp).show(|ui| {
             let _ = ui.add(egui::Button::new("✓  Auto").frame(false));
-            ui.add_enabled(false, egui::Button::new("    Manual").frame(false));
+            ui.add_enabled(false, egui::Button::new(format!("    {}", tr("Manual"))).frame(false));
             ui.separator();
-            ui.label(RichText::new("Cada sentencia se confirma al ejecutarse").small().color(pal(ui).muted));
+            ui.label(RichText::new(tr("Each statement is committed when run")).small().color(pal(ui).muted));
         });
     }
 
-    /// Selector "conexión · base" de la consola (deshabilitado mientras está ocupada).
+    /// Console "connection · database" selector (disabled while busy).
     fn connection_selector(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let busy = self.is_busy();
         let current = self.conn.and_then(|id| cx.connections.iter().find(|c| c.id == id));
         let (ico, label) = match current {
             Some(c) => (Ico::Driver(c.driver), c.label(self.db.as_deref())),
-            None => (Ico::Database, "<sin conexión>".to_string()),
+            None => (Ico::Database, tr("<no connection>").to_string()),
         };
         let resp = theme::flat_button(ui, Some(ico), &label, FontId::proportional(13.0), true, !busy)
-            .on_hover_text("Data source y base de datos de la consola");
+            .on_hover_text(tr("Console data source and database"));
         let before = (self.conn, self.db.clone());
         egui::Popup::menu(&resp).show(|ui| {
             ui.set_min_width(240.0);
-            if ui.selectable_label(self.conn.is_none(), "<sin conexión>").clicked() {
+            if ui.selectable_label(self.conn.is_none(), tr("<no connection>")).clicked() {
                 self.conn = None;
                 self.db = None;
                 ui.close();
@@ -410,7 +411,7 @@ impl Console {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
                         let sel = effective.as_deref() == Some(d.as_str());
-                        let text = if c.default_db.as_deref() == Some(d.as_str()) { format!("{d}  (por defecto)") } else { d.clone() };
+                        let text = if c.default_db.as_deref() == Some(d.as_str()) { trf("{db}  (default)", &[("db", d)]) } else { d.clone() };
                         if ui.add(egui::Button::selectable(sel, text)).clicked() {
                             self.conn = Some(c.id);
                             self.db = Some(d.clone());
@@ -421,7 +422,7 @@ impl Console {
             }
         });
         if (self.conn, self.db.clone()) != before {
-            // Lo pendiente era para la conexión/base anterior.
+            // Pending statements were for the previous connection/database.
             self.pending = None;
             self.run_started = None;
             if let Some(id) = self.conn
@@ -438,18 +439,18 @@ impl Console {
         toolbar_row(ui, |ui| {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
-            if theme::icon_button(ui, Ico::Play, !busy, "Ejecutar sentencia actual o selección (⌘↩)").clicked() {
+            if theme::icon_button(ui, Ico::Play, !busy, tr("Run current statement or selection (⌘↩)")).clicked() {
                 actions.push(ConsoleAction::Run);
             }
-            if theme::icon_button(ui, Ico::PlayAll, !busy, "Ejecutar todo (⌘⇧↩)").clicked() {
+            if theme::icon_button(ui, Ico::PlayAll, !busy, tr("Run all (⌘⇧↩)")).clicked() {
                 actions.push(ConsoleAction::RunAll);
             }
             theme::toolbar_separator(ui);
-            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), "Ver log de ejecución").clicked() {
+            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), tr("Show execution log")).clicked() {
                 self.result_tab = ResultTab::Output;
             }
             self.tx_dropdown(ui);
-            theme::icon_button(ui, Ico::Stop, false, "Cancelar (no disponible)");
+            theme::icon_button(ui, Ico::Stop, false, tr("Cancel (not available)"));
             self.busy_label(ui);
                 }
                 theme::Side::Right => {
@@ -465,14 +466,14 @@ impl Console {
         toolbar_row(ui, |ui| {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
-            if theme::icon_button(ui, Ico::Refresh, !busy, "Recargar página (⌘R)").clicked() {
+            if theme::icon_button(ui, Ico::Refresh, !busy, tr("Reload page (⌘R)")).clicked() {
                 actions.push(ConsoleAction::Reload);
             }
-            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), "Copiar el log de consultas").clicked() {
+            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), tr("Copy the query log")).clicked() {
                 let text = self.log.iter().map(|e| format!("[{}] {} {}", e.time, e.statement, e.message)).collect::<Vec<_>>().join("\n");
                 ui.ctx().copy_text(text);
             }
-            theme::icon_button(ui, Ico::Stop, false, "Cancelar (no disponible)");
+            theme::icon_button(ui, Ico::Stop, false, tr("Cancel (not available)"));
             theme::toolbar_separator(ui);
             let idx = self.results.len().checked_sub(1);
             if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)
@@ -486,7 +487,7 @@ impl Console {
             theme::toolbar_separator(ui);
             self.tx_dropdown(ui);
             theme::toolbar_separator(ui);
-            if theme::icon_button(ui, Ico::Ddl, cx.columns.is_some(), "Ver DDL de la tabla").clicked() {
+            if theme::icon_button(ui, Ico::Ddl, cx.columns.is_some(), tr("Show table DDL")).clicked() {
                 actions.push(ConsoleAction::Ddl);
             }
             self.busy_label(ui);
@@ -498,19 +499,19 @@ impl Console {
                 let fmt = self.export_format;
                 let (target, base) = match &self.table {
                     Some(t) => (crate::db::Session::quote_table(cx.driver, &t.schema, &t.table), t.table.clone()),
-                    None => ("tabla".to_string(), "resultado".to_string()),
+                    None => (tr("table").to_string(), tr("result").to_string()),
                 };
-                // ⋮: copiar al portapapeles.
-                let more = theme::icon_button(ui, Ico::MoreVert, has_rows, "Copiar al portapapeles");
+                // ⋮: copy to the clipboard.
+                let more = theme::icon_button(ui, Ico::MoreVert, has_rows, tr("Copy to clipboard"));
                 egui::Popup::menu(&more).show(|ui| {
-                    if ui.button(format!("Copiar todo como {}", fmt.label())).clicked() {
+                    if ui.button(trf("Copy all as {format}", &[("format", &fmt.label())])).clicked() {
                         if let Some(view) = self.results.last() {
                             ui.ctx().copy_text(results::format_rows(view, fmt, &target));
                         }
                         ui.close();
                     }
                     for other in results::ExportFormat::ALL.into_iter().filter(|f| *f != fmt) {
-                        if ui.button(format!("Copiar todo como {}", other.label())).clicked() {
+                        if ui.button(trf("Copy all as {format}", &[("format", &other.label())])).clicked() {
                             if let Some(view) = self.results.last() {
                                 ui.ctx().copy_text(results::format_rows(view, other, &target));
                             }
@@ -518,16 +519,16 @@ impl Console {
                         }
                     }
                 });
-                // ⤓: exportar directamente a fichero con el formato elegido.
-                if theme::icon_button(ui, Ico::Export, has_rows, &format!("Exportar a fichero {}…", fmt.label())).clicked()
+                // ⤓: export straight to a file in the chosen format.
+                if theme::icon_button(ui, Ico::Export, has_rows, &trf("Export to {format} file…", &[("format", &fmt.label())])).clicked()
                     && let Some(view) = self.results.last()
                     && let Err(e) = results::export_to_file(view, fmt, &target, &base)
                 {
-                    actions.push(ConsoleAction::Error(format!("No se pudo exportar: {e}")));
+                    actions.push(ConsoleAction::Error(trf("Export failed: {error}", &[("error", &e)])));
                 }
-                // "CSV ⌄": elegir el formato de extracción.
+                // "CSV ⌄": choose the extraction format.
                 let selector = theme::flat_button(ui, None, fmt.label(), FontId::proportional(13.0), true, true)
-                    .on_hover_text("Formato de extracción");
+                    .on_hover_text(tr("Extraction format"));
                 egui::Popup::menu(&selector).show(|ui| {
                     for f in results::ExportFormat::ALL {
                         if ui.add(egui::Button::selectable(f == fmt, f.label())).clicked() {
@@ -541,7 +542,7 @@ impl Console {
         });
     }
 
-    /// Fila "WHERE | ORDER BY" del editor de datos.
+    /// "WHERE | ORDER BY" row of the data editor.
     fn filter_row(&mut self, ui: &mut Ui, actions: &mut Vec<ConsoleAction>) {
         let p = pal(ui);
         let Some(t) = self.table.as_mut() else { return };
@@ -587,7 +588,7 @@ impl Console {
 
     fn results_ui(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
         let p = pal(ui);
-        // Cabecera tipo tool window "Services": título + pestañas de resultados (cerrables).
+        // "Services" tool window header: title + (closable) result tabs.
         let busy = self.is_busy();
         let mut close = None;
         theme::clipped_row(ui, 36.0, |ui| {
@@ -599,7 +600,7 @@ impl Console {
                     .results
                     .get(i)
                     .filter(|r| r.edit.is_none() && !r.rs.is_command())
-                    .map(|r| r.readonly_reason.clone().unwrap_or_else(|| "Resultado de solo lectura".into())),
+                    .map(|r| r.readonly_reason.clone().unwrap_or_else(|| tr("Read-only result").into())),
                 ResultTab::Output => None,
             };
             let tabs_w = (ui.available_width() - if lock.is_some() { 38.0 } else { 8.0 }).max(0.0);
@@ -619,7 +620,7 @@ impl Console {
                                 self.result_tab = ResultTab::Output;
                             }
                             out.context_menu(|ui| {
-                                if ui.add_enabled(has_results && !busy, egui::Button::new("Cerrar todos los resultados")).clicked() {
+                                if ui.add_enabled(has_results && !busy, egui::Button::new(tr("Close all results"))).clicked() {
                                     close = Some(CloseResults::All);
                                     ui.close();
                                 }
@@ -635,15 +636,15 @@ impl Console {
                                     self.result_tab = ResultTab::Result(i);
                                 }
                                 resp.context_menu(|ui| {
-                                    if ui.add_enabled(!busy, egui::Button::new("Cerrar")).clicked() {
+                                    if ui.add_enabled(!busy, egui::Button::new(tr("Close"))).clicked() {
                                         close = Some(CloseResults::One(i));
                                         ui.close();
                                     }
-                                    if ui.add_enabled(!busy && n > 1, egui::Button::new("Cerrar otras")).clicked() {
+                                    if ui.add_enabled(!busy && n > 1, egui::Button::new(tr("Close others"))).clicked() {
                                         close = Some(CloseResults::Others(i));
                                         ui.close();
                                     }
-                                    if ui.add_enabled(!busy, egui::Button::new("Cerrar todas")).clicked() {
+                                    if ui.add_enabled(!busy, egui::Button::new(tr("Close all"))).clicked() {
                                         close = Some(CloseResults::All);
                                         ui.close();
                                     }
@@ -657,7 +658,7 @@ impl Console {
                     ui.add_space(8.0);
                     let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                     icons::paint(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(14.0)), Ico::Lock, p.muted, &p, true);
-                    resp.on_hover_text(format!("Solo lectura: {why}"));
+                    resp.on_hover_text(trf("Read-only: {reason}", &[("reason", &why)]));
                 });
             }
         });
@@ -667,7 +668,7 @@ impl Console {
         hline(ui);
         let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Copy)))
             && ui.memory(|m| m.focused().is_none());
-        // Mini barra de edición sobre el grid si el resultado es editable.
+        // Mini edit bar above the grid if the result is editable.
         if let ResultTab::Result(i) = self.result_tab
             && self.results.get(i).is_some_and(|r| r.edit.is_some())
         {
@@ -704,7 +705,7 @@ impl Console {
         let editor_id = self.editor_id();
         let focused = ui.memory(|m| m.has_focus(editor_id));
 
-        // Teclas del autocompletado: se consumen antes de que las vea el TextEdit.
+        // Autocompletion keys: consumed before the TextEdit sees them.
         let mut accept = false;
         if focused {
             if self.completion.is_some() {
@@ -733,7 +734,7 @@ impl Console {
                 i.events.retain(|e| {
                     !matches!(e, Event::Key { key: Key::Space, pressed: true, modifiers, .. } if modifiers.ctrl)
                 });
-                // Algunos sistemas generan también el texto " " con Ctrl pulsado.
+                // Some systems also emit the text " " with Ctrl held.
                 let removed = before != i.events.len();
                 if removed {
                     i.events.retain(|e| !matches!(e, Event::Text(t) if t == " "));
@@ -749,7 +750,7 @@ impl Console {
         }
 
         let caret_line = self.line_col().0;
-        // Layouter con caché del LayoutJob resaltado.
+        // Layouter caching the highlighted LayoutJob.
         let dark = cx.dark;
         let font_size = cx.font_size;
         let hl_cache = &mut self.hl_cache;
@@ -877,7 +878,7 @@ impl Console {
         }
     }
 
-    /// Dibuja el popup; devuelve true si se hizo clic en un elemento.
+    /// Draws the popup; returns true if an item was clicked.
     fn completion_popup(&mut self, ui: &Ui, anchor: egui::Pos2) -> bool {
         let pal = palette(ui.visuals().dark_mode);
         let Some(comp) = self.completion.as_mut() else { return false };
@@ -1021,7 +1022,7 @@ fn build_items(prefix: &str, qualifier: Option<&str>, text: &str, schemas: &[Sch
     let table_kind = |k: ObjectKind| if k == ObjectKind::Table { ItemKind::Table } else { ItemKind::View };
 
     if let Some(q) = qualifier {
-        // esquema.<tabla>
+        // schema.<table>
         for s in schemas.iter().filter(|s| s.name.eq_ignore_ascii_case(q)) {
             for t in &s.tables {
                 if matches_prefix(&t.name, prefix) {
@@ -1029,7 +1030,7 @@ fn build_items(prefix: &str, qualifier: Option<&str>, text: &str, schemas: &[Sch
                 }
             }
         }
-        // tabla.<columna> o alias.<columna>
+        // table.<column> or alias.<column>
         let table_name = resolve_alias(q, text, schemas).unwrap_or_else(|| q.to_string());
         for s in schemas {
             for t in s.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(&table_name)) {
@@ -1044,7 +1045,7 @@ fn build_items(prefix: &str, qualifier: Option<&str>, text: &str, schemas: &[Sch
         let mut seen_cols = std::collections::HashSet::new();
         for s in schemas {
             if schemas.len() > 1 && matches_prefix(&s.name, prefix) {
-                items.push(CompletionItem { text: s.name.clone(), kind: ItemKind::Schema, detail: "esquema".into() });
+                items.push(CompletionItem { text: s.name.clone(), kind: ItemKind::Schema, detail: tr("schema").into() });
             }
             for t in &s.tables {
                 if matches_prefix(&t.name, prefix) {
@@ -1073,7 +1074,7 @@ fn build_items(prefix: &str, qualifier: Option<&str>, text: &str, schemas: &[Sch
     items
 }
 
-/// Busca `<tabla> [AS] <alias>` en el texto para resolver un alias a su tabla.
+/// Looks for `<table> [AS] <alias>` in the text to resolve an alias to its table.
 fn resolve_alias(alias: &str, text: &str, schemas: &[SchemaInfo]) -> Option<String> {
     let words: Vec<&str> = text
         .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';'))
@@ -1099,34 +1100,34 @@ fn resolve_alias(alias: &str, text: &str, schemas: &[SchemaInfo]) -> Option<Stri
     None
 }
 
-/// Contador de cambios pendientes y aviso de tabla sin clave primaria.
+/// Pending changes counter and warning for tables without a primary key.
 fn edit_status_icon(ui: &mut Ui, v: &ResultView) {
     let p = pal(ui);
     let Some(e) = &v.edit else { return };
     if !e.target.has_pk {
         let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
         icons::paint(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(15.0)), Ico::Problems, p.warn, &p, true);
-        resp.on_hover_text(
-            "La tabla no tiene clave primaria: cada fila se identifica por todos sus valores \
-             originales. Si un cambio no afecta exactamente a una fila, no se guarda nada.",
-        );
+        resp.on_hover_text(tr(
+            "The table has no primary key: each row is identified by all of its original \
+             values. If a change does not affect exactly one row, nothing is saved.",
+        ));
     }
     let n = e.state.pending_count();
     if n > 0 {
         ui.add_space(4.0);
-        let text = if n == 1 { "1 cambio".to_string() } else { format!("{n} cambios") };
+        let text = if n == 1 { tr("1 change").to_string() } else { trf("{n} changes", &[("n", &n)]) };
         ui.label(RichText::new(text).color(p.accent).size(12.5));
     }
 }
 
-/// Línea horizontal fina a todo el ancho (separador interno de isla).
+/// Thin full-width horizontal line (separator inside an island).
 fn hline(ui: &mut Ui) {
     let p = pal(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.island_border));
 }
 
-/// Fila de barra de herramientas de 36 px.
+/// 36 px toolbar row.
 fn toolbar_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let w = ui.available_width();
     ui.allocate_ui_with_layout(vec2(w, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1170,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn indices_a_cerrar() {
+    fn indices_to_close() {
         assert_eq!(CloseResults::One(1).indices(3), vec![1]);
         assert!(CloseResults::One(5).indices(3).is_empty());
         assert_eq!(CloseResults::Others(1).indices(3), vec![0, 2]);
@@ -1178,11 +1179,11 @@ mod tests {
     }
 
     #[test]
-    fn reindexado_tras_cerrar() {
+    fn reindex_after_close() {
         assert_eq!(remap_index(0, &[1]), Some(0));
         assert_eq!(remap_index(1, &[1]), None);
         assert_eq!(remap_index(3, &[0, 2]), Some(1));
-        // Se cierra la activa: pasa a la que ocupa su sitio o a la última.
+        // The active one is closed: moves to the one taking its place or to the last one.
         assert_eq!(tab_after_close(ResultTab::Result(1), &[1], 2), ResultTab::Result(1));
         assert_eq!(tab_after_close(ResultTab::Result(2), &[2], 2), ResultTab::Result(1));
         assert_eq!(tab_after_close(ResultTab::Result(2), &[0], 2), ResultTab::Result(1));
@@ -1191,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn cerrar_resultados_de_consola() {
+    fn close_console_results() {
         let rs = |stmt: &str| crate::db::ResultSet { statement: stmt.into(), ..Default::default() };
         let mut c = Console::new(1, "c".into(), String::new(), None);
         c.results = (0..4).map(|i| ResultView::new(rs(&format!("select {i}")), i)).collect();

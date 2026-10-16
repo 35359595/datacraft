@@ -1,12 +1,12 @@
-//! Edición de datos en el grid: cambios pendientes y el SQL que los aplica.
+//! Data editing in the grid: pending changes and the SQL that applies them.
 //!
-//! Los valores viajan como texto (igual que se leen) y se escriben como literales de
-//! cadena; los tres motores convierten implícitamente `'42'` al tipo de la columna.
+//! Values travel as text (just as they are read) and are written as string literals;
+//! all three engines implicitly convert `'42'` to the column type.
 
 use crate::db::{Cell, Driver, Session};
 
-/// Un cambio pendiente sobre una fila. `key` identifica la fila: las columnas de la PK
-/// o, si la tabla no tiene, todas las columnas con sus valores originales.
+/// A pending change on a row. `key` identifies the row: the PK columns or, if the
+/// table has none, every column with its original value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     Update { key: Vec<(String, Cell)>, set: Vec<(String, Cell)> },
@@ -14,7 +14,7 @@ pub enum Change {
     Delete { key: Vec<(String, Cell)> },
 }
 
-/// Identificador entrecomillado según el dialecto.
+/// Identifier quoted for the dialect.
 pub fn quote_ident(driver: Driver, name: &str) -> String {
     match driver {
         Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
@@ -22,7 +22,7 @@ pub fn quote_ident(driver: Driver, name: &str) -> String {
     }
 }
 
-/// Literal SQL para un valor. `None` = NULL. SQL Server usa `N'..'` para no perder Unicode.
+/// SQL literal for a value. `None` = NULL. SQL Server uses `N'..'` so Unicode isn't lost.
 pub fn literal(driver: Driver, value: &Cell) -> String {
     match value {
         None => "NULL".into(),
@@ -46,8 +46,8 @@ fn where_clause(driver: Driver, key: &[(String, Cell)]) -> String {
         .join(" AND ")
 }
 
-/// Sentencia que aplica `change` sobre `schema.table`. Cada UPDATE/DELETE debe afectar
-/// exactamente a una fila: `Session::apply_changes` lo comprueba y si no, deshace todo.
+/// Statement that applies `change` to `schema.table`. Each UPDATE/DELETE must affect
+/// exactly one row: `Session::apply_changes` checks it and otherwise rolls everything back.
 pub fn change_sql(driver: Driver, schema: &str, table: &str, change: &Change) -> String {
     let target = Session::quote_table(driver, schema, table);
     match change {
@@ -71,8 +71,8 @@ pub fn change_sql(driver: Driver, schema: &str, table: &str, change: &Change) ->
     }
 }
 
-/// true para valores que el grid muestra recortados (BLOB/binario en hex con "…"):
-/// no se pueden editar ni usar como clave porque no son el valor real.
+/// true for values the grid shows truncated (BLOB/binary in hex with "…"): they can't
+/// be edited or used as a key because they aren't the real value.
 pub fn is_lossy_display(value: &Cell) -> bool {
     value.as_deref().is_some_and(|v| v.starts_with("0x") && v.ends_with('…'))
 }
@@ -86,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn update_con_pk_y_comillas() {
+    fn update_with_pk_and_quotes() {
         let ch = Change::Update { key: vec![kv("id", Some("7"))], set: vec![kv("name", Some("O'Brien")), kv("note", None)] };
         assert_eq!(
             change_sql(Driver::MsSql, "dbo", "users", &ch),
@@ -99,13 +99,13 @@ mod tests {
     }
 
     #[test]
-    fn clave_con_null_usa_is_null() {
+    fn null_key_uses_is_null() {
         let ch = Change::Delete { key: vec![kv("a", Some("1")), kv("b", None)] };
         assert_eq!(change_sql(Driver::Sqlite, "main", "t", &ch), "DELETE FROM \"t\" WHERE \"a\" = '1' AND \"b\" IS NULL");
     }
 
     #[test]
-    fn insert_con_y_sin_valores() {
+    fn insert_with_and_without_values() {
         let ch = Change::Insert { values: vec![kv("x", Some("1")), kv("y", None)] };
         assert_eq!(change_sql(Driver::Sqlite, "main", "t", &ch), "INSERT INTO \"t\" (\"x\", \"y\") VALUES ('1', NULL)");
         let empty = Change::Insert { values: vec![] };
@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn identificadores_raros() {
+    fn odd_identifiers() {
         assert_eq!(quote_ident(Driver::MsSql, "a]b"), "[a]]b]");
         assert_eq!(quote_ident(Driver::Postgres, "a\"b"), "\"a\"\"b\"");
         assert!(is_lossy_display(&Some("0xFF…".into())));

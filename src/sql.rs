@@ -1,11 +1,11 @@
-//! Utilidades de texto SQL: troceo de sentencias, sentencia bajo el cursor
-//! y resaltado de sintaxis para el editor.
+//! SQL text utilities: statement splitting, statement under the cursor
+//! and syntax highlighting for the editor.
 
 use crate::db::Driver;
 use egui::Color32;
 use egui::text::{LayoutJob, TextFormat};
 
-/// Trozo de script con su rango en bytes dentro del texto original.
+/// Script fragment with its byte range within the original text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub text: String,
@@ -13,14 +13,14 @@ pub struct Statement {
     pub end: usize,
 }
 
-/// Divide un script en sentencias. Respeta comillas simples/dobles, `[ident]` (SQL Server),
-/// `$tag$...$tag$` (PostgreSQL), comentarios `--` y `/* */`. Separadores: `;` y, en SQL Server,
-/// una línea que solo contiene `GO` (sin distinguir mayúsculas). Omite trozos vacíos o solo comentarios.
-/// `text` va recortado (trim) y sin el `;` final.
+/// Splits a script into statements. Honors single/double quotes, `[ident]` (SQL Server),
+/// `$tag$...$tag$` (PostgreSQL), `--` and `/* */` comments. Separators: `;` and, on SQL Server,
+/// a line containing only `GO` (case-insensitive). Skips empty or comment-only fragments.
+/// `text` is trimmed and has no trailing `;`.
 pub fn split_statements(script: &str, driver: Driver) -> Vec<Statement> {
     let dialect = Dialect::for_driver(driver);
     let mut out = Vec::new();
-    // Rango de tokens significativos (ni espacio ni comentario) de la sentencia en curso.
+    // Range of significant tokens (neither whitespace nor comment) of the current statement.
     let mut current: Option<(usize, usize)> = None;
     let mut flush = |current: &mut Option<(usize, usize)>| {
         if let Some((start, end)) = current.take() {
@@ -47,8 +47,8 @@ pub fn split_statements(script: &str, driver: Driver) -> Vec<Statement> {
     out
 }
 
-/// Sentencia que contiene la posición `cursor` (en bytes). Si el cursor está en espacio entre
-/// sentencias, devuelve la anterior más cercana (como DataGrip); si no hay, la siguiente.
+/// Statement containing the `cursor` position (in bytes). If the cursor is in the space between
+/// statements, returns the closest previous one (like DataGrip); if there is none, the next one.
 pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<Statement> {
     let stmts = split_statements(script, driver);
     if stmts.is_empty() {
@@ -60,7 +60,7 @@ pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<State
     }
 
     let next_idx = stmts.partition_point(|s| s.start <= cursor);
-    // Si el cursor está en la sangría de la línea donde empieza la siguiente sentencia, esa.
+    // If the cursor is in the indentation of the line where the next statement starts, that one.
     if let Some(next) = stmts.get(next_idx) {
         let line_start = script[..cursor].rfind('\n').map_or(0, |i| i + 1);
         let before_cursor_blank = script[line_start..cursor].trim().is_empty();
@@ -73,10 +73,10 @@ pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<State
     Some(stmts[next_idx - 1].clone())
 }
 
-/// Trozos a enviar al servidor al ejecutar un script entero o una selección.
-/// SQL Server: lotes separados solo por `GO` (un `DECLARE` o un `BEGIN…END` con `;` siguen juntos).
-/// SQLite: el script entero (el driver ya lo recorre sentencia a sentencia, respetando triggers).
-/// PostgreSQL: sentencias por `;` (el dollar-quoting protege los cuerpos de funciones).
+/// Fragments to send to the server when running a whole script or a selection.
+/// SQL Server: batches separated only by `GO` (a `DECLARE` or a `BEGIN…END` with `;` stay together).
+/// SQLite: the whole script (the driver already walks it statement by statement, honoring triggers).
+/// PostgreSQL: statements by `;` (dollar-quoting protects function bodies).
 pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
     match driver {
         Driver::Postgres => split_statements(script, driver),
@@ -87,7 +87,7 @@ pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
             let mut flush = |current: &mut Option<(usize, usize)>| {
                 if let Some((start, end)) = current.take() {
                     let text = script[start..end].to_string();
-                    // Un lote formado solo por `;` no aporta nada.
+                    // A batch made only of `;` adds nothing.
                     if text.chars().any(|c| c != ';' && !c.is_whitespace()) {
                         out.push(Statement { text, start, end });
                     }
@@ -109,7 +109,7 @@ pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
     }
 }
 
-/// LayoutJob coloreado para `egui::TextEdit::layouter`.
+/// Colored LayoutJob for `egui::TextEdit::layouter`.
 pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text::LayoutJob {
     let palette = if dark_mode {
         Palette::DARK
@@ -121,7 +121,7 @@ pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text:
 
     for tok in Lexer::new(text, Dialect::PERMISSIVE) {
         let style = Style::of(&tok, text);
-        // Agrupa tokens consecutivos con el mismo estilo para no inflar las secciones.
+        // Group consecutive tokens with the same style so the sections don't pile up.
         match &mut pending {
             Some((_, end, s)) if *s == style => *end = tok.end,
             _ => {
@@ -138,7 +138,7 @@ pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text:
     job
 }
 
-/// Palabras clave SQL comunes (mayúsculas), usadas por el resaltado y el autocompletado.
+/// Common SQL keywords (uppercase), used by highlighting and autocompletion.
 pub const KEYWORDS: &[&str] = &[
     "ABORT",
     "ACTION",
@@ -424,7 +424,7 @@ fn is_keyword(word: &str) -> bool {
     KEYWORDS.binary_search(&upper.as_str()).is_ok()
 }
 
-/// ¿Es `tok` un `GO` solo en su línea (admite espacios y un comentario `--` detrás)?
+/// Is `tok` a `GO` alone on its line (allowing spaces and a trailing `--` comment)?
 fn is_go_line(script: &str, tok: &Token) -> bool {
     if !script[tok.start..tok.end].eq_ignore_ascii_case("go") {
         return false;
@@ -439,7 +439,7 @@ fn is_go_line(script: &str, tok: &Token) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Tokenizador
+// Tokenizer
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,13 +469,13 @@ struct Dialect {
     backticks: bool,
     dollar_quotes: bool,
     nested_comments: bool,
-    /// `@var` y `#temp` como palabras (T-SQL).
+    /// `@var` and `#temp` as words (T-SQL).
     tsql_names: bool,
     go_separator: bool,
 }
 
 impl Dialect {
-    /// Para el resaltado, que no conoce el motor: acepta todas las formas de comillas.
+    /// For highlighting, which doesn't know the engine: accepts every quoting form.
     const PERMISSIVE: Dialect = Dialect {
         brackets: true,
         backticks: true,
@@ -515,8 +515,8 @@ impl Dialect {
     }
 }
 
-/// Todas las decisiones se toman sobre bytes ASCII; los bytes >= 0x80 solo aparecen dentro
-/// de palabras, cadenas o comentarios, así que los límites de token caen siempre en límite de char.
+/// Every decision is made on ASCII bytes; bytes >= 0x80 only appear inside words, strings
+/// or comments, so token boundaries always fall on char boundaries.
 struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
@@ -542,14 +542,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Avanza hasta pasar `close` (si no aparece, hasta el final). `escape_double`: `''` → `'`.
+    /// Advances past `close` (to the end if it doesn't appear). `escape_double`: `''` → `'`.
     fn eat_quoted(&mut self, close: u8, escape_double: bool, backslash: bool) {
         while self.pos < self.src.len() {
             let b = self.src[self.pos];
             self.pos += 1;
             if backslash && b == b'\\' {
                 self.pos = (self.pos + 1).min(self.src.len());
-                // El byte saltado podría ser el inicio de un char multibyte: completa el char.
+                // The skipped byte could start a multibyte char: complete the char.
                 self.eat_while(|b| (0x80..0xC0).contains(&b));
             } else if b == close {
                 if escape_double && self.peek(0) == Some(close) {
@@ -583,12 +583,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Si en la posición actual hay `$tag$`, devuelve su longitud.
+    /// If there is a `$tag$` at the current position, returns its length.
     fn dollar_tag_len(&self) -> Option<usize> {
         let rest = &self.src[self.pos..];
         let mut i = 1;
         if rest.get(i).is_some_and(|b| b.is_ascii_digit()) {
-            return None; // $1: parámetro
+            return None; // $1: parameter
         }
         while rest
             .get(i)
@@ -624,7 +624,7 @@ impl<'a> Lexer<'a> {
                 self.eat_quoted(b'\'', true, false);
                 Kind::Str
             }
-            // Prefijos de cadena: E'..' (escapes con \), N'..', X'..', B'..'.
+            // String prefixes: E'..' (escapes with \), N'..', X'..', B'..'.
             b'e' | b'E' | b'n' | b'N' | b'x' | b'X' | b'b' | b'B' if next == Some(b'\'') => {
                 self.pos += 2;
                 self.eat_quoted(b'\'', true, matches!(b, b'e' | b'E'));
@@ -703,7 +703,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `arr[1]`: un `[` pegado a una palabra o `)` es subíndice, no identificador (salvo T-SQL).
+    /// `arr[1]`: a `[` right after a word or `)` is a subscript, not an identifier (except in T-SQL).
     fn follows_operand(&self) -> bool {
         !self.dialect.go_separator
             && self.pos > 0
@@ -731,7 +731,7 @@ impl Iterator for Lexer<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Resaltado
+// Highlighting
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,7 +767,7 @@ struct Palette {
 }
 
 impl Palette {
-    // Esquema "Dark" de las Islands (DataGrip 2026)
+    // Islands "Dark" scheme (DataGrip 2026)
     const DARK: Palette = Palette {
         text: Color32::from_rgb(0xBC, 0xBE, 0xC4),
         keyword: Color32::from_rgb(0xCF, 0x8E, 0x6D),
@@ -817,7 +817,7 @@ mod tests {
         assert!(KEYWORDS.len() >= 200);
         assert!(KEYWORDS.windows(2).all(|w| w[0] < w[1]));
         assert!(KEYWORDS.iter().all(|k| k.to_ascii_uppercase() == *k));
-        assert!(is_keyword("select") && is_keyword("Where") && !is_keyword("usuarios"));
+        assert!(is_keyword("select") && is_keyword("Where") && !is_keyword("customers"));
     }
 
     #[test]
@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn go_separator() {
-        let s = "SELECT 1\nGO\nselect 2\n  go  -- fin\nSELECT 'GO'\n/*\nGO\n*/\nSELECT go_x\nGo";
+        let s = "SELECT 1\nGO\nselect 2\n  go  -- end\nSELECT 'GO'\n/*\nGO\n*/\nSELECT go_x\nGo";
         let t = texts(s, Driver::MsSql);
         assert_eq!(
             t,
@@ -878,7 +878,7 @@ mod tests {
                 "SELECT 'GO'\n/*\nGO\n*/\nSELECT go_x"
             ]
         );
-        // En Postgres GO no separa.
+        // On Postgres GO doesn't separate.
         assert_eq!(texts("SELECT 1\nGO\nSELECT 2", Driver::Postgres).len(), 1);
     }
 
@@ -886,14 +886,14 @@ mod tests {
     fn empty_and_comment_only() {
         assert!(texts("", Driver::Postgres).is_empty());
         assert!(texts(" ;; \n ; ", Driver::Postgres).is_empty());
-        assert!(texts("-- solo\n/* comentario */;", Driver::MsSql).is_empty());
-        let t = texts("-- cabecera\nSELECT 1; -- cola\n", Driver::Sqlite);
+        assert!(texts("-- only\n/* comment */;", Driver::MsSql).is_empty());
+        let t = texts("-- header\nSELECT 1; -- tail\n", Driver::Sqlite);
         assert_eq!(t, vec!["SELECT 1"]);
     }
 
     #[test]
     fn batches_keep_tsql_and_triggers_together() {
-        let ms = split_batches("DECLARE @n int = 5;\nSELECT @n;\nGO\nSELECT 2;\n go -- fin\n;", Driver::MsSql);
+        let ms = split_batches("DECLARE @n int = 5;\nSELECT @n;\nGO\nSELECT 2;\n go -- end\n;", Driver::MsSql);
         let texts: Vec<_> = ms.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["DECLARE @n int = 5;\nSELECT @n;", "SELECT 2;"]);
         let trig = "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE a SET x = 1; END;\nSELECT 1;";
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(lite.len(), 1);
         assert_eq!(lite[0].text, trig);
         assert_eq!(split_batches("SELECT 1; SELECT 2", Driver::Postgres).len(), 2);
-        assert!(split_batches("  ;; -- nada\n", Driver::MsSql).is_empty());
+        assert!(split_batches("  ;; -- nothing\n", Driver::MsSql).is_empty());
     }
 
     #[test]
@@ -946,7 +946,7 @@ mod tests {
             for x in &st {
                 assert_eq!(&s[x.start..x.end], x.text);
             }
-            // Cualquier posición, incluso a mitad de un char multibyte.
+            // Any position, even in the middle of a multibyte char.
             for c in 0..=s.len() + 5 {
                 assert!(statement_at(s, c, d).is_some());
             }
@@ -961,21 +961,21 @@ mod tests {
         let at = |c| statement_at(s, c, d).unwrap().text;
         assert_eq!(at(0), "SELECT 1");
         assert_eq!(at(3), "SELECT 1");
-        assert_eq!(at(8), "SELECT 1"); // justo antes del ';'
-        assert_eq!(at(9), "SELECT 1"); // tras el ';'
-        assert_eq!(at(10), "SELECT 1"); // línea en blanco
-        assert_eq!(at(11), "SELECT 2"); // sangría de la línea de SELECT 2
+        assert_eq!(at(8), "SELECT 1"); // right before the ';'
+        assert_eq!(at(9), "SELECT 1"); // after the ';'
+        assert_eq!(at(10), "SELECT 1"); // blank line
+        assert_eq!(at(11), "SELECT 2"); // indentation of the SELECT 2 line
         let p2 = s.find("SELECT 2").unwrap();
         assert_eq!(at(p2 + 4), "SELECT 2");
-        assert_eq!(at(p2 + 12), "SELECT 2"); // espacios tras el ';'
+        assert_eq!(at(p2 + 12), "SELECT 2"); // spaces after the ';'
         assert_eq!(at(s.len()), "SELECT 3");
         assert_eq!(at(s.len() + 100), "SELECT 3");
 
-        let s2 = "\n\n  -- hola\n SELECT 1; SELECT 2";
+        let s2 = "\n\n  -- hello\n SELECT 1; SELECT 2";
         assert_eq!(statement_at(s2, 0, d).unwrap().text, "SELECT 1");
         let st = statement_at(s2, s2.len(), d).unwrap();
         assert_eq!((st.start, st.end), (s2.len() - 8, s2.len()));
-        assert_eq!(statement_at("  -- nada\n", 3, d), None);
+        assert_eq!(statement_at("  -- nothing\n", 3, d), None);
         assert_eq!(statement_at("", 0, d), None);
     }
 
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn highlight_reconstructs_and_colors() {
-        let s = "select \"Nombre\", [x], 42, 'a''b' -- c\nFROM t /* d */ WHERE arr[1] = $$x$$;";
+        let s = "select \"Name\", [x], 42, 'a''b' -- c\nFROM t /* d */ WHERE arr[1] = $$x$$;";
         assert_eq!(highlight_text(s), s);
         assert_eq!(highlight_text(""), "");
         let job = highlight(s, false, egui::FontId::monospace(13.0));
@@ -1006,7 +1006,7 @@ mod tests {
         assert_eq!(color_of("FROM").color, Palette::LIGHT.keyword);
         assert_eq!(color_of("42").color, Palette::LIGHT.number);
         assert_eq!(color_of("'a''b'").color, Palette::LIGHT.string);
-        assert_eq!(color_of("\"Nombre\"").color, Palette::LIGHT.ident);
+        assert_eq!(color_of("\"Name\"").color, Palette::LIGHT.ident);
         assert_eq!(color_of("[x]").color, Palette::LIGHT.ident);
         assert_eq!(color_of("[1]").color, Palette::LIGHT.text);
         assert_eq!(color_of("$$x$$").color, Palette::LIGHT.string);

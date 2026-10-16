@@ -26,6 +26,7 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "tim
 tokio-postgres = "0.7.18"
 tokio-util = { version = "0.7.20", features = ["compat"] }
 muda = { version = "0.21.2", default-features = false }
+sys-locale = "0.3.2"
 
 [profile.release]
 lto = "fat"
