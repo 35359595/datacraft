@@ -1,16 +1,37 @@
 #!/bin/zsh
-# Builds in release mode and generates target/release/DataCraft.app (optional: --install copies it to /Applications).
+# Builds in release mode and generates target/release/DataCraft.app.
+# Options: --universal (Apple Silicon + Intel binary), --dmg (target/release/DataCraft-<version>-<arch>.dmg),
+# --install (copies the app to /Applications).
 set -euo pipefail
 cd "${0:A:h}/.."
 source "$HOME/.cargo/env" 2>/dev/null || true
 
+UNIVERSAL=0 DMG=0 INSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --universal) UNIVERSAL=1 ;;
+    --dmg) DMG=1 ;;
+    --install) INSTALL=1 ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-cargo build --release
+if (( UNIVERSAL )); then
+  cargo build --release --target aarch64-apple-darwin
+  cargo build --release --target x86_64-apple-darwin
+  lipo -create -output target/release/datacraft-universal \
+    target/aarch64-apple-darwin/release/datacraft target/x86_64-apple-darwin/release/datacraft
+  BIN=target/release/datacraft-universal ARCH=universal
+else
+  cargo build --release
+  BIN=target/release/datacraft ARCH=$(uname -m)
+fi
 
 APP=target/release/DataCraft.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/datacraft "$APP/Contents/MacOS/DataCraft"
+cp "$BIN" "$APP/Contents/MacOS/DataCraft"
 cp assets/DataCraft.icns "$APP/Contents/Resources/DataCraft.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -58,7 +79,18 @@ else
 fi
 echo "Generated $APP"
 
-if [[ "${1:-}" == "--install" ]]; then
+if (( DMG )); then
+  DMG_FILE="target/release/DataCraft-${VERSION}-${ARCH}.dmg"
+  STAGE=$(mktemp -d)
+  cp -R "$APP" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"
+  rm -f "$DMG_FILE"
+  hdiutil create -volname DataCraft -srcfolder "$STAGE" -format UDZO "$DMG_FILE" >/dev/null
+  rm -rf "$STAGE"
+  echo "Generated $DMG_FILE"
+fi
+
+if (( INSTALL )); then
   rm -rf /Applications/DataCraft.app
   cp -R "$APP" /Applications/
   echo "Installed at /Applications/DataCraft.app"

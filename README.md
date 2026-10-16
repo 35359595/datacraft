@@ -2,6 +2,8 @@
 
 DataGrip-style database client for macOS (Islands theme), written in Rust with egui.
 
+![DataCraft table data editor](docs/screenshots/table-editor.png)
+
 - **Engines:** PostgreSQL, SQL Server and SQLite.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
 - **SQL consoles:** highlighting, autocompletion, ⌘↩ (statement under the cursor or selection) and ⌘⇧↩ (everything; `GO` batches on SQL Server). Each console runs against the database you pick.
@@ -12,11 +14,20 @@ DataGrip-style database client for macOS (Islands theme), written in Rust with e
 - **Languages:** English and Spanish; follows the system language and can be changed in Settings.
 - **Passwords:** stored in the macOS Keychain, never in the connections file.
 
+![About DataCraft](docs/screenshots/about.png)
+
+## Download
+
+Get the latest `.dmg` (universal: Apple Silicon and Intel, macOS 11+) from
+[Releases](https://github.com/javy-fernandez/datacraft/releases). The app is not notarized: the first
+time, right-click DataCraft.app → **Open**, or run `xattr -dr com.apple.quarantine /Applications/DataCraft.app`.
+
 ## Build
 
 ```bash
-cargo run                      # development
-scripts/bundle.sh --install    # optimized DataCraft.app in /Applications
+cargo run                                  # development
+scripts/bundle.sh --install                # optimized DataCraft.app in /Applications
+scripts/bundle.sh --universal --dmg        # universal app + .dmg (needs: rustup target add x86_64-apple-darwin)
 ```
 
 ### Code signing (optional)
@@ -42,6 +53,11 @@ The PostgreSQL live tests run with `cargo test -- --ignored` and the `DATACRAFT_
 
 Demo mode for screenshots: `DATACRAFT_DEMO=path.db cargo run` (see the header of `src/app.rs`).
 
+## License
+
+DataCraft is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Bundled fonts keep their own open license (SIL OFL 1.1); see [assets/fonts/README.md](assets/fonts/README.md).
+
 ## Español
 
 Cliente de bases de datos para macOS al estilo de DataGrip (tema Islands), escrito en Rust con egui.
@@ -56,11 +72,18 @@ Cliente de bases de datos para macOS al estilo de DataGrip (tema Islands), escri
 - **Idiomas:** inglés y español; sigue el idioma del sistema y se puede cambiar en Ajustes.
 - **Contraseñas:** se guardan en el Llavero de macOS, nunca en el fichero de conexiones.
 
+### Descarga
+
+Descarga el último `.dmg` (universal: Apple Silicon e Intel, macOS 11+) desde
+[Releases](https://github.com/javy-fernandez/datacraft/releases). La app no está notarizada: la primera
+vez, clic derecho en DataCraft.app → **Abrir**, o ejecuta `xattr -dr com.apple.quarantine /Applications/DataCraft.app`.
+
 ### Compilar
 
 ```bash
-cargo run                      # desarrollo
-scripts/bundle.sh --install    # DataCraft.app optimizada en /Applications
+cargo run                                  # desarrollo
+scripts/bundle.sh --install                # DataCraft.app optimizada en /Applications
+scripts/bundle.sh --universal --dmg        # app universal + .dmg (requiere: rustup target add x86_64-apple-darwin)
 ```
 
 **Firma (opcional):** `bundle.sh` firma la app con un certificado llamado **DataCraft** si existe
@@ -83,3 +106,8 @@ Los tests en vivo de PostgreSQL se ejecutan con `cargo test -- --ignored` y las 
 `DATACRAFT_PG_*` (ver `src/db/postgres.rs`).
 
 Modo demo para capturas: `DATACRAFT_DEMO=ruta.db cargo run` (ver la cabecera de `src/app.rs`).
+
+### Licencia
+
+DataCraft tiene doble licencia [MIT](LICENSE-MIT) o [Apache-2.0](LICENSE-APACHE), a tu elección.
+Las fuentes incluidas mantienen su propia licencia abierta (SIL OFL 1.1); ver [assets/fonts/README.md](assets/fonts/README.md).
