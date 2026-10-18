@@ -2148,7 +2148,7 @@ impl DataCraftApp {
                     if theme::primary_button(ui, tr("Delete")).clicked() {
                         decision = Some(true);
                     }
-                    if theme::secondary_button(ui, "Cancelar").clicked() {
+                    if theme::secondary_button(ui, tr("Cancel")).clicked() {
                         decision = Some(false);
                     }
                 });
@@ -2184,7 +2184,7 @@ impl DataCraftApp {
                     if theme::primary_button(ui, tr("Discard")).clicked() {
                         decision = Some(true);
                     }
-                    if theme::secondary_button(ui, "Cancelar").clicked() {
+                    if theme::secondary_button(ui, tr("Cancel")).clicked() {
                         decision = Some(false);
                     }
                 });
@@ -2218,7 +2218,7 @@ impl DataCraftApp {
                     ui.label(tr("Lightweight SQL client for PostgreSQL, SQL Server and SQLite."));
                     ui.label(RichText::new(tr("Made with Rust, egui and tokio")).small().color(p.muted));
                     ui.add_space(14.0);
-                    theme::primary_button(ui, "Cerrar").clicked()
+                    theme::primary_button(ui, tr("Close")).clicked()
                 })
                 .inner
             });
@@ -2238,7 +2238,7 @@ impl DataCraftApp {
                     ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=1_000_000).speed(10));
                 });
                 ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| theme::primary_button(ui, "Cerrar").clicked())
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| theme::primary_button(ui, tr("Close")).clicked())
                     .inner
             });
             if resp.inner || resp.should_close() {
