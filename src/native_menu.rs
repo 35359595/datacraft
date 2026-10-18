@@ -163,7 +163,8 @@ impl NativeMenu {
     /// the app already launched (e.g. in `DataCraftApp::new` with `&cc.egui_ctx`): it replaces
     /// winit's default menu. Returns `None` when not on the main thread or if it fails.
     pub fn install(ctx: &egui::Context) -> Option<Self> {
-        if std::thread::current().name() != Some("main") {
+        // Only macOS has the NSApp menu bar; elsewhere the egui shortcuts act instead.
+        if !cfg!(target_os = "macos") || std::thread::current().name() != Some("main") {
             return None;
         }
         let built = match build() {
@@ -173,6 +174,7 @@ impl NativeMenu {
                 return None;
             }
         };
+        #[cfg(target_os = "macos")]
         built.menu.init_for_nsapp();
 
         let (tx, rx) = channel();
@@ -387,9 +389,11 @@ fn build() -> muda::Result<Built> {
             }),
         ],
     )?;
+    #[cfg(target_os = "macos")]
     window_menu.set_as_windows_menu_for_nsapp();
 
     let help_menu = submenu(|| tr("Help"), &[&item(MenuCommand::Help, || tr("DataCraft Help"), None)])?;
+    #[cfg(target_os = "macos")]
     help_menu.set_as_help_menu_for_nsapp();
 
     let menu = Menu::with_items(&[&app_menu, &file_menu, &edit_menu, &view_menu, &run_menu, &window_menu, &help_menu])?;
