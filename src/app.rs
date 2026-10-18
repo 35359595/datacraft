@@ -17,6 +17,8 @@
 //! several queries, run with "Run all" (one result tab each).
 //! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked.
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
+//! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
+//! `table-submit` also creates that table in the demo database.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -25,6 +27,7 @@ use crate::i18n::{self, Lang, tr, trf};
 use crate::sql;
 use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
+use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -233,6 +236,8 @@ pub struct DataCraftApp {
     explorer: ExplorerState,
     dialog: Option<ConnectionDialog>,
     confirm_delete: Option<ConnId>,
+    /// "New Database" / "New Table" dialog.
+    create: Option<CreateDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -302,6 +307,7 @@ impl DataCraftApp {
             explorer: ExplorerState::default(),
             dialog: None,
             confirm_delete: None,
+            create: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -544,6 +550,21 @@ impl DataCraftApp {
                         if std::env::var("DATACRAFT_DEMO_TAB").is_ok_and(|v| v == "console") {
                             self.active = 0;
                         }
+                        let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
+                        if demo_create.starts_with("table")
+                            && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
+                        {
+                            self.open_new_table(conn, db.clone(), None);
+                            if let Some(d) = self.create.as_mut() {
+                                d.name = "customers".into();
+                                d.columns.extend(create_dialog::demo_columns());
+                                if demo_create == "table-submit" {
+                                    d.running = true;
+                                    let statements = vec![create_dialog::create_table_sql(d.driver, "main", &d.name, &d.columns)];
+                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements });
+                                }
+                            }
+                        }
                     }
                 }
                 Response::ConnectFailed { conn, error } => {
@@ -612,6 +633,7 @@ impl DataCraftApp {
                     self.apply_demo_edit(console);
                 }
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
+                Response::DdlDone { conn, result } => self.ddl_done(conn, result),
             }
         }
     }
@@ -1080,6 +1102,12 @@ impl DataCraftApp {
                 }
                 ExplorerAction::Delete(id) => self.confirm_delete = Some(id),
                 ExplorerAction::LoadDatabase(id, db) => self.load_database(id, db),
+                ExplorerAction::NewDatabase(id) => {
+                    if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
+                        self.create = Some(CreateDialog::database(id, c.cfg.driver));
+                    }
+                }
+                ExplorerAction::NewTable { conn, db, schema } => self.open_new_table(conn, db, schema),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1092,6 +1120,56 @@ impl DataCraftApp {
                 ExplorerAction::GenerateInsert(t) => self.generate(ctx, &t, Generate::Insert),
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
                 ExplorerAction::Hide => self.show_explorer = false,
+            }
+        }
+    }
+
+    fn open_new_table(&mut self, conn: ConnId, db: String, schema: Option<String>) {
+        let Some(c) = self.conn(conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        let driver = c.cfg.driver;
+        let schemas: Vec<String> = c.schemas(Some(&db)).unwrap_or_default().iter().map(|s| s.name.clone()).collect();
+        let default = create_dialog::default_schema(driver).to_string();
+        let schema = schema.or_else(|| schemas.contains(&default).then_some(default.clone())).or_else(|| schemas.first().cloned()).unwrap_or(default);
+        self.ensure_db_loaded(conn, Some(&db));
+        self.create = Some(CreateDialog::table(conn, driver, db, schema));
+    }
+
+    /// Reply to the "New Database" / "New Table" dialog's statements.
+    fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
+        let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && d.running) else {
+            if let Err(e) = result {
+                self.error(e);
+            }
+            return;
+        };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            return;
+        }
+        let Some(d) = self.create.take() else { return };
+        let name = d.name.trim().to_string();
+        match d.target {
+            CreateTarget::Database => {
+                self.explorer.expanded.insert(format!("c:{conn}"));
+                self.explorer.selected = Some(explorer::db_key(conn, &name));
+                self.worker.send(Request::Refresh(conn));
+            }
+            CreateTarget::Table { db, schema } => {
+                let schema = if d.driver == Driver::Sqlite { "main".to_string() } else { schema.trim().to_string() };
+                let tref = TableRef { conn, db: db.clone(), schema: schema.clone(), table: name.clone() };
+                self.explorer.expanded.insert(format!("c:{conn}"));
+                self.explorer.expanded.insert(explorer::db_key(conn, &db));
+                self.explorer.expanded.insert(format!("s:{conn}:{db}:{schema}"));
+                self.explorer.selected = Some(explorer::table_key(&tref));
+                self.explorer.selected_table = Some(tref);
+                // The reload brings the new table; if a load is already in progress it may
+                // miss it, so wait for it and ask again.
+                if let Some(c) = self.conn_mut(conn) {
+                    c.loading.remove(&db);
+                }
+                self.load_database(conn, db);
+                self.info(trf("Table “{name}” created", &[("name", &name)]));
             }
         }
     }
@@ -1277,6 +1355,7 @@ impl DataCraftApp {
     fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.confirm_delete.is_some()
+            || self.create.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2020,6 +2099,31 @@ impl DataCraftApp {
                 Some(DialogResult::Test(cfg)) => self.worker.send(Request::Test(cfg)),
                 Some(DialogResult::Cancel) => self.dialog = None,
                 None => {}
+            }
+        }
+
+        if let Some(d) = self.create.as_ref() {
+            let schemas: Vec<String> = match &d.target {
+                CreateTarget::Table { db, .. } => {
+                    self.conn(d.conn).and_then(|c| c.schemas(Some(db))).unwrap_or_default().iter().map(|s| s.name.clone()).collect()
+                }
+                CreateTarget::Database => vec![],
+            };
+            if let Some(d) = self.create.as_mut() {
+                match d.show(ctx, &schemas) {
+                    Some(CreateResult::Create(statements)) => {
+                        d.running = true;
+                        d.error = None;
+                        let db = match &d.target {
+                            CreateTarget::Table { db, .. } => Some(db.clone()),
+                            CreateTarget::Database => None,
+                        };
+                        let conn = d.conn;
+                        self.worker.send(Request::RunDdl { conn, db, statements });
+                    }
+                    Some(CreateResult::Cancel) => self.create = None,
+                    None => {}
+                }
             }
         }
 

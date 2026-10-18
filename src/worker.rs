@@ -42,6 +42,8 @@ pub enum Request {
         console: ConsoleId,
         statements: Vec<String>,
     },
+    /// Runs DDL outside any console (new database or table). `db`: as in `Execute`.
+    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String> },
 }
 
 pub enum Response {
@@ -62,6 +64,8 @@ pub enum Response {
     },
     /// Result of `ApplyChanges`: modified rows or an error (in which case nothing was saved).
     ChangesApplied { console: ConsoleId, result: Result<u64, String> },
+    /// Result of `RunDdl`.
+    DdlDone { conn: ConnId, result: Result<(), String> },
 }
 
 pub struct Worker {
@@ -272,6 +276,30 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             let lost = s.is_closed();
             drop(s);
             let mut out = vec![Response::ChangesApplied { console, result }];
+            if lost {
+                state.forget(conn, &session).await;
+                out.push(Response::ConnectFailed { conn, error: tr("Connection lost").into() });
+            }
+            out
+        }
+        Request::RunDdl { conn, db, statements } => {
+            let (session, target) = match state.session_for(conn, db.as_deref()).await {
+                Ok(s) => s,
+                Err(e) => return vec![Response::DdlDone { conn, result: Err(format!("{e:#}")) }],
+            };
+            let mut s = session.lock().await;
+            let mut result = s.use_database(&target).await.map_err(|e| format!("{e:#}"));
+            if result.is_ok() {
+                for stmt in &statements {
+                    if let Err(e) = s.execute(stmt, 0).await {
+                        result = Err(format!("{e:#}"));
+                        break;
+                    }
+                }
+            }
+            let lost = s.is_closed();
+            drop(s);
+            let mut out = vec![Response::DdlDone { conn, result }];
             if lost {
                 state.forget(conn, &session).await;
                 out.push(Response::ConnectFailed { conn, error: tr("Connection lost").into() });

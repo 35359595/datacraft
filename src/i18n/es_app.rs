@@ -95,4 +95,5 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Max rows per query:", "Máx. filas por consulta:"),
     ("Copy SQL", "Copiar SQL"),
     ("Saving…", "Guardando…"),
+    ("Table “{name}” created", "Tabla «{name}» creada"),
 ];

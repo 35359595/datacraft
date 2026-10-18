@@ -257,6 +257,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_table_dialog_sql_runs() {
+        use crate::ui::create_dialog::{NewColumn, create_table_sql};
+        let db = TempDb::new("new_table");
+        let mut s = db.open().await;
+        let col = |name: &str, ty: &str, pk: bool, default: &str| NewColumn {
+            name: name.into(),
+            data_type: ty.into(),
+            not_null: false,
+            primary_key: pk,
+            default: default.into(),
+        };
+        let cols = [col("id", "INTEGER", true, ""), col("Full Name", "TEXT", false, "'n/a'")];
+        s.execute(&create_table_sql(Driver::Sqlite, "main", "order", &cols), 0).await.unwrap();
+        s.execute("INSERT INTO \"order\" (id) VALUES (1)", 0).await.unwrap();
+        let rs = s.execute("SELECT \"Full Name\" FROM \"order\"", 10).await.unwrap();
+        assert_eq!(rs[0].rows, vec![vec![Some("n/a".to_string())]]);
+        let schemas = s.introspect().await.unwrap();
+        let t = schemas[0].tables.iter().find(|t| t.name == "order").unwrap();
+        assert!(t.columns[0].primary_key && !t.columns[0].nullable);
+    }
+
+    #[tokio::test]
     async fn ddl_does_not_inherit_affected_rows() {
         let db = TempDb::new("ddl");
         let mut s = db.open().await;

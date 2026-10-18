@@ -2,6 +2,7 @@
 
 pub mod connection_dialog;
 pub mod console;
+pub mod create_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;

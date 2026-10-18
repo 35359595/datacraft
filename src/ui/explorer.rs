@@ -44,6 +44,10 @@ pub enum ExplorerAction {
     Delete(ConnId),
     /// New console on the connection (and the database, if opened from a database).
     NewConsole(ConnId, Option<String>),
+    /// "New Database" dialog on the connection.
+    NewDatabase(ConnId),
+    /// "New Table" dialog in a database (and schema, if one was chosen).
+    NewTable { conn: ConnId, db: String, schema: Option<String> },
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     OpenTable(TableRef),
@@ -231,9 +235,29 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
     theme::clipped_row(ui, 30.0, |ui| {
         ui.add_space(10.0);
         ui.spacing_mut().item_spacing.x = 1.0;
-        if theme::icon_button(ui, Ico::Plus, true, tr("New Connection")).clicked() {
-            actions.push(ExplorerAction::NewConnection);
-        }
+        let plus = theme::icon_button(ui, Ico::Plus, true, tr("New"));
+        let sel_driver = sel_state.map(|c| c.cfg.driver);
+        let sel_db = sel_conn.and_then(|_| selected_db(state, conns)).or_else(|| sel_state.and_then(|c| c.default_db().map(str::to_string)));
+        egui::Popup::menu(&plus).show(|ui| {
+            if ui.button(tr("New Connection…")).clicked() {
+                actions.push(ExplorerAction::NewConnection);
+                ui.close();
+            }
+            let can_db = connected && sel_driver.is_some_and(|d| d != Driver::Sqlite);
+            if ui.add_enabled(can_db, egui::Button::new(tr("New Database…"))).clicked()
+                && let Some(id) = sel_conn
+            {
+                actions.push(ExplorerAction::NewDatabase(id));
+                ui.close();
+            }
+            if ui.add_enabled(connected && sel_db.is_some(), egui::Button::new(tr("New Table…"))).clicked()
+                && let (Some(conn), Some(db)) = (sel_conn, sel_db.clone())
+            {
+                let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
+                actions.push(ExplorerAction::NewTable { conn, db, schema });
+                ui.close();
+            }
+        });
         if theme::icon_button(ui, Ico::Properties, sel_conn.is_some(), tr("Data Source Properties")).clicked()
             && let Some(id) = sel_conn
         {
@@ -412,6 +436,10 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
             ui.close();
         }
         ui.separator();
+        if c.cfg.driver != Driver::Sqlite && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+            actions.push(ExplorerAction::NewDatabase(id));
+            ui.close();
+        }
         if ui.button(tr("New Console")).clicked() {
             actions.push(ExplorerAction::NewConsole(id, None));
             ui.close();
@@ -512,6 +540,15 @@ fn database_rows(
             ui.close();
         }
         let connected = matches!(c.status, ConnStatus::Connected);
+        if ui.add_enabled(connected, egui::Button::new(tr("New Table…"))).clicked() {
+            actions.push(ExplorerAction::NewTable { conn: id, db: db_name.clone(), schema: None });
+            ui.close();
+        }
+        if !sqlite && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+            actions.push(ExplorerAction::NewDatabase(id));
+            ui.close();
+        }
+        ui.separator();
         if ui.add_enabled(connected && !loading, egui::Button::new(tr("Reload Schema"))).clicked() {
             actions.push(ExplorerAction::LoadDatabase(id, db_name.clone()));
             ui.close();
@@ -586,6 +623,16 @@ fn schema_rows(
             label_color: None,
         },
     );
+    row.resp.context_menu(|ui| {
+        if ui.button(tr("New Table…")).clicked() {
+            actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+            ui.close();
+        }
+        if ui.button(tr("Copy Name")).clicked() {
+            ui.ctx().copy_text(s.name.clone());
+            ui.close();
+        }
+    });
     if row.toggled {
         if all.len() == 1 {
             let closed_key = format!("{skey}:closed");
@@ -642,6 +689,14 @@ fn object_groups(
                 label_color: None,
             },
         );
+        if kind == ObjectKind::Table {
+            row.resp.context_menu(|ui| {
+                if ui.button(tr("New Table…")).clicked() {
+                    actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+                    ui.close();
+                }
+            });
+        }
         if row.toggled {
             let closed_key = format!("{gkey}:closed");
             if g_open {
@@ -709,6 +764,11 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         }
         if ui.button(tr("Generate DDL")).clicked() {
             actions.push(ExplorerAction::GenerateDdl(tref.clone()));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(tr("New Table…")).clicked() {
+            actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
             ui.close();
         }
     });
