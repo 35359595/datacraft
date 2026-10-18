@@ -42,8 +42,10 @@ pub enum Request {
         console: ConsoleId,
         statements: Vec<String>,
     },
-    /// Runs DDL outside any console (new database or table). `db`: as in `Execute`.
-    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String> },
+    /// Runs DDL outside any console (create or drop a database or table). `db`: as in
+    /// `Execute`. `close_db`: database whose own session (PostgreSQL) is closed first, so
+    /// it can be dropped.
+    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String> },
 }
 
 pub enum Response {
@@ -282,7 +284,12 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
             out
         }
-        Request::RunDdl { conn, db, statements } => {
+        Request::RunDdl { conn, db, statements, close_db } => {
+            if let Some(name) = close_db.filter(|n| !n.is_empty())
+                && let Some(l) = state.live.lock().await.get_mut(&conn)
+            {
+                l.sessions.remove(&name);
+            }
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
                 Ok(s) => s,
                 Err(e) => return vec![Response::DdlDone { conn, result: Err(format!("{e:#}")) }],

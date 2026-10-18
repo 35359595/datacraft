@@ -96,4 +96,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Copy SQL", "Copiar SQL"),
     ("Saving…", "Guardando…"),
     ("Table “{name}” created", "Tabla «{name}» creada"),
+    ("Table “{name}” dropped", "Tabla «{name}» eliminada"),
+    ("View “{name}” dropped", "Vista «{name}» eliminada"),
 ];

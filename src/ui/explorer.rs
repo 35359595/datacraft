@@ -48,6 +48,10 @@ pub enum ExplorerAction {
     NewDatabase(ConnId),
     /// "New Table" dialog in a database (and schema, if one was chosen).
     NewTable { conn: ConnId, db: String, schema: Option<String> },
+    /// Confirm and drop a database.
+    DropDatabase(ConnId, String),
+    /// Confirm and drop a table or view.
+    DropObject(TableRef, ObjectKind),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     OpenTable(TableRef),
@@ -557,6 +561,17 @@ fn database_rows(
             ui.ctx().copy_text(db_name.clone());
             ui.close();
         }
+        if !sqlite {
+            ui.separator();
+            // The connection's default database cannot be dropped from its own session.
+            let btn = egui::Button::new(RichText::new(tr("Drop…")).color(p.error));
+            let resp = ui.add_enabled(connected && !d.current, btn);
+            let resp = if d.current { resp.on_disabled_hover_text(tr("It is the connection's default database")) } else { resp };
+            if resp.clicked() {
+                actions.push(ExplorerAction::DropDatabase(id, db_name.clone()));
+                ui.close();
+            }
+        }
     });
     if !open {
         return;
@@ -769,6 +784,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         ui.separator();
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
+            ui.close();
+        }
+        if ui.button(RichText::new(tr("Drop…")).color(p.error)).clicked() {
+            actions.push(ExplorerAction::DropObject(tref.clone(), t.kind));
             ui.close();
         }
     });

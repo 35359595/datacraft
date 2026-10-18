@@ -90,4 +90,17 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Every column needs a name", "Todas las columnas necesitan un nombre"),
     ("Column “{name}” needs a type", "La columna «{name}» necesita un tipo"),
     ("Duplicate column “{name}”", "Columna «{name}» duplicada"),
+    // drop_dialog.rs and Drop menus in explorer.rs
+    ("Drop…", "Eliminar…"),
+    ("It is the connection's default database", "Es la base de datos por defecto de la conexión"),
+    ("Drop Database", "Eliminar base de datos"),
+    ("Drop Table", "Eliminar tabla"),
+    ("Drop View", "Eliminar vista"),
+    ("Drop database “{name}” and all its data?", "¿Eliminar la base de datos «{name}» y todos sus datos?"),
+    ("Drop table “{name}” and all its data?", "¿Eliminar la tabla «{name}» y todos sus datos?"),
+    ("Drop view “{name}”?", "¿Eliminar la vista «{name}»?"),
+    ("This action cannot be undone.", "Esta acción no se puede deshacer."),
+    ("Type “{name}” to confirm:", "Escribe «{name}» para confirmar:"),
+    ("Dropping…", "Eliminando…"),
+    ("Drop", "Eliminar"),
 ];

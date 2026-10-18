@@ -19,6 +19,8 @@
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
+//! `DATACRAFT_DEMO_DROP=table` opens the confirmation to drop the first table;
+//! `table-submit` also drops it.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -28,6 +30,7 @@ use crate::sql;
 use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
+use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -238,6 +241,8 @@ pub struct DataCraftApp {
     confirm_delete: Option<ConnId>,
     /// "New Database" / "New Table" dialog.
     create: Option<CreateDialog>,
+    /// Confirmation to drop a database, table or view.
+    drop: Option<DropDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -308,6 +313,7 @@ impl DataCraftApp {
             dialog: None,
             confirm_delete: None,
             create: None,
+            drop: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -550,6 +556,19 @@ impl DataCraftApp {
                         if std::env::var("DATACRAFT_DEMO_TAB").is_ok_and(|v| v == "console") {
                             self.active = 0;
                         }
+                        let demo_drop = std::env::var("DATACRAFT_DEMO_DROP").unwrap_or_default();
+                        if demo_drop.starts_with("table")
+                            && let Some(t) = self.explorer.selected_table.clone()
+                            && let Some(driver) = self.conn(conn).map(|c| c.cfg.driver)
+                        {
+                            let mut d = DropDialog::object(conn, driver, DropKind::Table, t.db.clone(), t.schema, t.table);
+                            if demo_drop == "table-submit" {
+                                d.running = true;
+                                let statements = vec![crate::ui::drop_dialog::drop_sql(driver, DropKind::Table, &d.schema, &d.name)];
+                                self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None });
+                            }
+                            self.drop = Some(d);
+                        }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
@@ -561,7 +580,7 @@ impl DataCraftApp {
                                 if demo_create == "table-submit" {
                                     d.running = true;
                                     let statements = vec![create_dialog::create_table_sql(d.driver, "main", &d.name, &d.columns)];
-                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements });
+                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None });
                                 }
                             }
                         }
@@ -1108,6 +1127,16 @@ impl DataCraftApp {
                     }
                 }
                 ExplorerAction::NewTable { conn, db, schema } => self.open_new_table(conn, db, schema),
+                ExplorerAction::DropDatabase(id, db) => {
+                    if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
+                        self.drop = Some(DropDialog::database(id, c.cfg.driver, db));
+                    }
+                }
+                ExplorerAction::DropObject(t, kind) => {
+                    if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
+                        self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind.into(), t.db, t.schema, t.table));
+                    }
+                }
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1136,6 +1165,10 @@ impl DataCraftApp {
 
     /// Reply to the "New Database" / "New Table" dialog's statements.
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
+        if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.drop_done(result);
+            return;
+        }
         let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && d.running) else {
             if let Err(e) = result {
                 self.error(e);
@@ -1170,6 +1203,54 @@ impl DataCraftApp {
                 }
                 self.load_database(conn, db);
                 self.info(trf("Table “{name}” created", &[("name", &name)]));
+            }
+        }
+    }
+
+    fn drop_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.drop.as_mut() else { return };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            return;
+        }
+        let Some(d) = self.drop.take() else { return };
+        let conn = d.conn;
+        match d.kind {
+            DropKind::Database => {
+                if let Some(c) = self.conn_mut(conn) {
+                    c.databases.retain(|x| x.name != d.db);
+                    c.loading.remove(&d.db);
+                    c.db_errors.remove(&d.db);
+                }
+                self.explorer.selected = None;
+                if self.explorer.selected_table.as_ref().is_some_and(|t| t.conn == conn && t.db == d.db) {
+                    self.explorer.selected_table = None;
+                }
+                self.worker.send(Request::Refresh(conn));
+            }
+            DropKind::Table | DropKind::View => {
+                // Its data editors no longer have anything to show.
+                let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+                let gone = |c: &Console| {
+                    c.conn == Some(conn)
+                        && c.db.as_deref().or(default_db.as_deref()) == Some(d.db.as_str())
+                        && c.table.as_ref().is_some_and(|t| t.schema == d.schema && t.table == d.name)
+                };
+                while let Some(i) = self.consoles.iter().position(gone) {
+                    self.close_console_now(i);
+                }
+                let tref = TableRef { conn, db: d.db.clone(), schema: d.schema.clone(), table: d.name.clone() };
+                if self.explorer.selected_table.as_ref() == Some(&tref) {
+                    self.explorer.selected_table = None;
+                    self.explorer.selected = None;
+                }
+                if let Some(c) = self.conn_mut(conn) {
+                    c.loading.remove(&d.db);
+                }
+                self.load_database(conn, d.db.clone());
+                let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
+                self.info(trf(msg, &[("name", &d.name)]));
             }
         }
     }
@@ -1356,6 +1437,7 @@ impl DataCraftApp {
         self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.create.is_some()
+            || self.drop.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2119,11 +2201,28 @@ impl DataCraftApp {
                             CreateTarget::Database => None,
                         };
                         let conn = d.conn;
-                        self.worker.send(Request::RunDdl { conn, db, statements });
+                        self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
                     }
                     Some(CreateResult::Cancel) => self.create = None,
                     None => {}
                 }
+            }
+        }
+
+        if let Some(d) = self.drop.as_mut() {
+            match d.show(ctx) {
+                Some(DropResult::Drop(statements)) => {
+                    d.running = true;
+                    d.error = None;
+                    let (conn, db, close_db) = match d.kind {
+                        // Run from the connection's default database, never from the one being dropped.
+                        DropKind::Database => (d.conn, None, Some(d.db.clone())),
+                        DropKind::Table | DropKind::View => (d.conn, Some(d.db.clone()), None),
+                    };
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db });
+                }
+                Some(DropResult::Cancel) => self.drop = None,
+                None => {}
             }
         }
 
