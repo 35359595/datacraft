@@ -30,6 +30,13 @@ tokio-util = { version = "0.7.20", features = ["compat"] }
 muda = { version = "0.21.2", default-features = false }
 sys-locale = "0.3.2"
 
+# Windows: DirectX 12 for the GPU, the Credential Manager for passwords and a bundled SQLite
+# (there is no system libsqlite3 to link against).
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+keyring = { version = "3", features = ["windows-native"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
