@@ -1,6 +1,7 @@
 //! Main application state and UI composition (DataGrip "Islands" style).
 //!
-//! Debug environment variable: `DATACRAFT_DEMO=<path.db>` starts with a temporary SQLite
+//! Debug environment variable: `DATACRAFT_DEMO=<path.db>` (or a server URL like
+//! `mariadb://root:pw@127.0.0.1:3307/shop`, see `demo_server_config`) starts with a temporary
 //! connection (not saved to `connections.json`) to that file, connects it, opens the data
 //! editor of its first table and a console with a sample query. In that mode the UI state
 //! is persisted to a temporary directory (see `main.rs`).
@@ -377,9 +378,15 @@ impl DataCraftApp {
     /// Demo mode (`DATACRAFT_DEMO`): temporary SQLite connection, console and data editor.
     fn start_demo(&mut self, path: &str) {
         let id = self.next_conn_id();
-        let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
-        cfg.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
-        cfg.file_path = path.to_string();
+        let cfg = match demo_server_config(id, path) {
+            Some(cfg) => cfg,
+            None => {
+                let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
+                cfg.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
+                cfg.file_path = path.to_string();
+                cfg
+            }
+        };
         self.conns.push(ConnState::new(cfg));
         self.explorer.expanded.insert(format!("c:{id}"));
         self.explorer.selected = Some(format!("c:{id}"));
@@ -607,7 +614,7 @@ impl DataCraftApp {
                                 d.columns.extend(create_dialog::demo_columns());
                                 if demo_create == "table-submit" {
                                     d.running = true;
-                                    let statements = vec![create_dialog::create_table_sql(d.driver, "main", &d.name, &d.columns)];
+                                    let statements = vec![d.sql()];
                                     self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None });
                                 }
                             }
@@ -2611,6 +2618,36 @@ enum Generate {
     Select,
     Insert,
     Ddl,
+}
+
+/// Demo mode against a server: `DATACRAFT_DEMO=<scheme>://user:password@host:port/database`
+/// with scheme `postgres`, `mysql`, `mariadb`, `sqlserver` or `oracle` (database = service).
+fn demo_server_config(id: u64, url: &str) -> Option<ConnectionConfig> {
+    let (scheme, rest) = url.split_once("://")?;
+    let driver = match scheme {
+        "postgres" | "postgresql" => Driver::Postgres,
+        "mysql" => Driver::MySql,
+        "mariadb" => Driver::MariaDb,
+        "sqlserver" | "mssql" => Driver::MsSql,
+        "oracle" => Driver::Oracle,
+        _ => return None,
+    };
+    let mut cfg = ConnectionConfig::new(id, driver);
+    let (auth, rest) = rest.rsplit_once('@')?;
+    let (user, password) = auth.split_once(':').unwrap_or((auth, ""));
+    let (hostport, db) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = hostport.rsplit_once(':').unwrap_or((hostport, ""));
+    cfg.user = user.to_string();
+    cfg.password = password.to_string();
+    cfg.host = host.to_string();
+    if let Ok(p) = port.parse() {
+        cfg.port = p;
+    }
+    if !db.is_empty() {
+        cfg.database = db.to_string();
+    }
+    cfg.name = format!("{}@{}", driver.label(), host);
+    Some(cfg)
 }
 
 /// true if the statement only reads (allowed on read-only connections). A `WITH` that

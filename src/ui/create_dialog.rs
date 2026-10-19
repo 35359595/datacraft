@@ -145,7 +145,7 @@ impl CreateDialog {
         }
     }
 
-    fn sql(&self) -> String {
+    pub fn sql(&self) -> String {
         match &self.target {
             CreateTarget::Database => create_database_sql(self.driver, &self.name),
             CreateTarget::Table { schema, .. } => create_table_sql(self.driver, schema, &self.name, &self.columns),
