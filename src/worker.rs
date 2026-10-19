@@ -491,6 +491,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn read_only_rejects_writes(cfg: ConnectionConfig, write: &str) {
+        let conn = cfg.id;
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        w.send(Request::Execute { conn, db: None, console: 3, statements: vec![write.into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 3, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert!(error.is_some(), "the server accepted a write on a read-only connection");
+    }
+
+    #[test]
+    fn sqlite_read_only_is_enforced_by_the_engine() {
+        let dir = std::env::temp_dir().join(format!("datacraft-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap().execute_batch("create table t(x); insert into t values (1)").unwrap();
+        let mut cfg = ConnectionConfig::new(9, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        cfg.read_only = true;
+        read_only_rejects_writes(cfg, "delete from t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live, like `cancels_a_running_mysql_query`.
+    #[test]
+    #[ignore]
+    fn mysql_read_only_is_enforced_by_the_server() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(10, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        cfg.read_only = true;
+        read_only_rejects_writes(cfg, "create table ro_probe(x int)");
+    }
+
     /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).
     #[test]
     #[ignore]

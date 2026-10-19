@@ -858,8 +858,10 @@ impl DataCraftApp {
         };
         let (conn, db, busy) = (c.conn, c.db.clone(), c.is_busy());
         let connected = conn.and_then(|id| self.conn(id)).is_some_and(|c| matches!(c.status, ConnStatus::Connected));
+        let read_only = conn.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.read_only);
         let Some(pv) = self.preview.as_mut() else { return };
         match conn {
+            _ if read_only => pv.error = Some(tr("Read-only connection").into()),
             _ if busy => pv.error = Some(tr("The tab is running another operation").into()),
             Some(conn) if connected => {
                 pv.applying = true;
@@ -1049,8 +1051,13 @@ impl DataCraftApp {
             console.result_tab = ResultTab::Output;
             return;
         };
+        let driver = self.conn(conn).map(|c| c.cfg.driver).unwrap_or(Driver::Postgres);
         if self.conn(conn).is_some_and(|c| c.cfg.read_only)
-            && let Some(stmt) = statements.iter().find(|s| !is_query(s))
+            && let Some(stmt) = statements
+                .iter()
+                .flat_map(|s| sql::split_statements(s, driver))
+                .map(|s| s.text)
+                .find(|s| !is_query(s))
         {
             let Some(console) = self.consoles.get_mut(idx) else { return };
             console.log.push(OutputEntry {
@@ -1428,6 +1435,9 @@ impl DataCraftApp {
     fn save_connection(&mut self, cfg: ConnectionConfig) {
         config::store_password(cfg.id, &cfg.password);
         let id = cfg.id;
+        if cfg.read_only {
+            self.revoke_editing(id);
+        }
         if let Some(existing) = self.conn_mut(id) {
             existing.cfg = cfg;
             if existing.status != ConnStatus::Disconnected {
@@ -1443,6 +1453,20 @@ impl DataCraftApp {
         }
         self.persist_connections();
         self.info(tr("Connection saved"));
+    }
+
+    /// A connection became read-only: its grids stop being editable (pending changes are dropped).
+    fn revoke_editing(&mut self, conn: ConnId) {
+        for c in self.consoles.iter_mut().filter(|c| c.conn == Some(conn)) {
+            for v in c.results.iter_mut() {
+                v.edit = None;
+                v.readonly_reason = Some(tr("Read-only connection").to_string());
+                v.edit_checked = true;
+            }
+        }
+        if self.preview.as_ref().is_some_and(|p| self.consoles.iter().any(|c| c.id == p.console && c.conn == Some(conn))) {
+            self.preview = None;
+        }
     }
 
     fn delete_connection(&mut self, id: ConnId) {
@@ -2682,11 +2706,13 @@ fn is_query(statement: &str) -> bool {
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
         .collect();
+    // `SELECT … INTO` creates tables (PG, SQL Server) or writes files (MySQL); `EXPLAIN ANALYZE`
+    // runs the statement.
+    let writes = |w: &String| matches!(w.as_str(), "insert" | "update" | "delete" | "merge" | "into" | "analyze" | "analyse");
     match words.first().map(String::as_str) {
-        Some("select" | "show" | "explain" | "describe" | "desc" | "values" | "table") => {
-            !(words[0] == "explain" && words.iter().any(|w| w == "analyze"))
-        }
-        Some("with") => !words.iter().any(|w| matches!(w.as_str(), "insert" | "update" | "delete" | "merge")),
+        Some("select" | "show" | "explain" | "describe" | "desc" | "values" | "table" | "with") => !words.iter().any(writes),
+        // SQL Server's explain plan.
+        Some("set") => words.len() == 3 && words[1] == "showplan_text" && matches!(words[2].as_str(), "on" | "off"),
         _ => false,
     }
 }
@@ -2989,6 +3015,10 @@ mod tests {
         assert!(is_query("with x as (select 1) select * from x"));
         assert!(is_query("explain select 1"));
         assert!(!is_query("explain analyze delete from t"));
+        assert!(!is_query("explain analyse delete from t"));
+        assert!(!is_query("select * into copy from t"));
+        assert!(is_query("SET SHOWPLAN_TEXT ON"));
+        assert!(!is_query("set ansi_nulls off"));
         assert!(!is_query("with d as (delete from t returning *) select * from d"));
         assert!(!is_query("update t set a = 1"));
         assert!(!is_query("drop table t"));

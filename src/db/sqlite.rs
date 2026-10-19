@@ -28,6 +28,7 @@ pub struct SqliteSession {
 impl SqliteSession {
     pub async fn connect(cfg: &ConnectionConfig) -> anyhow::Result<Self> {
         let path = cfg.file_path.trim().to_string();
+        let read_only = cfg.read_only;
         if path.is_empty() {
             anyhow::bail!(tr("No SQLite database file was specified"));
         }
@@ -36,7 +37,8 @@ impl SqliteSession {
             if !std::path::Path::new(&path).exists() {
                 anyhow::bail!(trf("The file {path} does not exist", &[("path", &path)]));
             }
-            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let mode = if read_only { OpenFlags::SQLITE_OPEN_READ_ONLY } else { OpenFlags::SQLITE_OPEN_READ_WRITE };
+            let flags = mode | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
             Connection::open_with_flags(&path, flags).with_context(|| trf("Could not open {path}", &[("path", &path)]))
         })
         .await??;

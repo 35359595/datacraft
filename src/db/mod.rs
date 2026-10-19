@@ -232,6 +232,23 @@ pub enum Session {
 
 impl Session {
     pub async fn connect(cfg: &ConnectionConfig) -> anyhow::Result<Session> {
+        let mut session = Self::open(cfg).await?;
+        // Read-only data sources are also enforced by the server where the engine allows it
+        // (SQLite opens the file read-only; SQL Server and Oracle rely on the app's checks).
+        if cfg.read_only {
+            let set = match cfg.driver {
+                Driver::Postgres => Some("SET default_transaction_read_only = on"),
+                Driver::MySql | Driver::MariaDb => Some("SET SESSION TRANSACTION READ ONLY"),
+                _ => None,
+            };
+            if let Some(set) = set {
+                session.execute(set, 0).await?;
+            }
+        }
+        Ok(session)
+    }
+
+    async fn open(cfg: &ConnectionConfig) -> anyhow::Result<Session> {
         Ok(match cfg.driver {
             Driver::Postgres => Session::Postgres(postgres::PgSession::connect(cfg).await?),
             Driver::Sqlite => Session::Sqlite(sqlite::SqliteSession::connect(cfg).await?),
