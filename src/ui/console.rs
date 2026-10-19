@@ -129,6 +129,8 @@ pub struct TableTab {
 pub enum ConsoleAction {
     Run,
     RunAll,
+    /// Run these statements as they are (e.g. the explain plan of the current statement).
+    RunStatements(Vec<String>),
     /// Reload the table editor data (with the current filters).
     Reload,
     /// Generate the DDL of the data editor's table.

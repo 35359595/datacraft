@@ -2147,6 +2147,12 @@ impl DataCraftApp {
             match a {
                 ConsoleAction::Run => self.run_console(idx, false),
                 ConsoleAction::RunAll => self.run_console(idx, true),
+                ConsoleAction::RunStatements(statements) => {
+                    let id = self.consoles[idx].id;
+                    if self.consoles[idx].table.is_none() && !self.consoles[idx].is_busy() && self.guard(Discard::Run(id, false)) {
+                        self.run_statements(idx, statements);
+                    }
+                }
                 ConsoleAction::Reload => {
                     if let Some(id) = self.consoles.get(idx).map(|c| c.id)
                         && self.guard(Discard::Reload(id))
