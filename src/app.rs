@@ -722,8 +722,10 @@ impl DataCraftApp {
             if v.edit_checked || v.rs.is_command() {
                 continue;
             }
+            let read_only = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.read_only);
             let target = match (c.conn, &c.table) {
                 (None, _) => Err(tr("No connection").to_string()),
+                _ if read_only => Err(tr("Read-only connection").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
                     None => Err(tr("Table structure not loaded yet").to_string()),
@@ -1024,6 +1026,20 @@ impl DataCraftApp {
             console.result_tab = ResultTab::Output;
             return;
         };
+        if self.conn(conn).is_some_and(|c| c.cfg.read_only)
+            && let Some(stmt) = statements.iter().find(|s| !is_query(s))
+        {
+            let Some(console) = self.consoles.get_mut(idx) else { return };
+            console.log.push(OutputEntry {
+                time: now(),
+                statement: stmt.trim().to_string(),
+                message: tr("Read-only connection: only queries can run (SELECT, WITH, SHOW, EXPLAIN…)").into(),
+                is_error: true,
+            });
+            console.result_tab = ResultTab::Output;
+            return;
+        }
+        let Some(console) = self.consoles.get_mut(idx) else { return };
         console.last_statements = statements.clone();
         console.run_started = Some(Instant::now());
         match status {
@@ -1134,12 +1150,22 @@ impl DataCraftApp {
                 ExplorerAction::Delete(id) => self.confirm_delete = Some(id),
                 ExplorerAction::LoadDatabase(id, db) => self.load_database(id, db),
                 ExplorerAction::NewDatabase(id) => {
+                    if self.refuse_read_only(id) {
+                        continue;
+                    }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.create = Some(CreateDialog::database(id, c.cfg.driver));
                     }
                 }
-                ExplorerAction::NewTable { conn, db, schema } => self.open_new_table(conn, db, schema),
+                ExplorerAction::NewTable { conn, db, schema } => {
+                    if !self.refuse_read_only(conn) {
+                        self.open_new_table(conn, db, schema);
+                    }
+                }
                 ExplorerAction::DropDatabase(id, db) => {
+                    if self.refuse_read_only(id) {
+                        continue;
+                    }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.drop = Some(DropDialog::database(id, c.cfg.driver, db));
                     }
@@ -1163,8 +1189,20 @@ impl DataCraftApp {
         }
     }
 
+    /// true (and reports it) if the connection is read-only.
+    fn refuse_read_only(&mut self, conn: ConnId) -> bool {
+        let ro = self.conn(conn).is_some_and(|c| c.cfg.read_only);
+        if ro {
+            self.error(tr("Read-only connection").to_string());
+        }
+        ro
+    }
+
     /// Drop / truncate / rename confirmation for a table or view.
     fn open_object_dialog(&mut self, t: TableRef, kind: DropKind) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
         if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
             self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind, t.db, t.schema, t.table));
         }
@@ -2501,6 +2539,25 @@ enum Generate {
     Ddl,
 }
 
+/// true if the statement only reads (allowed on read-only connections). A `WITH` that
+/// contains a data-modifying statement (PostgreSQL) is not.
+fn is_query(statement: &str) -> bool {
+    let words: Vec<String> = statement
+        .lines()
+        .map(|l| l.split("--").next().unwrap_or(""))
+        .flat_map(|l| l.split(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    match words.first().map(String::as_str) {
+        Some("select" | "show" | "explain" | "describe" | "desc" | "values" | "table") => {
+            !(words[0] == "explain" && words.iter().any(|w| w == "analyze"))
+        }
+        Some("with") => !words.iter().any(|w| matches!(w.as_str(), "insert" | "update" | "delete" | "merge")),
+        _ => false,
+    }
+}
+
 /// Data editor query with filters and the row limit in the SQL itself.
 pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str, order_by: &str, max_rows: usize) -> String {
     let t = Session::quote_table(driver, schema, table);
@@ -2790,6 +2847,19 @@ mod tests {
             z = zoom_in(z);
         }
         assert_eq!(z, 2.0);
+    }
+
+    #[test]
+    fn read_only_statements() {
+        assert!(is_query("select 1"));
+        assert!(is_query("  -- note\n SELECT * FROM t"));
+        assert!(is_query("with x as (select 1) select * from x"));
+        assert!(is_query("explain select 1"));
+        assert!(!is_query("explain analyze delete from t"));
+        assert!(!is_query("with d as (delete from t returning *) select * from d"));
+        assert!(!is_query("update t set a = 1"));
+        assert!(!is_query("drop table t"));
+        assert!(!is_query(""));
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Port:", "Puerto:"),
     ("Database:", "Base de datos:"),
     ("Service:", "Servicio:"),
+    ("Read-only", "Solo lectura"),
+    ("Only queries can run; the data editor and the create, drop and rename actions are disabled", "Solo se pueden ejecutar consultas; el editor de datos y las acciones de crear, eliminar y renombrar quedan desactivados"),
     ("User:", "Usuario:"),
     ("Password:", "Contraseña:"),
     ("Trust server certificate", "Confiar en el certificado del servidor"),

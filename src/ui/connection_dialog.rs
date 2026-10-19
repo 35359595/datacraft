@@ -217,6 +217,10 @@ impl ConnectionDialog {
                     }
                 }
             }
+            ui.label("");
+            ui.checkbox(&mut self.cfg.read_only, tr("Read-only"))
+                .on_hover_text(tr("Only queries can run; the data editor and the create, drop and rename actions are disabled"));
+            ui.end_row();
         });
     }
 

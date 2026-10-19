@@ -85,6 +85,8 @@ pub struct ConnectionConfig {
     pub file_path: String,
     /// SQL Server: accept self-signed certificates.
     pub trust_cert: bool,
+    /// DataGrip's "Read-only": the data editor can't save and consoles only run queries.
+    pub read_only: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -118,6 +120,7 @@ impl ConnectionConfig {
             password: String::new(),
             file_path: String::new(),
             trust_cert: true,
+            read_only: false,
         }
     }
 }
