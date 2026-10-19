@@ -1402,10 +1402,11 @@ impl DataCraftApp {
                 }
                 self.load_database(conn, d.db.clone());
                 if d.kind == DropKind::Rename {
-                    let renamed = TableRef { table: d.new_name.trim().to_string(), ..tref };
+                    let new_name = crate::ui::drop_dialog::effective_name(d.driver, &d.new_name);
+                    let renamed = TableRef { table: new_name.clone(), ..tref };
                     self.explorer.selected = Some(explorer::table_key(&renamed));
                     self.explorer.selected_table = Some(renamed);
-                    self.info(trf("Table “{name}” renamed to “{new_name}”", &[("name", &d.name), ("new_name", &d.new_name.trim())]));
+                    self.info(trf("Table “{name}” renamed to “{new_name}”", &[("name", &d.name), ("new_name", &new_name)]));
                 } else {
                     let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
                     self.info(trf(msg, &[("name", &d.name)]));

@@ -58,6 +58,14 @@ pub fn drop_sql(driver: Driver, kind: DropKind, schema: &str, name: &str) -> Str
     object_sql(driver, kind, schema, name, "")
 }
 
+/// Name the table will have after a rename. Oracle: a simple name typed in lowercase means
+/// the usual uppercase name, not a case-sensitive quoted one.
+pub fn effective_name(driver: Driver, new_name: &str) -> String {
+    let n = new_name.trim();
+    let simple = n.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if driver == Driver::Oracle && simple { n.to_ascii_uppercase() } else { n.to_string() }
+}
+
 /// Statement for `kind` on `schema.name`; `new_name` is only used by `Rename`.
 pub fn object_sql(driver: Driver, kind: DropKind, schema: &str, name: &str, new_name: &str) -> String {
     let q = |s: &str| quote_ident_if_needed(driver, s);
@@ -70,7 +78,7 @@ pub fn object_sql(driver: Driver, kind: DropKind, schema: &str, name: &str, new_
         DropKind::Truncate if driver == Driver::Sqlite => format!("delete from {}", object(schema, name)),
         DropKind::Truncate => format!("truncate table {}", object(schema, name)),
         DropKind::Rename => {
-            let new_name = new_name.trim();
+            let new_name = &effective_name(driver, new_name);
             match driver {
                 Driver::MsSql => {
                     let old = format!("{}.{}", q(schema), q(name)).replace('\'', "''");
@@ -226,5 +234,7 @@ mod tests {
         assert_eq!(t(Driver::MySql, DropKind::Rename, "goods"), "rename table s.items to s.goods");
         assert_eq!(t(Driver::MsSql, DropKind::Rename, "it's"), "exec sp_rename 's.items', 'it''s'");
         assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "GOODS"), "alter table HR.ITEMS rename to GOODS");
+        assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "goods"), "alter table HR.ITEMS rename to GOODS");
+        assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "_x"), "alter table HR.ITEMS rename to \"_x\"");
     }
 }

@@ -60,7 +60,12 @@ pub fn change_sql(driver: Driver, schema: &str, table: &str, change: &Change) ->
         }
         Change::Insert { values } => {
             if values.is_empty() {
-                return format!("INSERT INTO {target} DEFAULT VALUES");
+                return match driver {
+                    Driver::MySql | Driver::MariaDb => format!("INSERT INTO {target} () VALUES ()"),
+                    // Oracle has no DEFAULT VALUES; this covers single-column tables.
+                    Driver::Oracle => format!("INSERT INTO {target} VALUES (DEFAULT)"),
+                    _ => format!("INSERT INTO {target} DEFAULT VALUES"),
+                };
             }
             let cols = values.iter().map(|(c, _)| quote_ident(driver, c)).collect::<Vec<_>>().join(", ");
             let vals = values.iter().map(|(_, v)| literal(driver, v)).collect::<Vec<_>>().join(", ");

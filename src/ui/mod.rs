@@ -66,8 +66,8 @@ pub fn quote_ident_if_needed(driver: Driver, name: &str) -> String {
     let simple = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && (driver != Driver::Postgres || !name.chars().any(|c| c.is_ascii_uppercase()))
-        // Oracle folds unquoted names to uppercase.
-        && (driver != Driver::Oracle || !name.chars().any(|c| c.is_ascii_lowercase()))
+        // Oracle folds unquoted names to uppercase and they must start with a letter.
+        && (driver != Driver::Oracle || (!name.chars().any(|c| c.is_ascii_lowercase()) && !name.starts_with('_')))
         && !crate::sql::KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(name));
     if simple { name.to_string() } else { quote_ident(driver, name) }
 }
