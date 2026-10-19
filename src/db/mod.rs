@@ -198,7 +198,7 @@ pub enum CancelHandle {
     Postgres(tokio_postgres::CancelToken),
     Sqlite(std::sync::Arc<rusqlite::InterruptHandle>),
     /// MySQL / MariaDB: `KILL QUERY <thread id>` from a second connection.
-    MySql(mysql_async::OptsBuilder, u32),
+    MySql(Box<mysql_async::OptsBuilder>, u32),
 }
 
 impl CancelHandle {
@@ -211,7 +211,7 @@ impl CancelHandle {
             }
             CancelHandle::MySql(opts, id) => {
                 use mysql_async::prelude::Queryable;
-                let mut conn = mysql_async::Conn::new(opts.clone()).await?;
+                let mut conn = mysql_async::Conn::new((**opts).clone()).await?;
                 conn.query_drop(format!("KILL QUERY {id}")).await?;
                 conn.disconnect().await?;
                 Ok(())
@@ -311,7 +311,7 @@ impl Session {
             Session::Sqlite(s) => Some(CancelHandle::Sqlite(s.interrupt_handle())),
             Session::MySql(s) => {
                 let (opts, id) = s.cancel_target();
-                Some(CancelHandle::MySql(opts, id))
+                Some(CancelHandle::MySql(Box::new(opts), id))
             }
             _ => None,
         }

@@ -13,7 +13,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("{db}  (default)", "{db}  (por defecto)"),
     ("Run current statement or selection (⌘↩)", "Ejecutar sentencia actual o selección (⌘↩)"),
     ("Run all (⌘⇧↩)", "Ejecutar todo (⌘⇧↩)"),
-    ("Cancel (not available)", "Cancelar (no disponible)"),
+    ("Cancel the running query", "Cancelar la consulta en curso"),
     ("Reload page (⌘R)", "Recargar página (⌘R)"),
     ("Copy the query log", "Copiar el log de consultas"),
     ("Show table DDL", "Ver DDL de la tabla"),

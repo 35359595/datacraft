@@ -175,6 +175,8 @@ pub enum ConsoleAction {
     RunAll,
     /// Run these statements as they are (e.g. the explain plan of the current statement).
     RunStatements(Vec<String>),
+    /// Cancel the running query.
+    Cancel,
     /// Reload the table editor data (with the current filters).
     Reload,
     /// Generate the DDL of the data editor's table.
@@ -967,7 +969,9 @@ impl Console {
                 cmds.push(EditCmd::Find);
             }
             self.tx_dropdown(ui);
-            theme::icon_button(ui, Ico::Stop, false, tr("Cancel (not available)"));
+            if theme::icon_button(ui, Ico::Stop, self.running, tr("Cancel the running query")).clicked() {
+                actions.push(ConsoleAction::Cancel);
+            }
             self.busy_label(ui);
                 }
                 theme::Side::Right => {
@@ -990,7 +994,9 @@ impl Console {
                 let text = self.log.iter().map(|e| format!("[{}] {} {}", e.time, e.statement, e.message)).collect::<Vec<_>>().join("\n");
                 ui.ctx().copy_text(text);
             }
-            theme::icon_button(ui, Ico::Stop, false, tr("Cancel (not available)"));
+            if theme::icon_button(ui, Ico::Stop, self.running, tr("Cancel the running query")).clicked() {
+                actions.push(ConsoleAction::Cancel);
+            }
             theme::toolbar_separator(ui);
             let idx = self.results.len().checked_sub(1);
             if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)

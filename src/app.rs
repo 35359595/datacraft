@@ -1556,11 +1556,13 @@ impl DataCraftApp {
         if self.modal_open() {
             return;
         }
+        let in_table = self.consoles.get(self.active).is_some_and(|c| c.table.is_some());
         let (run_all, run, new_console, reload, quit, save) = ctx.input_mut(|i| {
             let run_all = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
             let run = i.consume_key(Modifiers::COMMAND, Key::Enter);
             let new_console = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
-            let reload = i.consume_key(Modifiers::COMMAND, Key::R);
+            // In a console ⌘R is "Replace" (handled by the editor).
+            let reload = in_table && i.consume_key(Modifiers::COMMAND, Key::R);
             let quit = i.consume_key(Modifiers::COMMAND, Key::Q);
             let save = i.consume_key(Modifiers::COMMAND, Key::S);
             (run_all, run, new_console, reload, quit, save)
@@ -1631,9 +1633,14 @@ impl DataCraftApp {
                 M::OpenSql if !modal => self.open_sql_file(),
                 M::SaveSqlAs if !modal => self.save_console_as(),
                 M::CloseTab if !modal && !self.consoles.is_empty() => self.close_console(self.active),
+                // In a console: find in the editor; elsewhere: filter the explorer.
                 M::Find => {
-                    self.show_explorer = true;
-                    self.explorer.show_filter = true;
+                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                        c.open_find(false);
+                    } else {
+                        self.show_explorer = true;
+                        self.explorer.show_filter = true;
+                    }
                 }
                 M::ToggleExplorer => self.show_explorer = !self.show_explorer,
                 M::ToggleResults => self.show_results = !self.show_results,
@@ -1648,7 +1655,14 @@ impl DataCraftApp {
                 M::Run if !modal => self.run_console(self.active, false),
                 M::RunAll if !modal => self.run_console(self.active, true),
                 M::SaveChanges if !modal => self.save_active_changes(),
-                M::Reload if !modal => self.reload_active(),
+                // ⌘R: reload in the data editor, replace in a console (like DataGrip).
+                M::Reload if !modal => {
+                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                        c.open_find(true);
+                    } else {
+                        self.reload_active();
+                    }
+                }
                 // No help website: shows the app info window.
                 M::Help => self.show_about = true,
                 _ => {}
@@ -2299,6 +2313,10 @@ impl DataCraftApp {
             match a {
                 ConsoleAction::Run => self.run_console(idx, false),
                 ConsoleAction::RunAll => self.run_console(idx, true),
+                ConsoleAction::Cancel => {
+                    let console = self.consoles[idx].id;
+                    self.worker.send(Request::Cancel { console });
+                }
                 ConsoleAction::RunStatements(statements) => {
                     let id = self.consoles[idx].id;
                     if self.consoles[idx].table.is_none() && !self.consoles[idx].is_busy() && self.guard(Discard::Run(id, false)) {

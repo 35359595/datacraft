@@ -360,6 +360,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 cancelled: std::sync::atomic::AtomicBool::new(false),
             });
             state.running.lock().unwrap_or_else(|e| e.into_inner()).insert(console, running.clone());
+            let statements_tail = statements.last().cloned();
             let mut results = Vec::new();
             let mut error = None;
             let mut abandoned = false;
@@ -389,6 +390,14 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                         break;
                     }
                 }
+            }
+            // SQL Server explain: `SET SHOWPLAN_TEXT OFF` must run even if the statement failed,
+            // or the session would keep returning plans instead of running queries.
+            if error.is_some()
+                && !abandoned
+                && let Some(last) = statements_tail.filter(|s| s.trim().eq_ignore_ascii_case("SET SHOWPLAN_TEXT OFF"))
+            {
+                let _ = s.execute(&last, 0).await;
             }
             state.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&console);
             if running.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
