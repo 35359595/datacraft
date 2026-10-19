@@ -1276,6 +1276,7 @@ impl Console {
         let caret_line = self.line_col().0;
         // Layouter caching the highlighted LayoutJob.
         let dark = cx.dark;
+        let driver = cx.driver;
         let font_size = cx.font_size;
         let hl_cache = &mut self.hl_cache;
         // Find bar matches are painted with a background (the selected one stronger).
@@ -1286,6 +1287,7 @@ impl Console {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             text.hash(&mut h);
             dark.hash(&mut h);
+            driver.hash(&mut h);
             font_size.to_bits().hash(&mut h);
             search.hash(&mut h);
             if search.is_some() {
@@ -1295,7 +1297,7 @@ impl Console {
             let job = match hl_cache {
                 Some((k, job)) if *k == key => job.clone(),
                 _ => {
-                    let mut job = sql::highlight(text, dark, FontId::monospace(font_size));
+                    let mut job = sql::highlight_for(text, driver, dark, FontId::monospace(font_size));
                     job.wrap.max_width = f32::INFINITY;
                     if let Some((q, case)) = &search {
                         let (other, current) = match_colors(dark);

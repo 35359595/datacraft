@@ -306,7 +306,6 @@ pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text:
 }
 
 /// Like [`highlight`], with the lexical rules of `driver` (MySQL `\'` escapes, Oracle `q'[…]'`).
-#[allow(dead_code)] // For editors that know their engine.
 pub fn highlight_for(text: &str, driver: Driver, dark_mode: bool, font: egui::FontId) -> egui::text::LayoutJob {
     highlight_dialect(text, Dialect::for_driver(driver), dark_mode, font)
 }
