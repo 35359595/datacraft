@@ -45,7 +45,8 @@ pub enum Request {
     /// Runs DDL outside any console (create or drop a database or table). `db`: as in
     /// `Execute`. `close_db`: database whose own session (PostgreSQL) is closed first, so
     /// it can be dropped.
-    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String> },
+    /// `transaction`: all statements in one transaction (imports); DDL runs without one.
+    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String>, transaction: bool },
     /// Cancels what a console's `Execute` is running. Engines without a native cancel
     /// abandon the query and close the session (it reconnects on the next run).
     Cancel { console: ConsoleId },
@@ -302,7 +303,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
             out
         }
-        Request::RunDdl { conn, db, statements, close_db } => {
+        Request::RunDdl { conn, db, statements, close_db, transaction } => {
             if let Some(name) = close_db.filter(|n| !n.is_empty())
                 && let Some(l) = state.live.lock().await.get_mut(&conn)
             {
@@ -314,7 +315,9 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             };
             let mut s = session.lock().await;
             let mut result = s.use_database(&target).await.map_err(|e| format!("{e:#}"));
-            if result.is_ok() {
+            if result.is_ok() && transaction {
+                result = s.run_transaction(&statements).await.map(|_| ()).map_err(|e| format!("{e:#}"));
+            } else if result.is_ok() {
                 for stmt in &statements {
                     if let Err(e) = s.execute(stmt, 0).await {
                         result = Err(format!("{e:#}"));
@@ -545,6 +548,51 @@ mod tests {
         cfg.read_only = true;
         read_only_rejects_writes(cfg, "delete from t");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An import (transactional RunDdl) whose second batch fails leaves no rows behind.
+    fn transactional_import_rolls_back(cfg: ConnectionConfig, setup: &str, table: &str) {
+        let conn = cfg.id;
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        w.send(Request::RunDdl { conn, db: None, statements: vec![setup.into()], close_db: None, transaction: false });
+        let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        result.unwrap();
+        let statements = vec![format!("insert into {table} values (1), (2)"), format!("insert into {table} values (2)")];
+        w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: true });
+        let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        assert!(result.is_err());
+        w.send(Request::Execute { conn, db: None, console: 4, statements: vec![format!("select count(*) from {table}")], max_rows: 10 });
+        let Response::Executed { results, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 4, .. })) else { unreachable!() };
+        assert_eq!(results[0].rows[0][0].as_deref(), Some("0"));
+        w.send(Request::RunDdl { conn, db: None, statements: vec![format!("drop table {table}")], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
+    }
+
+    #[test]
+    fn sqlite_import_is_all_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("datacraft-tx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap();
+        let mut cfg = ConnectionConfig::new(11, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        transactional_import_rolls_back(cfg, "create table imp(x integer primary key)", "imp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn mysql_import_is_all_or_nothing() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(12, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        transactional_import_rolls_back(cfg, "create table dc_imp(x int primary key)", "dc_imp");
     }
 
     /// Live, like `cancels_a_running_mysql_query`.

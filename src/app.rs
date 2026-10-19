@@ -589,7 +589,7 @@ impl DataCraftApp {
                             if demo_drop.ends_with("-submit") {
                                 d.running = true;
                                 let statements = vec![d.sql()];
-                                self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None });
+                                self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None, transaction: false });
                             }
                             self.drop = Some(d);
                         }
@@ -615,7 +615,7 @@ impl DataCraftApp {
                                 if demo_create == "table-submit" {
                                     d.running = true;
                                     let statements = vec![d.sql()];
-                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None });
+                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None, transaction: false });
                                 }
                             }
                         }
@@ -1248,7 +1248,7 @@ impl DataCraftApp {
         let statements = d.start();
         if !statements.is_empty() {
             let (conn, db) = (d.conn, Some(d.db.clone()));
-            self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+            self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: true });
         }
     }
 
@@ -1265,7 +1265,8 @@ impl DataCraftApp {
         self.info(trf("{n} rows imported into “{table}”", &[("n", &d.imported), ("table", &d.table)]));
     }
 
-    /// Reloads the open data editors of a table (that aren't busy).
+    /// Reloads the open data editors of a table (that aren't busy and have no pending edits,
+    /// which a reload would silently discard).
     fn reload_table_editors(&mut self, conn: ConnId, db: &str, schema: &str, table: &str) {
         let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
         let editors: Vec<usize> = (0..self.consoles.len())
@@ -1275,6 +1276,7 @@ impl DataCraftApp {
                     && c.db.as_deref().or(default_db.as_deref()) == Some(db)
                     && c.table.as_ref().is_some_and(|t| t.schema == schema && t.table == table)
                     && !c.is_busy()
+                    && !c.has_pending_edits()
             })
             .collect();
         for i in editors {
@@ -2407,7 +2409,7 @@ impl DataCraftApp {
                             CreateTarget::Database => None,
                         };
                         let conn = d.conn;
-                        self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+                        self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: false });
                     }
                     Some(CreateResult::Cancel) => self.create = None,
                     None => {}
@@ -2419,7 +2421,7 @@ impl DataCraftApp {
             match d.show(ctx) {
                 Some(ImportResult::Import(statements)) => {
                     let (conn, db) = (d.conn, Some(d.db.clone()));
-                    self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: true });
                 }
                 Some(ImportResult::Cancel) => self.import = None,
                 None => {}
@@ -2436,7 +2438,7 @@ impl DataCraftApp {
                         DropKind::Database => (d.conn, None, Some(d.db.clone())),
                         _ => (d.conn, Some(d.db.clone()), None),
                     };
-                    self.worker.send(Request::RunDdl { conn, db, statements, close_db });
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db, transaction: false });
                 }
                 Some(DropResult::Cancel) => self.drop = None,
                 None => {}
@@ -2734,11 +2736,11 @@ pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str
         sql.push_str(&format!(" ORDER BY {o}"));
     }
     match driver {
-        Driver::MsSql => {}
-        Driver::Oracle => sql.push_str(&format!(" FETCH FIRST {max_rows} ROWS ONLY")),
-        _ => sql.push_str(&format!(" LIMIT {max_rows}")),
+        Driver::MsSql => sql,
+        // ROWNUM instead of FETCH FIRST so it also works before 12c.
+        Driver::Oracle => format!("SELECT * FROM ({sql}) WHERE ROWNUM <= {max_rows}"),
+        _ => format!("{sql} LIMIT {max_rows}"),
     }
-    sql
 }
 
 /// Approximate DDL from the known column information.
@@ -3037,5 +3039,10 @@ mod tests {
             table_query(Driver::MsSql, "dbo", "t", "x = 1", "", 5),
             "SELECT TOP (5) * FROM [dbo].[t] WHERE x = 1"
         );
+        assert_eq!(
+            table_query(Driver::Oracle, "HR", "T", "", "ID", 5),
+            "SELECT * FROM (SELECT * FROM \"HR\".\"T\" ORDER BY ID) WHERE ROWNUM <= 5"
+        );
+        assert_eq!(table_query(Driver::MySql, "shop", "t", "", "", 5), "SELECT * FROM `shop`.`t` LIMIT 5");
     }
 }

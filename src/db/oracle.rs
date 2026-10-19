@@ -116,13 +116,22 @@ impl OraSession {
     }
 
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        self.transaction(statements, true).await
+    }
+
+    /// All the statements in one transaction (e.g. an import's INSERTs).
+    pub async fn run_transaction(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        self.transaction(statements, false).await
+    }
+
+    async fn transaction(&mut self, statements: &[String], single_row: bool) -> anyhow::Result<u64> {
         let statements = statements.to_vec();
         let (conn, gate) = (Arc::clone(&self.conn), Arc::clone(&self.gate));
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
             let Ok(_guard) = gate.lock() else {
                 anyhow::bail!(tr("The Oracle connection became unusable"));
             };
-            let result = apply_in_transaction(&conn, &statements);
+            let result = run_in_transaction(&conn, &statements, single_row);
             if result.is_err() {
                 let _ = conn.rollback();
             }
@@ -429,12 +438,14 @@ fn run(conn: &Connection, sql: &str, display: String, max_rows: usize) -> Result
     Ok(rs)
 }
 
-fn apply_in_transaction(conn: &Connection, statements: &[String]) -> anyhow::Result<u64> {
+/// Runs the statements without committing in between; with `single_row`, each must affect
+/// exactly one row. Commits at the end (the caller rolls back on error).
+fn run_in_transaction(conn: &Connection, statements: &[String], single_row: bool) -> anyhow::Result<u64> {
     let mut total = 0;
     for stmt in statements {
         let sql = normalize_statement(stmt);
         let n = conn.execute(&sql, &[]).map_err(ora_error)?.row_count().map_err(ora_error)?;
-        if n != 1 {
+        if single_row && n != 1 {
             return Err(super::not_single_row(n, stmt));
         }
         total += n;

@@ -343,6 +343,35 @@ impl Session {
         }
     }
 
+    /// Runs the statements in ONE transaction (all or nothing), without the one-row rule of
+    /// `apply_changes`. Returns the affected rows when the engine reports them.
+    pub async fn run_transaction(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        if let Session::Oracle(s) = self {
+            return s.run_transaction(statements).await;
+        }
+        let (begin, commit, rollback) = match self {
+            Session::MsSql(_) => ("BEGIN TRANSACTION", "COMMIT TRANSACTION", "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"),
+            Session::MySql(_) => ("START TRANSACTION", "COMMIT", "ROLLBACK"),
+            _ => ("BEGIN", "COMMIT", "ROLLBACK"),
+        };
+        self.execute(begin, 0).await?;
+        let mut total = 0;
+        for stmt in statements {
+            match self.execute(stmt, 0).await {
+                Ok(rs) => total += rs.iter().filter_map(|r| r.affected).sum::<u64>(),
+                Err(e) => {
+                    let _ = self.execute(rollback, 0).await;
+                    return Err(e);
+                }
+            }
+        }
+        if let Err(e) = self.execute(commit, 0).await {
+            let _ = self.execute(rollback, 0).await;
+            return Err(e);
+        }
+        Ok(total)
+    }
+
     /// true if the connection has been lost (socket closed, protocol error...).
     pub fn is_closed(&self) -> bool {
         match self {
