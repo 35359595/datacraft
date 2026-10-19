@@ -8,6 +8,7 @@ use std::f32::consts::{PI, TAU};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ico {
+    ChevronLeft,
     ChevronRight,
     ChevronDown,
     Database,
@@ -66,6 +67,7 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
     };
     let obj = |c: Color32| if enabled { c } else { color };
     match ico {
+        Ico::ChevronLeft => line(&[(10.0, 3.5), (5.5, 8.0), (10.0, 12.5)], color),
         Ico::ChevronRight => line(&[(6.0, 3.5), (10.5, 8.0), (6.0, 12.5)], color),
         Ico::ChevronDown => line(&[(3.5, 6.0), (8.0, 10.5), (12.5, 6.0)], color),
         Ico::Database | Ico::Driver(_) => {

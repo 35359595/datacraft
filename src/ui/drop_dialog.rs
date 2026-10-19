@@ -53,6 +53,7 @@ pub enum DropResult {
     Cancel,
 }
 
+#[cfg(test)]
 pub fn drop_sql(driver: Driver, kind: DropKind, schema: &str, name: &str) -> String {
     object_sql(driver, kind, schema, name, "")
 }

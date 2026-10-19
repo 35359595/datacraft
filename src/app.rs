@@ -18,6 +18,8 @@
 //! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
 //! `<column>=<text>` types that text in its search box (which also filters the grid).
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
+//! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
+//! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
 //! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or

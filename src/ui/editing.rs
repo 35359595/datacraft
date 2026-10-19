@@ -215,6 +215,13 @@ impl EditState {
         self.inserted.len() - 1
     }
 
+    /// Appends a new row with these values (`None` = left to the column default).
+    pub fn add_row_with(&mut self, values: Vec<Option<Cell>>) -> usize {
+        self.checkpoint();
+        self.inserted.push(values);
+        self.inserted.len() - 1
+    }
+
     /// Marks existing rows for deletion and removes new ones. Returns true if anything changed.
     pub fn delete_rows(&mut self, rs: &ResultSet, target: &EditTarget, rows: &[RowRef]) -> bool {
         let existing: Vec<usize> = rows

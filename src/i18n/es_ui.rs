@@ -112,5 +112,10 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Truncate", "Vaciar"),
     ("Rename…", "Renombrar…"),
     ("Truncate…", "Vaciar…"),
+    ("Clone Row", "Clonar fila"),
+    ("Record View", "Vista de registro"),
+    ("Previous row", "Fila anterior"),
+    ("Next row", "Fila siguiente"),
+    ("Row {n} of {total}", "Fila {n} de {total}"),
     ("Drop", "Eliminar"),
 ];
