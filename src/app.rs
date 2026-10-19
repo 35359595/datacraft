@@ -1994,8 +1994,12 @@ impl DataCraftApp {
                         if conn.is_none_or(|x| !x.cfg.driver.flat_schema()) {
                             crumbs.push((Some(Ico::Schema), t.schema.clone()));
                         }
-                        crumbs.push((Some(Ico::Folder), "tables".into()));
-                        crumbs.push((Some(Ico::Table), t.table.clone()));
+                        let is_view = c
+                            .conn
+                            .and_then(|id| self.table_info(id, c.db.as_deref(), &t.schema, &t.table))
+                            .is_some_and(|i| i.kind == crate::db::ObjectKind::View);
+                        crumbs.push((Some(Ico::Folder), if is_view { "views" } else { "tables" }.into()));
+                        crumbs.push((Some(if is_view { Ico::View } else { Ico::Table }), t.table.clone()));
                     }
                     None => crumbs.push((Some(Ico::Console), c.title.clone())),
                 }
