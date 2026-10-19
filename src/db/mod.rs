@@ -7,7 +7,9 @@ pub mod mssql;
 pub mod mysql;
 pub mod oracle;
 pub mod postgres;
+pub mod snowflake;
 pub mod sqlite;
+pub mod url;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -20,10 +22,12 @@ pub enum Driver {
     MySql,
     MariaDb,
     Oracle,
+    Snowflake,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 6] = [Driver::Postgres, Driver::MySql, Driver::MariaDb, Driver::MsSql, Driver::Oracle, Driver::Sqlite];
+    pub const ALL: [Driver; 7] =
+        [Driver::Postgres, Driver::MySql, Driver::MariaDb, Driver::MsSql, Driver::Oracle, Driver::Snowflake, Driver::Sqlite];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -33,6 +37,7 @@ impl Driver {
             Driver::MySql => "MySQL",
             Driver::MariaDb => "MariaDB",
             Driver::Oracle => "Oracle",
+            Driver::Snowflake => "Snowflake",
         }
     }
 
@@ -42,6 +47,7 @@ impl Driver {
             Driver::MsSql => 1433,
             Driver::MySql | Driver::MariaDb => 3306,
             Driver::Oracle => 1521,
+            Driver::Snowflake => 443,
             Driver::Sqlite => 0,
         }
     }
@@ -62,14 +68,14 @@ impl Driver {
         match self {
             Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
             Driver::MySql | Driver::MariaDb => format!("`{}`", name.replace('`', "``")),
-            Driver::Postgres | Driver::Sqlite | Driver::Oracle => format!("\"{}\"", name.replace('"', "\"\"")),
+            Driver::Postgres | Driver::Sqlite | Driver::Oracle | Driver::Snowflake => format!("\"{}\"", name.replace('"', "\"\"")),
         }
     }
 }
 
 /// Persisted connection settings. The password is NOT stored here: it goes to the
 /// macOS Keychain (see `config.rs`) and is filled into `password` in memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectionConfig {
     pub id: u64,
@@ -87,6 +93,32 @@ pub struct ConnectionConfig {
     pub trust_cert: bool,
     /// DataGrip's "Read-only": the data editor can't save and consoles only run queries.
     pub read_only: bool,
+    /// Snowflake: warehouse, role and schema for the session (empty = the user's defaults).
+    pub warehouse: String,
+    pub role: String,
+    pub schema: String,
+    /// DataGrip's "Authentication" (Snowflake).
+    pub auth: AuthMode,
+    /// DataGrip's "Authenticator" field: the JDBC `authenticator` (`snowflake_jwt`, `oauth`…).
+    pub authenticator: String,
+    /// Advanced tab: user-defined driver properties (`private_key_file`…), in table order.
+    pub properties: Vec<(String, String)>,
+    /// Before the Advanced tab the key file had its own field: read so `migrate` can move it
+    /// into `properties`, never written back.
+    #[serde(skip_serializing)]
+    pub private_key_file: String,
+}
+
+/// DataGrip's "Authentication" options for Snowflake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AuthMode {
+    /// User and password.
+    #[default]
+    UserPassword,
+    /// The `authenticator` field, user and password; key pairs go through driver properties.
+    Authenticator,
+    /// Neither user nor password: everything comes from the driver properties.
+    NoAuth,
 }
 
 impl Default for ConnectionConfig {
@@ -108,19 +140,49 @@ impl ConnectionConfig {
                 Driver::MsSql => "master".into(),
                 // Oracle: service name of the pluggable database.
                 Driver::Oracle => "FREEPDB1".into(),
-                Driver::Sqlite | Driver::MySql | Driver::MariaDb => String::new(),
+                Driver::Sqlite | Driver::MySql | Driver::MariaDb | Driver::Snowflake => String::new(),
             },
             user: match driver {
                 Driver::Postgres => "postgres".into(),
                 Driver::MsSql => "sa".into(),
                 Driver::MySql | Driver::MariaDb => "root".into(),
                 Driver::Oracle => "system".into(),
-                Driver::Sqlite => String::new(),
+                Driver::Sqlite | Driver::Snowflake => String::new(),
             },
             password: String::new(),
             file_path: String::new(),
             trust_cert: true,
             read_only: false,
+            warehouse: String::new(),
+            role: String::new(),
+            schema: String::new(),
+            auth: AuthMode::default(),
+            authenticator: String::new(),
+            properties: Vec::new(),
+            private_key_file: String::new(),
+        }
+    }
+
+    /// Value of a driver property (case-insensitive name), when set and not blank.
+    pub fn property(&self, name: &str) -> Option<&str> {
+        self.properties.iter().find(|(k, v)| k.trim().eq_ignore_ascii_case(name) && !v.trim().is_empty()).map(|(_, v)| v.trim())
+    }
+
+    /// Sets a driver property, replacing one with the same name.
+    pub fn set_property(&mut self, name: &str, value: &str) {
+        match self.properties.iter_mut().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)) {
+            Some((_, v)) => *v = value.to_string(),
+            None => self.properties.push((name.to_string(), value.to_string())),
+        }
+    }
+
+    /// Upgrades a config saved by an older version: the key file of the old "Key pair"
+    /// authentication becomes the `private_key_file` property of "Authenticator".
+    pub fn migrate(&mut self) {
+        let key = std::mem::take(&mut self.private_key_file);
+        if !key.trim().is_empty() && self.property("private_key_file").is_none() {
+            self.set_property("private_key_file", key.trim());
+            self.auth = AuthMode::Authenticator;
         }
     }
 }
@@ -202,6 +264,8 @@ pub enum CancelHandle {
     MySql(Box<mysql_async::OptsBuilder>, u32),
     /// Oracle: `break_execution` on the same connection.
     Oracle(std::sync::Arc<::oracle::Connection>),
+    /// Snowflake: `abort-request` for the running request id.
+    Snowflake(snowflake::SfCancel),
 }
 
 impl CancelHandle {
@@ -224,6 +288,7 @@ impl CancelHandle {
                 conn.disconnect().await?;
                 Ok(())
             }
+            CancelHandle::Snowflake(h) => h.cancel().await,
         }
     }
 }
@@ -236,10 +301,19 @@ pub enum Session {
     /// MySQL and MariaDB.
     MySql(Box<mysql::MySession>),
     Oracle(Box<oracle::OraSession>),
+    Snowflake(Box<snowflake::SfSession>),
 }
 
 impl Session {
     pub async fn connect(cfg: &ConnectionConfig) -> anyhow::Result<Session> {
+        // "No auth": the engine's defaults (trust/peer auth…). Snowflake reads its properties.
+        let no_auth;
+        let cfg = if cfg.auth == AuthMode::NoAuth && cfg.driver != Driver::Snowflake {
+            no_auth = ConnectionConfig { user: String::new(), password: String::new(), ..cfg.clone() };
+            &no_auth
+        } else {
+            cfg
+        };
         let mut session = Self::open(cfg).await?;
         // Read-only data sources are also enforced by the server where the engine allows it
         // (SQLite opens the file read-only; SQL Server and Oracle rely on the app's checks).
@@ -263,6 +337,7 @@ impl Session {
             Driver::MsSql => Session::MsSql(Box::new(mssql::MsSession::connect(cfg).await?)),
             Driver::MySql | Driver::MariaDb => Session::MySql(Box::new(mysql::MySession::connect(cfg).await?)),
             Driver::Oracle => Session::Oracle(Box::new(oracle::OraSession::connect(cfg).await?)),
+            Driver::Snowflake => Session::Snowflake(Box::new(snowflake::SfSession::connect(cfg).await?)),
         })
     }
 
@@ -275,6 +350,7 @@ impl Session {
             Session::MsSql(s) => s.execute(sql, max_rows).await,
             Session::MySql(s) => s.execute(sql, max_rows).await,
             Session::Oracle(s) => s.execute(sql, max_rows).await,
+            Session::Snowflake(s) => s.execute(sql, max_rows).await,
         }
     }
 
@@ -286,6 +362,7 @@ impl Session {
             Session::MsSql(s) => s.current_database().await,
             Session::MySql(s) => s.current_database().await,
             Session::Oracle(s) => s.current_database().await,
+            Session::Snowflake(s) => s.current_database().await,
         }
     }
 
@@ -297,6 +374,7 @@ impl Session {
             Session::MsSql(s) => s.list_databases().await,
             Session::MySql(s) => s.list_databases().await,
             Session::Oracle(s) => s.list_databases().await,
+            Session::Snowflake(s) => s.list_databases().await,
         }
     }
 
@@ -311,6 +389,7 @@ impl Session {
         match self {
             Session::MsSql(s) if !db.is_empty() => s.use_database(db).await,
             Session::MySql(s) if !db.is_empty() => s.use_database(db).await,
+            Session::Snowflake(s) if !db.is_empty() => s.use_database(db).await,
             _ => Ok(()),
         }
     }
@@ -325,6 +404,7 @@ impl Session {
             Session::MsSql(s) => s.apply_changes(statements).await,
             Session::MySql(s) => s.apply_changes(statements).await,
             Session::Oracle(s) => s.apply_changes(statements).await,
+            Session::Snowflake(s) => s.apply_changes(statements).await,
         }
     }
 
@@ -339,6 +419,7 @@ impl Session {
                 Some(CancelHandle::MySql(Box::new(opts), id))
             }
             Session::Oracle(s) => Some(CancelHandle::Oracle(s.break_handle())),
+            Session::Snowflake(s) => Some(CancelHandle::Snowflake(s.cancel_handle())),
             _ => None,
         }
     }
@@ -380,6 +461,7 @@ impl Session {
             Session::MsSql(s) => s.is_closed(),
             Session::MySql(s) => s.is_closed(),
             Session::Oracle(s) => s.is_closed(),
+            Session::Snowflake(s) => s.is_closed(),
         }
     }
 
@@ -391,13 +473,38 @@ impl Session {
             Session::MsSql(s) => s.introspect().await,
             Session::MySql(s) => s.introspect().await,
             Session::Oracle(s) => s.introspect().await,
+            Session::Snowflake(s) => s.introspect().await,
         }
+    }
+
+    /// Product and version for the dialog's Test Connection ("Snowflake 10.37.102",
+    /// "PostgreSQL 16.4"…), or None when the server won't say.
+    pub async fn server_version(&mut self, driver: Driver) -> Option<String> {
+        let sql = match driver {
+            Driver::Postgres => "SHOW server_version",
+            Driver::MySql | Driver::MariaDb => "SELECT VERSION()",
+            Driver::MsSql => "SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))",
+            Driver::Oracle => "SELECT version FROM product_component_version WHERE product LIKE 'Oracle%'",
+            Driver::Sqlite => "SELECT sqlite_version()",
+            Driver::Snowflake => "SELECT CURRENT_VERSION()",
+        };
+        let rs = self.execute(sql, 1).await.ok()?;
+        let v = rs.into_iter().next()?.rows.into_iter().next()?.into_iter().next()??;
+        // MariaDB reports itself in its version string ("11.4.2-MariaDB-…").
+        let v = v.split(['-', ' ']).next().unwrap_or(&v).to_string();
+        let product = match driver {
+            Driver::MsSql => "Microsoft SQL Server",
+            Driver::Postgres => "PostgreSQL",
+            Driver::Sqlite => "SQLite",
+            d => d.label(),
+        };
+        Some(format!("{product} {v}"))
     }
 
     /// Qualified name quoted for the dialect, e.g. `"public"."users"` or `[dbo].[users]`.
     pub fn quote_table(driver: Driver, schema: &str, table: &str) -> String {
         match driver {
-            Driver::Postgres => format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\"")),
+            Driver::Postgres | Driver::Snowflake => format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\"")),
             Driver::Sqlite => format!("\"{}\"", table.replace('"', "\"\"")),
             Driver::MsSql => format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]")),
             // MySQL: the schema is the database.

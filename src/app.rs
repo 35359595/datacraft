@@ -33,7 +33,7 @@ use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, 
 use crate::edit;
 use crate::i18n::{self, Lang, tr, trf};
 use crate::sql;
-use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
+use crate::ui::connection_dialog::{ConnectionDialog, DialogResult};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
@@ -645,10 +645,8 @@ impl DataCraftApp {
                     }
                 }
                 Response::TestResult { conn, result } => {
-                    if let Some(d) = self.dialog.as_mut()
-                        && d.cfg.id == conn
-                    {
-                        d.test = TestState::Done(result);
+                    if let Some(d) = self.dialog.as_mut() {
+                        d.set_test_result(conn, result);
                     }
                 }
                 Response::Disconnected(conn) => {
@@ -1163,8 +1161,8 @@ impl DataCraftApp {
                 ExplorerAction::Disconnect(id) => self.disconnect(id),
                 ExplorerAction::Refresh(id) => self.worker.send(Request::Refresh(id)),
                 ExplorerAction::Edit(id) => {
-                    if let Some(c) = self.conn(id) {
-                        self.dialog = Some(ConnectionDialog::edit(c.cfg.clone()));
+                    if self.conn(id).is_some() {
+                        self.dialog = Some(ConnectionDialog::edit(id, &self.conn_configs()));
                     }
                 }
                 ExplorerAction::Duplicate(id) => {
@@ -1432,7 +1430,11 @@ impl DataCraftApp {
 
     fn open_new_connection_dialog(&mut self) {
         let id = self.next_conn_id();
-        self.dialog = Some(ConnectionDialog::new_connection(id));
+        self.dialog = Some(ConnectionDialog::new_connection(id, &self.conn_configs()));
+    }
+
+    fn conn_configs(&self) -> Vec<ConnectionConfig> {
+        self.conns.iter().map(|c| c.cfg.clone()).collect()
     }
 
     fn save_connection(&mut self, cfg: ConnectionConfig) {
@@ -2382,11 +2384,18 @@ impl DataCraftApp {
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(dialog) = self.dialog.as_mut() {
             match dialog.show(ctx) {
-                Some(DialogResult::Save(cfg)) => {
-                    self.dialog = None;
-                    self.save_connection(cfg);
+                Some(DialogResult::Save { save, delete, close }) => {
+                    if close {
+                        self.dialog = None;
+                    }
+                    for id in delete {
+                        self.delete_connection(id);
+                    }
+                    for cfg in save {
+                        self.save_connection(cfg);
+                    }
                 }
-                Some(DialogResult::Test(cfg)) => self.worker.send(Request::Test(cfg)),
+                Some(DialogResult::Test(cfg)) => self.worker.send(Request::Test(*cfg)),
                 Some(DialogResult::Cancel) => self.dialog = None,
                 None => {}
             }

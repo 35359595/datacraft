@@ -34,6 +34,7 @@ pub fn load_connections() -> Vec<ConnectionConfig> {
         }
     };
     for c in &mut list {
+        c.migrate();
         if let Some(pw) = keychain_entry(c.id).and_then(|e| e.get_password().ok()) {
             c.password = pw;
         }

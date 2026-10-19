@@ -4,8 +4,11 @@ DataGrip-style database client for macOS and Windows (Islands theme), written in
 
 ![DataCraft table data editor](docs/screenshots/table-editor.png)
 
-- **Engines:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle and SQLite. Oracle needs the
+- **Engines:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, Snowflake and SQLite. Oracle needs the
   [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) installed.
+  Snowflake speaks the JDBC driver's REST protocol natively (no Java): password, key-pair (the
+  `private_key_file` driver property, as in DataGrip), OAuth or programmatic access token authentication,
+  with role, database, schema and warehouse per data source.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
 Shortcuts are written with ⌘ / ⌥ (macOS); on Windows use Ctrl / Alt.
 
@@ -62,8 +65,9 @@ cargo test
 scripts/test_mssql.sh <host>   # real SQL Server (non-destructive: only #temp tables), asks for the password
 ```
 
-The live tests run with `cargo test -- --ignored` and the `DATACRAFT_PG_*`, `DATACRAFT_MY_*` and
-`DATACRAFT_ORA_*` variables (see `src/db/postgres.rs`, `src/db/mysql.rs` and `src/db/oracle.rs`).
+The live tests run with `cargo test -- --ignored` and the `DATACRAFT_PG_*`, `DATACRAFT_MY_*`,
+`DATACRAFT_ORA_*` and `DATACRAFT_SF_*` variables (see `src/db/postgres.rs`, `src/db/mysql.rs`,
+`src/db/oracle.rs` and `src/db/snowflake.rs`).
 
 Demo mode for screenshots: `DATACRAFT_DEMO=path.db cargo run` (see the header of `src/app.rs`).
 
@@ -76,8 +80,11 @@ Bundled fonts keep their own open license (SIL OFL 1.1); see [assets/fonts/READM
 
 Cliente de bases de datos para macOS y Windows al estilo de DataGrip (tema Islands), escrito en Rust con egui.
 
-- **Motores:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle y SQLite. Oracle requiere tener instalado el
+- **Motores:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, Snowflake y SQLite. Oracle requiere tener instalado el
   [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html).
+  Snowflake usa directamente el protocolo REST del driver JDBC (sin Java): autenticación por contraseña, par de
+  claves (la propiedad `private_key_file` del controlador, como en DataGrip), OAuth o token de acceso
+  programático, con rol, base de datos, esquema y almacén por fuente de datos.
 - **Database Explorer:** todas las bases del servidor (se cargan al expandirlas), esquemas, tablas, vistas, columnas y claves primarias.
 Los atajos se indican con ⌘ / ⌥ (macOS); en Windows son Ctrl / Alt.
 
@@ -131,7 +138,8 @@ scripts/test_mssql.sh <host>   # SQL Server real (no destructivo: solo tablas #t
 ```
 
 Los tests en vivo se ejecutan con `cargo test -- --ignored` y las variables `DATACRAFT_PG_*`,
-`DATACRAFT_MY_*` y `DATACRAFT_ORA_*` (ver `src/db/postgres.rs`, `src/db/mysql.rs` y `src/db/oracle.rs`).
+`DATACRAFT_MY_*`, `DATACRAFT_ORA_*` y `DATACRAFT_SF_*` (ver `src/db/postgres.rs`, `src/db/mysql.rs`,
+`src/db/oracle.rs` y `src/db/snowflake.rs`).
 
 Modo demo para capturas: `DATACRAFT_DEMO=ruta.db cargo run` (ver la cabecera de `src/app.rs`).
 

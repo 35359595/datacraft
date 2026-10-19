@@ -58,12 +58,12 @@ pub fn drop_sql(driver: Driver, kind: DropKind, schema: &str, name: &str) -> Str
     object_sql(driver, kind, schema, name, "")
 }
 
-/// Name the table will have after a rename. Oracle: a simple name typed in lowercase means
-/// the usual uppercase name, not a case-sensitive quoted one.
+/// Name the table will have after a rename. Oracle and Snowflake: a simple name typed in
+/// lowercase means the usual uppercase name, not a case-sensitive quoted one.
 pub fn effective_name(driver: Driver, new_name: &str) -> String {
     let n = new_name.trim();
     let simple = n.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if driver == Driver::Oracle && simple { n.to_ascii_uppercase() } else { n.to_string() }
+    if matches!(driver, Driver::Oracle | Driver::Snowflake) && simple { n.to_ascii_uppercase() } else { n.to_string() }
 }
 
 /// Statement for `kind` on `schema.name`; `new_name` is only used by `Rename`.
@@ -85,6 +85,8 @@ pub fn object_sql(driver: Driver, kind: DropKind, schema: &str, name: &str, new_
                     format!("exec sp_rename '{old}', '{}'", new_name.replace('\'', "''"))
                 }
                 Driver::MySql | Driver::MariaDb => format!("rename table {} to {}", object(schema, name), object(schema, new_name)),
+                // Snowflake resolves an unqualified new name in the session's current schema.
+                Driver::Snowflake => format!("alter table {} rename to {}", object(schema, name), object(schema, new_name)),
                 // The new name can't be qualified on PostgreSQL, SQLite or Oracle.
                 _ => format!("alter table {} rename to {}", object(schema, name), q(new_name)),
             }
@@ -236,5 +238,7 @@ mod tests {
         assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "GOODS"), "alter table HR.ITEMS rename to GOODS");
         assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "goods"), "alter table HR.ITEMS rename to GOODS");
         assert_eq!(object_sql(Driver::Oracle, DropKind::Rename, "HR", "ITEMS", "_x"), "alter table HR.ITEMS rename to \"_x\"");
+        assert_eq!(object_sql(Driver::Snowflake, DropKind::Rename, "PUBLIC", "ITEMS", "goods"), "alter table PUBLIC.ITEMS rename to PUBLIC.GOODS");
+        assert_eq!(object_sql(Driver::Snowflake, DropKind::Rename, "PUBLIC", "items", "Goods"), "alter table PUBLIC.\"items\" rename to PUBLIC.GOODS");
     }
 }
