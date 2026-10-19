@@ -5,7 +5,7 @@
 //! session (with `USE [db]` before each operation on SQL Server); PostgreSQL opens one
 //! session per database, because a PG connection cannot switch databases.
 
-use crate::db::{ConnectionConfig, DatabaseInfo, Driver, ResultSet, SchemaInfo, Session};
+use crate::db::{CancelHandle, ConnectionConfig, DatabaseInfo, Driver, ResultSet, SchemaInfo, Session};
 use crate::i18n::{tr, trf};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +45,11 @@ pub enum Request {
     /// Runs DDL outside any console (create or drop a database or table). `db`: as in
     /// `Execute`. `close_db`: database whose own session (PostgreSQL) is closed first, so
     /// it can be dropped.
-    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String> },
+    /// `transaction`: all statements in one transaction (imports); DDL runs without one.
+    RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String>, transaction: bool },
+    /// Cancels what a console's `Execute` is running. Engines without a native cancel
+    /// abandon the query and close the session (it reconnects on the next run).
+    Cancel { console: ConsoleId },
 }
 
 pub enum Response {
@@ -130,9 +134,24 @@ struct Live {
     sessions: HashMap<String, SharedSession>,
 }
 
+/// A console's `Execute` in progress. Registered before waiting for the session, so a
+/// cancel that arrives meanwhile is not lost.
+#[derive(Default)]
+struct Running {
+    /// Native cancel of the session's running statement (once the session is held).
+    native: std::sync::Mutex<Option<CancelHandle>>,
+    /// true while a statement of THIS execution is running on the server (a native cancel
+    /// outside that window could hit another console's query on a shared session).
+    in_flight: std::sync::atomic::AtomicBool,
+    /// Abandons the query (engines without native cancel, or if it failed).
+    abandon: tokio::sync::Notify,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Default)]
 struct State {
     live: Mutex<HashMap<ConnId, Live>>,
+    running: std::sync::Mutex<HashMap<ConsoleId, Arc<Running>>>,
     /// Epoch per connection: changes with every Connect/Disconnect.
     epochs: std::sync::Mutex<HashMap<ConnId, u64>>,
 }
@@ -284,7 +303,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
             out
         }
-        Request::RunDdl { conn, db, statements, close_db } => {
+        Request::RunDdl { conn, db, statements, close_db, transaction } => {
             if let Some(name) = close_db.filter(|n| !n.is_empty())
                 && let Some(l) = state.live.lock().await.get_mut(&conn)
             {
@@ -296,7 +315,9 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             };
             let mut s = session.lock().await;
             let mut result = s.use_database(&target).await.map_err(|e| format!("{e:#}"));
-            if result.is_ok() {
+            if result.is_ok() && transaction {
+                result = s.run_transaction(&statements).await.map(|_| ()).map_err(|e| format!("{e:#}"));
+            } else if result.is_ok() {
                 for stmt in &statements {
                     if let Err(e) = s.execute(stmt, 0).await {
                         result = Err(format!("{e:#}"));
@@ -313,11 +334,53 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
             out
         }
+        Request::Cancel { console } => {
+            use std::sync::atomic::Ordering::SeqCst;
+            let running = state.running.lock().unwrap_or_else(|e| e.into_inner()).get(&console).cloned();
+            if let Some(r) = running {
+                r.cancelled.store(true, SeqCst);
+                let native = r.native.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                // The statement may not have reached the server yet when the first cancel
+                // arrives: retry while this same execution is still running a statement.
+                let still_running = || {
+                    r.in_flight.load(SeqCst)
+                        && state.running.lock().unwrap_or_else(|e| e.into_inner()).get(&console).is_some_and(|x| Arc::ptr_eq(x, &r))
+                };
+                for _ in 0..25 {
+                    if !still_running() {
+                        break;
+                    }
+                    match &native {
+                        Some(h) if h.cancel().await.is_ok() => {}
+                        _ => {
+                            r.abandon.notify_one();
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                // Still running after ~5 s of native cancels: abandon it.
+                if still_running() {
+                    r.abandon.notify_one();
+                }
+            }
+            vec![]
+        }
         Request::Execute { conn, db, console, statements, max_rows } => {
+            use std::sync::atomic::Ordering::SeqCst;
             let start = Instant::now();
+            let running = Arc::new(Running::default());
+            state.running.lock().unwrap_or_else(|e| e.into_inner()).insert(console, running.clone());
+            let unregister = |state: &State| {
+                let mut map = state.running.lock().unwrap_or_else(|e| e.into_inner());
+                if map.get(&console).is_some_and(|r| Arc::ptr_eq(r, &running)) {
+                    map.remove(&console);
+                }
+            };
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
                 Ok(s) => s,
                 Err(e) => {
+                    unregister(state);
                     return vec![Response::Executed {
                         console,
                         results: vec![],
@@ -327,25 +390,62 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 }
             };
             let mut s = session.lock().await;
+            *running.native.lock().unwrap_or_else(|e| e.into_inner()) = s.cancel_handle();
+            let statements_tail = statements.last().cloned();
             let mut results = Vec::new();
             let mut error = None;
+            let mut abandoned = false;
             if let Err(e) = s.use_database(&target).await {
                 error = Some(format!("{e:#}"));
             } else {
                 for stmt in statements {
-                    match s.execute(&stmt, max_rows).await {
+                    // `in_flight` first: either this sees `cancelled` or the canceller sees
+                    // `in_flight` (and retries until the statement stops).
+                    running.in_flight.store(true, SeqCst);
+                    if running.cancelled.load(SeqCst) {
+                        running.in_flight.store(false, SeqCst);
+                        break;
+                    }
+                    let result = tokio::select! {
+                        r = s.execute(&stmt, max_rows) => r,
+                        _ = running.abandon.notified() => {
+                            abandoned = true;
+                            Err(anyhow::anyhow!(tr("Query cancelled")))
+                        }
+                    };
+                    running.in_flight.store(false, SeqCst);
+                    match result {
                         Ok(rs) => results.extend(rs),
                         Err(e) => {
                             error = Some(format!("{e:#}"));
                             break;
                         }
                     }
+                    if abandoned {
+                        break;
+                    }
                 }
             }
-            let lost = s.is_closed();
+            // SQL Server explain: `SET SHOWPLAN_TEXT OFF` must run even if the statement failed,
+            // or the session would keep returning plans instead of running queries.
+            if error.is_some()
+                && !abandoned
+                && let Some(last) = statements_tail.filter(|s| s.trim().eq_ignore_ascii_case("SET SHOWPLAN_TEXT OFF"))
+            {
+                let _ = s.execute(&last, 0).await;
+            }
+            unregister(state);
+            if running.cancelled.load(SeqCst) {
+                error = Some(tr("Query cancelled").to_string());
+            }
+            // An abandoned query leaves the session in an unknown state: it is closed.
+            let lost = abandoned || s.is_closed();
             drop(s);
             let mut out = vec![Response::Executed { console, results, error: error.clone(), elapsed: start.elapsed() }];
-            if lost {
+            if abandoned {
+                state.forget(conn, &session).await;
+                out.push(Response::ConnectFailed { conn, error: tr("Query cancelled; the connection was closed and will reopen on the next run").to_string() });
+            } else if lost {
                 // Forget the broken session; the UI will reconnect on the next run.
                 state.forget(conn, &session).await;
                 let detail = error.unwrap_or_default();
@@ -379,4 +479,162 @@ async fn load_databases(session: &mut Session, default_db: &str) -> anyhow::Resu
             DatabaseInfo { schemas: if current { schemas.take() } else { None }, current, name }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_for(w: &Worker, pred: impl Fn(&Response) -> bool) -> Response {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            for r in w.poll() {
+                if pred(&r) {
+                    return r;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for the worker");
+    }
+
+    #[test]
+    fn cancels_a_running_sqlite_query() {
+        let dir = std::env::temp_dir().join(format!("datacraft-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap().execute_batch("create table t(x)").unwrap();
+        let w = Worker::start(egui::Context::default());
+        let mut cfg = ConnectionConfig::new(7, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        // Endless recursive CTE: only a cancel stops it.
+        let endless = "with recursive c(n) as (select 1 union all select n + 1 from c) select count(*) from c".to_string();
+        w.send(Request::Execute { conn: 7, db: None, console: 1, statements: vec![endless], max_rows: 10 });
+        std::thread::sleep(Duration::from_millis(300));
+        w.send(Request::Cancel { console: 1 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 1, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert_eq!(error.as_deref(), Some(tr("Query cancelled")));
+        // The session is still usable.
+        w.send(Request::Execute { conn: 7, db: None, console: 2, statements: vec!["select 1".into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 2, .. }));
+        let Response::Executed { error, results, .. } = r else { unreachable!() };
+        assert!(error.is_none() && results.len() == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn read_only_rejects_writes(cfg: ConnectionConfig, write: &str) {
+        let conn = cfg.id;
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        w.send(Request::Execute { conn, db: None, console: 3, statements: vec![write.into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 3, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert!(error.is_some(), "the server accepted a write on a read-only connection");
+    }
+
+    #[test]
+    fn sqlite_read_only_is_enforced_by_the_engine() {
+        let dir = std::env::temp_dir().join(format!("datacraft-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap().execute_batch("create table t(x); insert into t values (1)").unwrap();
+        let mut cfg = ConnectionConfig::new(9, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        cfg.read_only = true;
+        read_only_rejects_writes(cfg, "delete from t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An import (transactional RunDdl) whose second batch fails leaves no rows behind.
+    fn transactional_import_rolls_back(cfg: ConnectionConfig, setup: &str, table: &str) {
+        let conn = cfg.id;
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        w.send(Request::RunDdl { conn, db: None, statements: vec![setup.into()], close_db: None, transaction: false });
+        let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        result.unwrap();
+        let statements = vec![format!("insert into {table} values (1), (2)"), format!("insert into {table} values (2)")];
+        w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: true });
+        let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        assert!(result.is_err());
+        w.send(Request::Execute { conn, db: None, console: 4, statements: vec![format!("select count(*) from {table}")], max_rows: 10 });
+        let Response::Executed { results, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 4, .. })) else { unreachable!() };
+        assert_eq!(results[0].rows[0][0].as_deref(), Some("0"));
+        w.send(Request::RunDdl { conn, db: None, statements: vec![format!("drop table {table}")], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
+    }
+
+    #[test]
+    fn sqlite_import_is_all_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("datacraft-tx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap();
+        let mut cfg = ConnectionConfig::new(11, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        transactional_import_rolls_back(cfg, "create table imp(x integer primary key)", "imp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn mysql_import_is_all_or_nothing() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(12, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        transactional_import_rolls_back(cfg, "create table dc_imp(x int primary key)", "dc_imp");
+    }
+
+    /// Live, like `cancels_a_running_mysql_query`.
+    #[test]
+    #[ignore]
+    fn mysql_read_only_is_enforced_by_the_server() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(10, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        cfg.read_only = true;
+        read_only_rejects_writes(cfg, "create table ro_probe(x int)");
+    }
+
+    /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).
+    #[test]
+    #[ignore]
+    fn cancels_a_running_mysql_query() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(8, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        let start = Instant::now();
+        w.send(Request::Execute { conn: 8, db: None, console: 1, statements: vec!["select sleep(30)".into()], max_rows: 10 });
+        std::thread::sleep(Duration::from_millis(500));
+        w.send(Request::Cancel { console: 1 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 1, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert_eq!(error.as_deref(), Some(tr("Query cancelled")));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        w.send(Request::Execute { conn: 8, db: None, console: 2, statements: vec!["select 1".into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 2, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+    }
 }

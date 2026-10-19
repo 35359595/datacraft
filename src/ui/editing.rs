@@ -49,10 +49,19 @@ pub struct EditState {
 
 const MAX_HISTORY: usize = 500;
 
-/// Types the grid shows as hex and that cannot be edited as text.
+/// Types the grid shows as hex (or, for MySQL `bit(n)`, as a number) and that cannot be
+/// written back as a text literal.
 pub fn is_binary_type(data_type: &str) -> bool {
     let t = data_type.to_lowercase();
-    ["blob", "binary", "bytea", "image", "rowversion"].iter().any(|k| t.contains(k))
+    // Oracle RAW / LONG RAW, MySQL BIT(n) and spatial types. SQL Server's plain `bit` is a
+    // boolean and stays editable.
+    ["blob", "binary", "bytea", "image", "rowversion", "geometry", "geography", "point", "polygon", "linestring"]
+        .iter()
+        .any(|k| t.contains(k))
+        || t == "raw"
+        || t.starts_with("raw(")
+        || t.starts_with("long raw")
+        || t.starts_with("bit(")
 }
 
 impl EditState {
@@ -212,6 +221,13 @@ impl EditState {
     pub fn add_row(&mut self, n_cols: usize) -> usize {
         self.checkpoint();
         self.inserted.push(vec![None; n_cols]);
+        self.inserted.len() - 1
+    }
+
+    /// Appends a new row with these values (`None` = left to the column default).
+    pub fn add_row_with(&mut self, values: Vec<Option<Cell>>) -> usize {
+        self.checkpoint();
+        self.inserted.push(values);
         self.inserted.len() - 1
     }
 
@@ -596,6 +612,16 @@ pub fn console_target(statement: &str, result_cols: &[String], schemas: &[Schema
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_types() {
+        for t in ["bytea", "varbinary(16)", "RAW(16)", "long raw", "bit(1)", "geometry", "blob"] {
+            assert!(is_binary_type(t), "{t}");
+        }
+        for t in ["bit", "text", "varchar2(20)", "timestamp", "number(10)"] {
+            assert!(!is_binary_type(t), "{t}");
+        }
+    }
     use crate::db::TableInfo;
 
     fn col(name: &str, pk: bool) -> ColumnInfo {

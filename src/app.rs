@@ -1,6 +1,7 @@
 //! Main application state and UI composition (DataGrip "Islands" style).
 //!
-//! Debug environment variable: `DATACRAFT_DEMO=<path.db>` starts with a temporary SQLite
+//! Debug environment variable: `DATACRAFT_DEMO=<path.db>` (or a server URL like
+//! `mariadb://root:pw@127.0.0.1:3307/shop`, see `demo_server_config`) starts with a temporary
 //! connection (not saved to `connections.json`) to that file, connects it, opens the data
 //! editor of its first table and a console with a sample query. In that mode the UI state
 //! is persisted to a temporary directory (see `main.rs`).
@@ -15,12 +16,17 @@
 //! resizable), `DATACRAFT_DEMO_WINDOW=<width>x<height>` resizes the window at startup
 //! (may go below the normal minimum) and `DATACRAFT_DEMO_MULTI=1` uses a console with
 //! several queries, run with "Run all" (one result tab each).
-//! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked.
+//! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
+//! `<column>=<text>` types that text in its search box (which also filters the grid).
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
+//! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
+//! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
+//! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
+//! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
-//! `DATACRAFT_DEMO_DROP=table` opens the confirmation to drop the first table;
-//! `table-submit` also drops it.
+//! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
+//! rename (to `<name>_renamed`) the first table; with `-submit` (e.g. `rename-submit`) it also runs it.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -31,6 +37,7 @@ use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
+use crate::ui::import_dialog::{ImportDialog, ImportResult};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -243,6 +250,7 @@ pub struct DataCraftApp {
     create: Option<CreateDialog>,
     /// Confirmation to drop a database, table or view.
     drop: Option<DropDialog>,
+    import: Option<ImportDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -314,6 +322,7 @@ impl DataCraftApp {
             confirm_delete: None,
             create: None,
             drop: None,
+            import: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -369,9 +378,15 @@ impl DataCraftApp {
     /// Demo mode (`DATACRAFT_DEMO`): temporary SQLite connection, console and data editor.
     fn start_demo(&mut self, path: &str) {
         let id = self.next_conn_id();
-        let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
-        cfg.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
-        cfg.file_path = path.to_string();
+        let cfg = match demo_server_config(id, path) {
+            Some(cfg) => cfg,
+            None => {
+                let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
+                cfg.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
+                cfg.file_path = path.to_string();
+                cfg
+            }
+        };
         self.conns.push(ConnState::new(cfg));
         self.explorer.expanded.insert(format!("c:{id}"));
         self.explorer.selected = Some(format!("c:{id}"));
@@ -557,17 +572,37 @@ impl DataCraftApp {
                             self.active = 0;
                         }
                         let demo_drop = std::env::var("DATACRAFT_DEMO_DROP").unwrap_or_default();
-                        if demo_drop.starts_with("table")
+                        let demo_kind = match demo_drop.split('-').next() {
+                            Some("table") => Some(DropKind::Table),
+                            Some("truncate") => Some(DropKind::Truncate),
+                            Some("rename") => Some(DropKind::Rename),
+                            _ => None,
+                        };
+                        if let Some(kind) = demo_kind
                             && let Some(t) = self.explorer.selected_table.clone()
                             && let Some(driver) = self.conn(conn).map(|c| c.cfg.driver)
                         {
-                            let mut d = DropDialog::object(conn, driver, DropKind::Table, t.db.clone(), t.schema, t.table);
-                            if demo_drop == "table-submit" {
+                            let mut d = DropDialog::object(conn, driver, kind, t.db.clone(), t.schema, t.table);
+                            if kind == DropKind::Rename {
+                                d.new_name = format!("{}_renamed", d.name);
+                            }
+                            if demo_drop.ends_with("-submit") {
                                 d.running = true;
-                                let statements = vec![crate::ui::drop_dialog::drop_sql(driver, DropKind::Table, &d.schema, &d.name)];
-                                self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None });
+                                let statements = vec![d.sql()];
+                                self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None, transaction: false });
                             }
                             self.drop = Some(d);
+                        }
+                        if let Ok(csv) = std::env::var("DATACRAFT_DEMO_IMPORT")
+                            && let Some(t) = self.explorer.selected_table.clone()
+                        {
+                            self.open_import(t);
+                            if let Some(d) = self.import.as_mut() {
+                                d.load(std::path::Path::new(&csv));
+                            }
+                            if std::env::var("DATACRAFT_DEMO_IMPORT_SUBMIT").is_ok_and(|v| v == "1") {
+                                self.submit_import();
+                            }
                         }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
@@ -579,8 +614,8 @@ impl DataCraftApp {
                                 d.columns.extend(create_dialog::demo_columns());
                                 if demo_create == "table-submit" {
                                     d.running = true;
-                                    let statements = vec![create_dialog::create_table_sql(d.driver, "main", &d.name, &d.columns)];
-                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None });
+                                    let statements = vec![d.sql()];
+                                    self.worker.send(Request::RunDdl { conn, db: Some(db), statements, close_db: None, transaction: false });
                                 }
                             }
                         }
@@ -710,8 +745,10 @@ impl DataCraftApp {
             if v.edit_checked || v.rs.is_command() {
                 continue;
             }
+            let read_only = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.read_only);
             let target = match (c.conn, &c.table) {
                 (None, _) => Err(tr("No connection").to_string()),
+                _ if read_only => Err(tr("Read-only connection").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
                     None => Err(tr("Table structure not loaded yet").to_string()),
@@ -821,8 +858,10 @@ impl DataCraftApp {
         };
         let (conn, db, busy) = (c.conn, c.db.clone(), c.is_busy());
         let connected = conn.and_then(|id| self.conn(id)).is_some_and(|c| matches!(c.status, ConnStatus::Connected));
+        let read_only = conn.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.read_only);
         let Some(pv) = self.preview.as_mut() else { return };
         match conn {
+            _ if read_only => pv.error = Some(tr("Read-only connection").into()),
             _ if busy => pv.error = Some(tr("The tab is running another operation").into()),
             Some(conn) if connected => {
                 pv.applying = true;
@@ -1012,6 +1051,25 @@ impl DataCraftApp {
             console.result_tab = ResultTab::Output;
             return;
         };
+        let driver = self.conn(conn).map(|c| c.cfg.driver).unwrap_or(Driver::Postgres);
+        if self.conn(conn).is_some_and(|c| c.cfg.read_only)
+            && let Some(stmt) = statements
+                .iter()
+                .flat_map(|s| sql::split_statements(s, driver))
+                .map(|s| s.text)
+                .find(|s| !is_query(s))
+        {
+            let Some(console) = self.consoles.get_mut(idx) else { return };
+            console.log.push(OutputEntry {
+                time: now(),
+                statement: stmt.trim().to_string(),
+                message: tr("Read-only connection: only queries can run (SELECT, WITH, SHOW, EXPLAIN…)").into(),
+                is_error: true,
+            });
+            console.result_tab = ResultTab::Output;
+            return;
+        }
+        let Some(console) = self.consoles.get_mut(idx) else { return };
         console.last_statements = statements.clone();
         console.run_started = Some(Instant::now());
         match status {
@@ -1122,21 +1180,30 @@ impl DataCraftApp {
                 ExplorerAction::Delete(id) => self.confirm_delete = Some(id),
                 ExplorerAction::LoadDatabase(id, db) => self.load_database(id, db),
                 ExplorerAction::NewDatabase(id) => {
+                    if self.refuse_read_only(id) {
+                        continue;
+                    }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.create = Some(CreateDialog::database(id, c.cfg.driver));
                     }
                 }
-                ExplorerAction::NewTable { conn, db, schema } => self.open_new_table(conn, db, schema),
+                ExplorerAction::NewTable { conn, db, schema } => {
+                    if !self.refuse_read_only(conn) {
+                        self.open_new_table(conn, db, schema);
+                    }
+                }
                 ExplorerAction::DropDatabase(id, db) => {
+                    if self.refuse_read_only(id) {
+                        continue;
+                    }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.drop = Some(DropDialog::database(id, c.cfg.driver, db));
                     }
                 }
-                ExplorerAction::DropObject(t, kind) => {
-                    if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
-                        self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind.into(), t.db, t.schema, t.table));
-                    }
-                }
+                ExplorerAction::DropObject(t, kind) => self.open_object_dialog(t, kind.into()),
+                ExplorerAction::TruncateTable(t) => self.open_object_dialog(t, DropKind::Truncate),
+                ExplorerAction::ImportData(t) => self.open_import(t),
+                ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1150,6 +1217,80 @@ impl DataCraftApp {
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
                 ExplorerAction::Hide => self.show_explorer = false,
             }
+        }
+    }
+
+    /// true (and reports it) if the connection is read-only.
+    fn refuse_read_only(&mut self, conn: ConnId) -> bool {
+        let ro = self.conn(conn).is_some_and(|c| c.cfg.read_only);
+        if ro {
+            self.error(tr("Read-only connection").to_string());
+        }
+        ro
+    }
+
+    /// "Import Data from File" into a table whose structure is loaded.
+    fn open_import(&mut self, t: TableRef) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
+        let Some(driver) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected).map(|c| c.cfg.driver) else { return };
+        let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table).map(<[ColumnInfo]>::to_vec) else {
+            self.error(tr("Table structure not loaded yet").to_string());
+            return;
+        };
+        self.import = Some(ImportDialog::new(t.conn, driver, t.db, t.schema, t.table, columns));
+    }
+
+    /// Demo mode: runs the import as if "Import" had been clicked.
+    fn submit_import(&mut self) {
+        let Some(d) = self.import.as_mut() else { return };
+        let statements = d.start();
+        if !statements.is_empty() {
+            let (conn, db) = (d.conn, Some(d.db.clone()));
+            self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: true });
+        }
+    }
+
+    /// Reply to an import's INSERTs.
+    fn import_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.import.as_mut() else { return };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            return;
+        }
+        let Some(d) = self.import.take() else { return };
+        self.reload_table_editors(d.conn, &d.db, &d.schema, &d.table);
+        self.info(trf("{n} rows imported into “{table}”", &[("n", &d.imported), ("table", &d.table)]));
+    }
+
+    /// Reloads the open data editors of a table (that aren't busy and have no pending edits,
+    /// which a reload would silently discard).
+    fn reload_table_editors(&mut self, conn: ConnId, db: &str, schema: &str, table: &str) {
+        let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+        let editors: Vec<usize> = (0..self.consoles.len())
+            .filter(|&i| {
+                let c = &self.consoles[i];
+                c.conn == Some(conn)
+                    && c.db.as_deref().or(default_db.as_deref()) == Some(db)
+                    && c.table.as_ref().is_some_and(|t| t.schema == schema && t.table == table)
+                    && !c.is_busy()
+                    && !c.has_pending_edits()
+            })
+            .collect();
+        for i in editors {
+            self.reload_table(i);
+        }
+    }
+
+    /// Drop / truncate / rename confirmation for a table or view.
+    fn open_object_dialog(&mut self, t: TableRef, kind: DropKind) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
+        if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
+            self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind, t.db, t.schema, t.table));
         }
     }
 
@@ -1167,6 +1308,10 @@ impl DataCraftApp {
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
             self.drop_done(result);
+            return;
+        }
+        if self.import.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.import_done(result);
             return;
         }
         let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && d.running) else {
@@ -1189,7 +1334,11 @@ impl DataCraftApp {
                 self.worker.send(Request::Refresh(conn));
             }
             CreateTarget::Table { db, schema } => {
-                let schema = if d.driver == Driver::Sqlite { "main".to_string() } else { schema.trim().to_string() };
+                let schema = match d.driver {
+                    Driver::Sqlite => "main".to_string(),
+                    Driver::MySql | Driver::MariaDb => db.clone(),
+                    _ => schema.trim().to_string(),
+                };
                 let tref = TableRef { conn, db: db.clone(), schema: schema.clone(), table: name.clone() };
                 self.explorer.expanded.insert(format!("c:{conn}"));
                 self.explorer.expanded.insert(explorer::db_key(conn, &db));
@@ -1229,7 +1378,12 @@ impl DataCraftApp {
                 }
                 self.worker.send(Request::Refresh(conn));
             }
-            DropKind::Table | DropKind::View => {
+            DropKind::Truncate => {
+                // Open data editors of that table show the (now empty) data again.
+                self.reload_table_editors(conn, &d.db, &d.schema, &d.name);
+                self.info(trf("Table “{name}” truncated", &[("name", &d.name)]));
+            }
+            DropKind::Table | DropKind::View | DropKind::Rename => {
                 // Its data editors no longer have anything to show.
                 let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
                 let gone = |c: &Console| {
@@ -1249,8 +1403,16 @@ impl DataCraftApp {
                     c.loading.remove(&d.db);
                 }
                 self.load_database(conn, d.db.clone());
-                let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
-                self.info(trf(msg, &[("name", &d.name)]));
+                if d.kind == DropKind::Rename {
+                    let new_name = crate::ui::drop_dialog::effective_name(d.driver, &d.new_name);
+                    let renamed = TableRef { table: new_name.clone(), ..tref };
+                    self.explorer.selected = Some(explorer::table_key(&renamed));
+                    self.explorer.selected_table = Some(renamed);
+                    self.info(trf("Table “{name}” renamed to “{new_name}”", &[("name", &d.name), ("new_name", &new_name)]));
+                } else {
+                    let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
+                    self.info(trf(msg, &[("name", &d.name)]));
+                }
             }
         }
     }
@@ -1276,6 +1438,9 @@ impl DataCraftApp {
     fn save_connection(&mut self, cfg: ConnectionConfig) {
         config::store_password(cfg.id, &cfg.password);
         let id = cfg.id;
+        if cfg.read_only {
+            self.revoke_editing(id);
+        }
         if let Some(existing) = self.conn_mut(id) {
             existing.cfg = cfg;
             if existing.status != ConnStatus::Disconnected {
@@ -1291,6 +1456,20 @@ impl DataCraftApp {
         }
         self.persist_connections();
         self.info(tr("Connection saved"));
+    }
+
+    /// A connection became read-only: its grids stop being editable (pending changes are dropped).
+    fn revoke_editing(&mut self, conn: ConnId) {
+        for c in self.consoles.iter_mut().filter(|c| c.conn == Some(conn)) {
+            for v in c.results.iter_mut() {
+                v.edit = None;
+                v.readonly_reason = Some(tr("Read-only connection").to_string());
+                v.edit_checked = true;
+            }
+        }
+        if self.preview.as_ref().is_some_and(|p| self.consoles.iter().any(|c| c.id == p.console && c.conn == Some(conn))) {
+            self.preview = None;
+        }
     }
 
     fn delete_connection(&mut self, id: ConnId) {
@@ -1404,11 +1583,13 @@ impl DataCraftApp {
         if self.modal_open() {
             return;
         }
+        let in_table = self.consoles.get(self.active).is_some_and(|c| c.table.is_some());
         let (run_all, run, new_console, reload, quit, save) = ctx.input_mut(|i| {
             let run_all = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
             let run = i.consume_key(Modifiers::COMMAND, Key::Enter);
             let new_console = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
-            let reload = i.consume_key(Modifiers::COMMAND, Key::R);
+            // In a console ⌘R is "Replace" (handled by the editor).
+            let reload = in_table && i.consume_key(Modifiers::COMMAND, Key::R);
             let quit = i.consume_key(Modifiers::COMMAND, Key::Q);
             let save = i.consume_key(Modifiers::COMMAND, Key::S);
             (run_all, run, new_console, reload, quit, save)
@@ -1438,6 +1619,7 @@ impl DataCraftApp {
             || self.confirm_delete.is_some()
             || self.create.is_some()
             || self.drop.is_some()
+            || self.import.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -1478,9 +1660,14 @@ impl DataCraftApp {
                 M::OpenSql if !modal => self.open_sql_file(),
                 M::SaveSqlAs if !modal => self.save_console_as(),
                 M::CloseTab if !modal && !self.consoles.is_empty() => self.close_console(self.active),
+                // In a console: find in the editor; elsewhere: filter the explorer.
                 M::Find => {
-                    self.show_explorer = true;
-                    self.explorer.show_filter = true;
+                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                        c.open_find(false);
+                    } else {
+                        self.show_explorer = true;
+                        self.explorer.show_filter = true;
+                    }
                 }
                 M::ToggleExplorer => self.show_explorer = !self.show_explorer,
                 M::ToggleResults => self.show_results = !self.show_results,
@@ -1495,7 +1682,14 @@ impl DataCraftApp {
                 M::Run if !modal => self.run_console(self.active, false),
                 M::RunAll if !modal => self.run_console(self.active, true),
                 M::SaveChanges if !modal => self.save_active_changes(),
-                M::Reload if !modal => self.reload_active(),
+                // ⌘R: reload in the data editor, replace in a console (like DataGrip).
+                M::Reload if !modal => {
+                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                        c.open_find(true);
+                    } else {
+                        self.reload_active();
+                    }
+                }
                 // No help website: shows the app info window.
                 M::Help => self.show_about = true,
                 _ => {}
@@ -1694,7 +1888,7 @@ impl DataCraftApp {
 
                 }
                 theme::Side::Right => {
-                ui.add_space(10.0);
+                ui.add_space(5.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let gear = theme::icon_button_sized(ui, Ico::Gear, true, tr("Settings"), 30.0);
                 egui::Popup::menu(&gear).show(|ui| {
@@ -1837,12 +2031,16 @@ impl DataCraftApp {
             if let Some(c) = console {
                 match &c.table {
                     Some(t) => {
-                        // SQLite: the "main" schema is the same as the database (the explorer omits it too).
-                        if conn.is_none_or(|x| x.cfg.driver != Driver::Sqlite) {
+                        // SQLite / MySQL: the schema is the same as the database (the explorer omits it too).
+                        if conn.is_none_or(|x| !x.cfg.driver.flat_schema()) {
                             crumbs.push((Some(Ico::Schema), t.schema.clone()));
                         }
-                        crumbs.push((Some(Ico::Folder), "tables".into()));
-                        crumbs.push((Some(Ico::Table), t.table.clone()));
+                        let is_view = c
+                            .conn
+                            .and_then(|id| self.table_info(id, c.db.as_deref(), &t.schema, &t.table))
+                            .is_some_and(|i| i.kind == crate::db::ObjectKind::View);
+                        crumbs.push((Some(Ico::Folder), if is_view { "views" } else { "tables" }.into()));
+                        crumbs.push((Some(if is_view { Ico::View } else { Ico::Table }), t.table.clone()));
                     }
                     None => crumbs.push((Some(Ico::Console), c.title.clone())),
                 }
@@ -1997,7 +2195,7 @@ impl DataCraftApp {
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 let more = theme::icon_button(ui, Ico::MoreVert, true, tr("Tabs"));
                 egui::Popup::menu(&more).show(|ui| {
                     if ui.add(egui::Button::new(tr("New console")).shortcut_text("⇧⌘N")).clicked() {
@@ -2142,6 +2340,16 @@ impl DataCraftApp {
             match a {
                 ConsoleAction::Run => self.run_console(idx, false),
                 ConsoleAction::RunAll => self.run_console(idx, true),
+                ConsoleAction::Cancel => {
+                    let console = self.consoles[idx].id;
+                    self.worker.send(Request::Cancel { console });
+                }
+                ConsoleAction::RunStatements(statements) => {
+                    let id = self.consoles[idx].id;
+                    if self.consoles[idx].table.is_none() && !self.consoles[idx].is_busy() && self.guard(Discard::Run(id, false)) {
+                        self.run_statements(idx, statements);
+                    }
+                }
                 ConsoleAction::Reload => {
                     if let Some(id) = self.consoles.get(idx).map(|c| c.id)
                         && self.guard(Discard::Reload(id))
@@ -2201,11 +2409,22 @@ impl DataCraftApp {
                             CreateTarget::Database => None,
                         };
                         let conn = d.conn;
-                        self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+                        self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: false });
                     }
                     Some(CreateResult::Cancel) => self.create = None,
                     None => {}
                 }
+            }
+        }
+
+        if let Some(d) = self.import.as_mut() {
+            match d.show(ctx) {
+                Some(ImportResult::Import(statements)) => {
+                    let (conn, db) = (d.conn, Some(d.db.clone()));
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: true });
+                }
+                Some(ImportResult::Cancel) => self.import = None,
+                None => {}
             }
         }
 
@@ -2217,9 +2436,9 @@ impl DataCraftApp {
                     let (conn, db, close_db) = match d.kind {
                         // Run from the connection's default database, never from the one being dropped.
                         DropKind::Database => (d.conn, None, Some(d.db.clone())),
-                        DropKind::Table | DropKind::View => (d.conn, Some(d.db.clone()), None),
+                        _ => (d.conn, Some(d.db.clone()), None),
                     };
-                    self.worker.send(Request::RunDdl { conn, db, statements, close_db });
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db, transaction: false });
                 }
                 Some(DropResult::Cancel) => self.drop = None,
                 None => {}
@@ -2314,7 +2533,7 @@ impl DataCraftApp {
                     ui.label(RichText::new("DataCraft").font(theme::bold(17.0)));
                     ui.label(RichText::new(trf("Version {version}", &[("version", &env!("CARGO_PKG_VERSION"))])).color(p.muted));
                     ui.add_space(8.0);
-                    ui.label(tr("Lightweight SQL client for PostgreSQL, SQL Server and SQLite."));
+                    ui.label(tr("Lightweight SQL client for PostgreSQL, MySQL, MariaDB, SQL Server, Oracle and SQLite."));
                     ui.label(RichText::new(tr("Made with Rust, egui and tokio")).small().color(p.muted));
                     ui.add_space(14.0);
                     theme::primary_button(ui, tr("Close")).clicked()
@@ -2450,12 +2669,63 @@ enum Generate {
     Ddl,
 }
 
+/// Demo mode against a server: `DATACRAFT_DEMO=<scheme>://user:password@host:port/database`
+/// with scheme `postgres`, `mysql`, `mariadb`, `sqlserver` or `oracle` (database = service).
+fn demo_server_config(id: u64, url: &str) -> Option<ConnectionConfig> {
+    let (scheme, rest) = url.split_once("://")?;
+    let driver = match scheme {
+        "postgres" | "postgresql" => Driver::Postgres,
+        "mysql" => Driver::MySql,
+        "mariadb" => Driver::MariaDb,
+        "sqlserver" | "mssql" => Driver::MsSql,
+        "oracle" => Driver::Oracle,
+        _ => return None,
+    };
+    let mut cfg = ConnectionConfig::new(id, driver);
+    let (auth, rest) = rest.rsplit_once('@')?;
+    let (user, password) = auth.split_once(':').unwrap_or((auth, ""));
+    let (hostport, db) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = hostport.rsplit_once(':').unwrap_or((hostport, ""));
+    cfg.user = user.to_string();
+    cfg.password = password.to_string();
+    cfg.host = host.to_string();
+    if let Ok(p) = port.parse() {
+        cfg.port = p;
+    }
+    if !db.is_empty() {
+        cfg.database = db.to_string();
+    }
+    cfg.name = format!("{}@{}", driver.label(), host);
+    Some(cfg)
+}
+
+/// true if the statement only reads (allowed on read-only connections). A `WITH` that
+/// contains a data-modifying statement (PostgreSQL) is not.
+fn is_query(statement: &str) -> bool {
+    let words: Vec<String> = statement
+        .lines()
+        .map(|l| l.split("--").next().unwrap_or(""))
+        .flat_map(|l| l.split(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    // `SELECT … INTO` creates tables (PG, SQL Server) or writes files (MySQL); `EXPLAIN ANALYZE`
+    // runs the statement.
+    let writes = |w: &String| matches!(w.as_str(), "insert" | "update" | "delete" | "merge" | "into" | "analyze" | "analyse");
+    match words.first().map(String::as_str) {
+        Some("select" | "show" | "explain" | "describe" | "desc" | "values" | "table" | "with") => !words.iter().any(writes),
+        // SQL Server's explain plan.
+        Some("set") => words.len() == 3 && words[1] == "showplan_text" && matches!(words[2].as_str(), "on" | "off"),
+        _ => false,
+    }
+}
+
 /// Data editor query with filters and the row limit in the SQL itself.
 pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str, order_by: &str, max_rows: usize) -> String {
     let t = Session::quote_table(driver, schema, table);
     let mut sql = match driver {
         Driver::MsSql => format!("SELECT TOP ({max_rows}) * FROM {t}"),
-        Driver::Postgres | Driver::Sqlite => format!("SELECT * FROM {t}"),
+        _ => format!("SELECT * FROM {t}"),
     };
     let w = where_clause.trim().trim_end_matches(';');
     if !w.is_empty() {
@@ -2465,10 +2735,12 @@ pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str
     if !o.is_empty() {
         sql.push_str(&format!(" ORDER BY {o}"));
     }
-    if driver != Driver::MsSql {
-        sql.push_str(&format!(" LIMIT {max_rows}"));
+    match driver {
+        Driver::MsSql => sql,
+        // ROWNUM instead of FETCH FIRST so it also works before 12c.
+        Driver::Oracle => format!("SELECT * FROM ({sql}) WHERE ROWNUM <= {max_rows}"),
+        _ => format!("{sql} LIMIT {max_rows}"),
     }
-    sql
 }
 
 /// Approximate DDL from the known column information.
@@ -2740,6 +3012,23 @@ mod tests {
     }
 
     #[test]
+    fn read_only_statements() {
+        assert!(is_query("select 1"));
+        assert!(is_query("  -- note\n SELECT * FROM t"));
+        assert!(is_query("with x as (select 1) select * from x"));
+        assert!(is_query("explain select 1"));
+        assert!(!is_query("explain analyze delete from t"));
+        assert!(!is_query("explain analyse delete from t"));
+        assert!(!is_query("select * into copy from t"));
+        assert!(is_query("SET SHOWPLAN_TEXT ON"));
+        assert!(!is_query("set ansi_nulls off"));
+        assert!(!is_query("with d as (delete from t returning *) select * from d"));
+        assert!(!is_query("update t set a = 1"));
+        assert!(!is_query("drop table t"));
+        assert!(!is_query(""));
+    }
+
+    #[test]
     fn table_query_limits_rows_per_dialect() {
         assert_eq!(table_query(Driver::Sqlite, "main", "users", "", "", 50), "SELECT * FROM \"users\" LIMIT 50");
         assert_eq!(
@@ -2750,5 +3039,10 @@ mod tests {
             table_query(Driver::MsSql, "dbo", "t", "x = 1", "", 5),
             "SELECT TOP (5) * FROM [dbo].[t] WHERE x = 1"
         );
+        assert_eq!(
+            table_query(Driver::Oracle, "HR", "T", "", "ID", 5),
+            "SELECT * FROM (SELECT * FROM \"HR\".\"T\" ORDER BY ID) WHERE ROWNUM <= 5"
+        );
+        assert_eq!(table_query(Driver::MySql, "shop", "t", "", "", 5), "SELECT * FROM `shop`.`t` LIMIT 5");
     }
 }

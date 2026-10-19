@@ -7,7 +7,7 @@ use crate::ui::editing::{EditState, EditTarget, RowRef};
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, pal};
 use egui::text::{CCursor, CCursorRange};
-use egui::{Color32, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2};
+use egui::{Color32, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_extras::{Column, TableBuilder};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -18,10 +18,39 @@ pub enum SortDir {
     Desc,
 }
 
-/// Local filter of a column (header funnel): original values that are shown.
+/// Local filter of a column (header funnel): the values checked in the list (`None` = all)
+/// and the text typed in the search box (case-insensitive substring).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ColumnFilter {
-    pub allowed: HashSet<Cell>,
+    pub allowed: Option<HashSet<Cell>>,
+    pub text: String,
+}
+
+impl ColumnFilter {
+    fn matches(&self, v: &Cell) -> bool {
+        self.allowed.as_ref().is_none_or(|a| a.contains(v)) && (self.text.is_empty() || matches_text(v, &self.text.to_lowercase()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.allowed.is_none() && self.text.is_empty()
+    }
+}
+
+/// Text shown for a value in the funnel list (also what the search box matches).
+fn value_label(v: &Cell) -> String {
+    match v {
+        None => "<null>".to_string(),
+        Some(s) if s.is_empty() => tr("<empty>").to_string(),
+        Some(s) => s.chars().take(80).collect(),
+    }
+}
+
+/// `needle` must already be lowercase. Matches the full value, not just the shown label.
+fn matches_text(v: &Cell, needle: &str) -> bool {
+    match v {
+        Some(s) if !s.is_empty() => s.to_lowercase().contains(needle),
+        _ => value_label(v).to_lowercase().contains(needle),
+    }
 }
 
 /// Funnel popup open on a column.
@@ -51,7 +80,7 @@ fn distinct_values(rows: &[Vec<Cell>], col: usize) -> Vec<(Cell, usize)> {
 /// Visible original rows: those passing every filter, in the requested order.
 fn compute_order(rows: &[Vec<Cell>], sort: Option<(usize, SortDir)>, filters: &BTreeMap<usize, ColumnFilter>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..rows.len())
-        .filter(|&r| filters.iter().all(|(c, f)| rows[r].get(*c).is_some_and(|v| f.allowed.contains(v))))
+        .filter(|&r| filters.iter().all(|(c, f)| rows[r].get(*c).is_some_and(|v| f.matches(v))))
         .collect();
     if let Some((c, dir)) = sort {
         order.sort_by(|&a, &b| {
@@ -98,6 +127,8 @@ pub struct ResultView {
     salt: u64,
     /// Some if the result is editable.
     pub edit: Option<EditSession>,
+    /// Visual row shown in the record view (the row as a vertical form).
+    record_view: Option<usize>,
     /// Why it is read-only (tooltip).
     pub readonly_reason: Option<String>,
     /// true once the app has decided whether it is editable.
@@ -121,6 +152,7 @@ impl ResultView {
             scroll_to: None,
             salt,
             edit: None,
+            record_view: None,
             readonly_reason: None,
             edit_checked: false,
         }
@@ -205,6 +237,33 @@ impl ResultView {
         let vr = base + i;
         let col = (0..n_cols).find(|&c| e.state.cell_editable(&self.rs, &e.target, RowRef::New(i), c)).unwrap_or(0);
         e.editing = Some(InlineEdit { row: RowRef::New(i), col, buffer: String::new(), focus: true });
+        self.selected = Some((vr, col));
+        self.selected_rows = BTreeSet::from([vr]);
+        self.anchor = Some(vr);
+        self.scroll_to = Some(vr);
+    }
+
+    /// Appends a copy of the selected row (DataGrip's "Clone Row"). The primary key and
+    /// binary columns are left to their defaults so the copy can be inserted.
+    pub fn clone_selected_row(&mut self) {
+        let Some(vr) = self.selected.map(|(r, _)| r).or_else(|| self.selected_rows.iter().next().copied()) else { return };
+        let Some(row) = self.row_ref(vr) else { return };
+        let n_cols = self.rs.columns.len();
+        let values: Vec<Option<Cell>> = (0..n_cols).map(|c| self.display_value(row, c)).collect();
+        let base = self.order.len();
+        let Some(e) = self.edit.as_mut() else { return };
+        e.editing = None;
+        let values = values
+            .into_iter()
+            .enumerate()
+            .map(|(c, v)| {
+                let skip = (e.target.has_pk && e.target.key_cols.contains(&c)) || e.target.binary_cols.get(c).copied().unwrap_or(false);
+                if skip { None } else { v }
+            })
+            .collect();
+        let i = e.state.add_row_with(values);
+        let vr = base + i;
+        let col = self.selected.map_or(0, |(_, c)| c);
         self.selected = Some((vr, col));
         self.selected_rows = BTreeSet::from([vr]);
         self.anchor = Some(vr);
@@ -578,6 +637,8 @@ enum GridAction {
     SetNull(RowRef, usize),
     Revert(RowRef, usize),
     DeleteRows,
+    CloneRow,
+    RecordView(usize),
     Copy(String),
 }
 
@@ -606,6 +667,7 @@ pub fn show_result(
     let mut actions: Vec<GridAction> = Vec::new();
     let editable = view.edit.is_some();
     demo_filter(view, area_rect);
+    demo_grid(view);
     let filters_active: Vec<usize> = view.filters.keys().copied().collect();
     let editing_now = view.edit.as_ref().is_some_and(|e| e.editing.is_some());
 
@@ -617,11 +679,17 @@ pub fn show_result(
         {
             ui.ctx().copy_text(view.display_value(row, c).flatten().unwrap_or_default());
         }
+        if let Some((r, _)) = view.selected
+            && ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter))
+        {
+            actions.push(GridAction::RecordView(r));
+        }
         if editable && let Some((r, c)) = view.selected {
-            let (edit_key, undo) = ui.input_mut(|i| {
+            let (edit_key, undo, clone) = ui.input_mut(|i| {
                 (
                     i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2),
                     i.consume_key(Modifiers::COMMAND, Key::Z),
+                    i.consume_key(Modifiers::COMMAND, Key::D),
                 )
             });
             if edit_key {
@@ -629,6 +697,9 @@ pub fn show_result(
             }
             if undo {
                 view.undo();
+            }
+            if clone {
+                actions.push(GridAction::CloneRow);
             }
         }
     }
@@ -902,7 +973,16 @@ pub fn show_result(
                                     actions.push(GridAction::DeleteRows);
                                     ui.close();
                                 }
+                                if ui.add(egui::Button::new(tr("Clone Row")).shortcut_text("⌘D")).clicked() {
+                                    actions.push(GridAction::Select { vr, col: Some(c), mods: Modifiers::NONE });
+                                    actions.push(GridAction::CloneRow);
+                                    ui.close();
+                                }
                                 ui.separator();
+                            }
+                            if ui.add(egui::Button::new(tr("Record View")).shortcut_text("⇧↩")).clicked() {
+                                actions.push(GridAction::RecordView(vr));
+                                ui.close();
                             }
                             if ui.button(tr("Copy value")).clicked() {
                                 actions.push(GridAction::Copy(value.clone().flatten().unwrap_or_default()));
@@ -934,7 +1014,8 @@ pub fn show_result(
     for a in actions {
         match a {
             GridAction::OpenFilter(c, anchor) => {
-                view.filter_popup = Some(FilterPopup { col: c, anchor, search: String::new(), values: distinct_values(&view.rs.rows, c), just_opened: true });
+                let search = view.filters.get(&c).map(|f| f.text.clone()).unwrap_or_default();
+                view.filter_popup = Some(FilterPopup { col: c, anchor, search, values: distinct_values(&view.rs.rows, c), just_opened: true });
             }
             GridAction::Sort(c) => {
                 view.toggle_sort(c);
@@ -988,10 +1069,90 @@ pub fn show_result(
                 }
             }
             GridAction::DeleteRows => view.delete_selected(),
+            GridAction::CloneRow => view.clone_selected_row(),
+            GridAction::RecordView(vr) => view.record_view = Some(vr),
             GridAction::Copy(t) => ui.ctx().copy_text(t),
         }
     }
+    record_view_ui(ui, view, columns_info);
     error
+}
+
+/// Record view: the row as a vertical list of column / value, with previous / next.
+fn record_view_ui(ui: &Ui, view: &mut ResultView, columns_info: Option<&[ColumnInfo]>) {
+    let Some(vr) = view.record_view else { return };
+    let n = view.n_view_rows();
+    let Some(row) = view.row_ref(vr) else {
+        view.record_view = None;
+        return;
+    };
+    let p = pal(ui);
+    let mut open = true;
+    let mut go: Option<usize> = None;
+    let values: Vec<Cell> = (0..view.rs.columns.len()).map(|c| view.display_value(row, c).flatten()).collect();
+    egui::Window::new(tr("Record View"))
+        .id(egui::Id::new(("record_view", view.salt)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(460.0)
+        .default_height(380.0)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ui.ctx().content_rect().center())
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                if theme::icon_button(ui, Ico::ChevronLeft, vr > 0, tr("Previous row")).clicked() {
+                    go = Some(vr - 1);
+                }
+                if theme::icon_button(ui, Ico::ChevronRight, vr + 1 < n, tr("Next row")).clicked() {
+                    go = Some(vr + 1);
+                }
+                ui.label(RichText::new(trf("Row {n} of {total}", &[("n", &(vr + 1)), ("total", &n)])).color(p.muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(tr("Copy row with headers")).clicked() {
+                        let text = view.rs.columns.iter().zip(&values).map(|(c, v)| format!("{c}\t{}", v.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n");
+                        ui.ctx().copy_text(text);
+                    }
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let label_w = 150.0;
+                for (c, name) in view.rs.columns.iter().enumerate() {
+                    let info = columns_info.and_then(|cols| cols.iter().find(|x| x.name == *name));
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(vec2(label_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_width(label_w);
+                            ui.add(egui::Label::new(RichText::new(name).strong().color(p.text)).truncate());
+                            if let Some(info) = info {
+                                ui.label(RichText::new(info.data_type.to_lowercase()).small().color(p.muted));
+                            }
+                        });
+                        let text = match &values[c] {
+                            None => RichText::new("<null>").monospace().color(p.muted),
+                            Some(v) => RichText::new(v).monospace().color(p.text),
+                        };
+                        let resp = ui.add(egui::Label::new(text).wrap().sense(egui::Sense::click()));
+                        resp.context_menu(|ui| {
+                            if ui.button(tr("Copy value")).clicked() {
+                                ui.ctx().copy_text(values[c].clone().unwrap_or_default());
+                                ui.close();
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+        });
+    if let Some(r) = go {
+        view.record_view = Some(r);
+        view.selected = Some((r, view.selected.map_or(0, |(_, c)| c)));
+        view.selected_rows = BTreeSet::from([r]);
+        view.scroll_to = Some(r);
+    }
+    if !open || ui.input(|i| i.key_pressed(Key::Escape)) {
+        view.record_view = None;
+    }
 }
 
 fn ui_mods(resp: &egui::Response) -> Modifiers {
@@ -1045,20 +1206,43 @@ pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -
 
 /// Demo mode (`DATACRAFT_DEMO_FILTER=<column>`): opens that column's funnel and unchecks
 /// its first value, to capture the filter without interacting with the app.
+/// `<column>=<text>` types that text in the search box instead.
 fn demo_filter(view: &mut ResultView, area: Rect) {
     if view.filters.is_empty()
         && view.filter_popup.is_none()
-        && let Ok(col_name) = std::env::var("DATACRAFT_DEMO_FILTER")
-        && let Some(c) = view.rs.columns.iter().position(|n| *n == col_name)
+        && let Ok(spec) = std::env::var("DATACRAFT_DEMO_FILTER")
+        && let (col_name, text) = spec.split_once('=').unwrap_or((spec.as_str(), ""))
+        && let Some(c) = view.rs.columns.iter().position(|n| n == col_name)
     {
         let values = distinct_values(&view.rs.rows, c);
-        let mut allowed: HashSet<Cell> = values.iter().map(|(v, _)| v.clone()).collect();
-        if let Some((first, _)) = values.first() {
-            allowed.remove(first);
-        }
-        view.set_filter(c, Some(ColumnFilter { allowed }));
+        let filter = if text.is_empty() {
+            let mut allowed: HashSet<Cell> = values.iter().map(|(v, _)| v.clone()).collect();
+            if let Some((first, _)) = values.first() {
+                allowed.remove(first);
+            }
+            ColumnFilter { allowed: Some(allowed), text: String::new() }
+        } else {
+            ColumnFilter { allowed: None, text: text.to_string() }
+        };
+        view.set_filter(c, Some(filter));
         let anchor = area.left_top() + egui::vec2(120.0 * c as f32 + 60.0, 30.0);
-        view.filter_popup = Some(FilterPopup { col: c, anchor, search: String::new(), values, just_opened: true });
+        view.filter_popup = Some(FilterPopup { col: c, anchor, search: text.to_string(), values, just_opened: true });
+    }
+}
+
+/// Demo mode (`DATACRAFT_DEMO_GRID=record|clone`): opens the record view of the first row,
+/// or clones it (in memory, never saved), once per run.
+fn demo_grid(view: &mut ResultView) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(mode) = std::env::var("DATACRAFT_DEMO_GRID") else { return };
+    if view.rs.rows.is_empty() || (mode == "clone" && view.edit.is_none()) || DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    view.selected = Some((0, 1.min(view.rs.columns.len().saturating_sub(1))));
+    match mode.as_str() {
+        "record" => view.record_view = Some(0),
+        "clone" => view.clone_selected_row(),
+        _ => {}
     }
 }
 
@@ -1071,6 +1255,7 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
     let mut new_filter: Option<Option<ColumnFilter>> = None;
     let mut close = ui.input(|i| i.key_pressed(Key::Escape));
     let col_name = view.rs.columns.get(col).cloned().unwrap_or_default();
+    let all_values = || popup.values.iter().map(|(v, _)| v.clone()).collect::<HashSet<Cell>>();
     let area = egui::Area::new(egui::Id::new(("col_filter", view.salt)))
         .order(egui::Order::Foreground)
         .fixed_pos(popup.anchor + egui::vec2(0.0, 4.0))
@@ -1083,34 +1268,40 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut popup.search).hint_text(tr("Search value…")).desired_width(f32::INFINITY),
                 );
-                if search.gained_focus() || ui.memory(|m| m.focused().is_none()) {
+                if popup.just_opened || ui.memory(|m| m.focused().is_none()) {
                     search.request_focus();
                 }
-                let needle = popup.search.to_lowercase();
-                let label_of = |v: &Cell| match v {
-                    None => "<null>".to_string(),
-                    Some(s) if s.is_empty() => tr("<empty>").to_string(),
-                    Some(s) => s.chars().take(80).collect(),
-                };
+                // The typed text filters the grid as well as the list.
+                if search.changed() {
+                    let mut f = current.clone().unwrap_or_default();
+                    f.text = popup.search.trim().to_string();
+                    new_filter = Some(Some(f));
+                }
+                let needle = popup.search.trim().to_lowercase();
                 let shown: Vec<usize> = popup
                     .values
                     .iter()
                     .enumerate()
-                    .filter(|(_, (v, _))| needle.is_empty() || label_of(v).to_lowercase().contains(&needle))
+                    .filter(|(_, (v, _))| needle.is_empty() || matches_text(v, &needle))
                     .map(|(i, _)| i)
                     .collect();
+                let base = new_filter.clone().flatten().or_else(|| current.clone()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     if ui.small_button(tr("All")).clicked() {
-                        let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
-                        allowed.extend(shown.iter().map(|&i| popup.values[i].0.clone()));
-                        new_filter = Some(Some(ColumnFilter { allowed }));
+                        let mut f = base.clone();
+                        if let Some(a) = f.allowed.as_mut() {
+                            a.extend(shown.iter().map(|&i| popup.values[i].0.clone()));
+                        }
+                        new_filter = Some(Some(f));
                     }
                     if ui.small_button(tr("None")).clicked() {
-                        let mut allowed = current.clone().map(|f| f.allowed).unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
+                        let mut f = base.clone();
+                        let mut allowed = f.allowed.take().unwrap_or_else(all_values);
                         for &i in &shown {
                             allowed.remove(&popup.values[i].0);
                         }
-                        new_filter = Some(Some(ColumnFilter { allowed }));
+                        f.allowed = Some(allowed);
+                        new_filter = Some(Some(f));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(current.is_some(), egui::Button::new(tr("Remove filter")).small()).clicked() {
@@ -1127,20 +1318,19 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                     |ui, range| {
                         for &i in &shown[range] {
                             let (value, count) = &popup.values[i];
-                            let mut on = current.as_ref().is_none_or(|f| f.allowed.contains(value));
-                            let text = RichText::new(label_of(value)).monospace().color(if value.is_none() { p.muted } else { p.text });
+                            let mut on = base.allowed.as_ref().is_none_or(|a| a.contains(value));
+                            let text = RichText::new(value_label(value)).monospace().color(if value.is_none() { p.muted } else { p.text });
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut on, text).changed() {
-                                    let mut allowed = current
-                                        .clone()
-                                        .map(|f| f.allowed)
-                                        .unwrap_or_else(|| popup.values.iter().map(|(v, _)| v.clone()).collect());
+                                    let mut f = base.clone();
+                                    let mut allowed = f.allowed.take().unwrap_or_else(all_values);
                                     if on {
                                         allowed.insert(value.clone());
                                     } else {
                                         allowed.remove(value);
                                     }
-                                    new_filter = Some(Some(ColumnFilter { allowed }));
+                                    f.allowed = Some(allowed);
+                                    new_filter = Some(Some(f));
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.label(RichText::new(count.to_string()).small().color(p.muted));
@@ -1152,6 +1342,9 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
                 if shown.is_empty() {
                     ui.label(RichText::new(tr("No matches")).color(p.muted));
                 }
+                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                    close = true;
+                }
             });
         });
     let just_opened = std::mem::take(&mut popup.just_opened);
@@ -1159,14 +1352,23 @@ fn filter_popup_ui(ui: &Ui, view: &mut ResultView) {
         close = true;
     }
     if let Some(f) = new_filter {
-        // If every value is checked, the filter is redundant.
-        let total = view.filter_popup.as_ref().map_or(0, |p| p.values.len());
-        let f = f.filter(|f| f.allowed.len() < total || view.filter_popup.as_ref().is_some_and(|p| p.values.iter().any(|(v, _)| !f.allowed.contains(v))));
-        view.set_filter(col, f);
+        // A filter that checks every value and has no text is redundant.
+        let total = all_values_of(view);
+        let f = f.map(|mut f| {
+            if f.allowed.as_ref().is_some_and(|a| total.iter().all(|v| a.contains(v))) {
+                f.allowed = None;
+            }
+            f
+        });
+        view.set_filter(col, f.filter(|f| !f.is_empty()));
     }
     if close {
         view.filter_popup = None;
     }
+}
+
+fn all_values_of(view: &ResultView) -> Vec<Cell> {
+    view.filter_popup.as_ref().map(|p| p.values.iter().map(|(v, _)| v.clone()).collect()).unwrap_or_default()
 }
 
 /// Floating pill centred at the bottom of the grid: "N rows ⌄  ⋮".
@@ -1296,10 +1498,23 @@ mod filter_tests {
     #[test]
     fn combined_filter_and_sort() {
         let mut filters = BTreeMap::new();
-        filters.insert(1, ColumnFilter { allowed: HashSet::from([Some("b".to_string()), None]) });
+        filters.insert(1, ColumnFilter { allowed: Some(HashSet::from([Some("b".to_string()), None])), text: String::new() });
         assert_eq!(compute_order(&rows(), None, &filters), vec![0, 1, 3]);
         assert_eq!(compute_order(&rows(), Some((0, SortDir::Desc)), &filters), vec![1, 3, 0]);
         assert_eq!(compute_order(&rows(), None, &BTreeMap::new()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn text_filter_hides_rows() {
+        let mut filters = BTreeMap::new();
+        filters.insert(1, ColumnFilter { allowed: None, text: "B".into() });
+        assert_eq!(compute_order(&rows(), None, &filters), vec![0, 3]);
+        filters.insert(1, ColumnFilter { allowed: None, text: "null".into() });
+        assert_eq!(compute_order(&rows(), None, &filters), vec![1]);
+        // Text and checked values combine.
+        filters.insert(0, ColumnFilter { allowed: Some(HashSet::from([Some("2".to_string())])), text: String::new() });
+        filters.insert(1, ColumnFilter { allowed: None, text: "b".into() });
+        assert_eq!(compute_order(&rows(), None, &filters), vec![3]);
     }
 }
 

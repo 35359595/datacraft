@@ -67,7 +67,8 @@ impl ConnectionDialog {
         }
         match self.cfg.driver {
             Driver::Sqlite if self.cfg.file_path.trim().is_empty() => Err(tr("Specify the database file").into()),
-            Driver::Postgres | Driver::MsSql if self.cfg.host.trim().is_empty() => Err(tr("Host is required").into()),
+            Driver::Sqlite => Ok(()),
+            _ if self.cfg.host.trim().is_empty() => Err(tr("Host is required").into()),
             _ => Ok(()),
         }
     }
@@ -188,7 +189,7 @@ impl ConnectionDialog {
                     });
                     ui.end_row();
                 }
-                Driver::Postgres | Driver::MsSql => {
+                _ => {
                     ui.label("Host:");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.host).margin(egui::vec2(8.0, 5.0)).desired_width(250.0));
@@ -197,7 +198,7 @@ impl ConnectionDialog {
                     });
                     ui.end_row();
 
-                    ui.label(tr("Database:"));
+                    ui.label(if self.cfg.driver == Driver::Oracle { tr("Service:") } else { tr("Database:") });
                     ui.add(egui::TextEdit::singleline(&mut self.cfg.database).margin(egui::vec2(8.0, 5.0)).desired_width(f32::INFINITY));
                     ui.end_row();
 
@@ -216,6 +217,10 @@ impl ConnectionDialog {
                     }
                 }
             }
+            ui.label("");
+            ui.checkbox(&mut self.cfg.read_only, tr("Read-only"))
+                .on_hover_text(tr("Only queries can run; the data editor and the create, drop and rename actions are disabled"));
+            ui.end_row();
         });
     }
 

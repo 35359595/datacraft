@@ -4,6 +4,7 @@ pub mod connection_dialog;
 pub mod console;
 pub mod create_dialog;
 pub mod drop_dialog;
+pub mod import_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;
@@ -57,10 +58,7 @@ pub fn byte_to_char(text: &str, byte_idx: usize) -> usize {
 
 /// Quotes an identifier for the dialect.
 pub fn quote_ident(driver: Driver, name: &str) -> String {
-    match driver {
-        Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
-        Driver::Postgres | Driver::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
+    driver.quote_ident(name)
 }
 
 /// Quotes only when needed (simple lowercase identifiers are left as is).
@@ -68,6 +66,8 @@ pub fn quote_ident_if_needed(driver: Driver, name: &str) -> String {
     let simple = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && (driver != Driver::Postgres || !name.chars().any(|c| c.is_ascii_uppercase()))
+        // Oracle folds unquoted names to uppercase and they must start with a letter.
+        && (driver != Driver::Oracle || (!name.chars().any(|c| c.is_ascii_lowercase()) && !name.starts_with('_')))
         && !crate::sql::KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(name));
     if simple { name.to_string() } else { quote_ident(driver, name) }
 }

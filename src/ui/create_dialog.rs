@@ -55,6 +55,14 @@ fn common_types(driver: Driver) -> &'static [&'static str] {
             "nvarchar(max)", "varchar(255)", "date", "datetime2", "uniqueidentifier", "varbinary(max)",
         ],
         Driver::Sqlite => &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", "BOOLEAN", "DATE", "DATETIME"],
+        Driver::MySql | Driver::MariaDb => &[
+            "int", "bigint", "smallint", "tinyint", "decimal(10,2)", "double", "boolean", "varchar(255)", "text",
+            "longtext", "date", "datetime", "timestamp", "json", "blob",
+        ],
+        Driver::Oracle => &[
+            "number", "number(10)", "number(10,2)", "binary_double", "varchar2(255)", "nvarchar2(255)", "char(1)",
+            "clob", "date", "timestamp", "blob", "raw(16)",
+        ],
     }
 }
 
@@ -64,6 +72,8 @@ pub fn default_schema(driver: Driver) -> &'static str {
         Driver::Postgres => "public",
         Driver::MsSql => "dbo",
         Driver::Sqlite => "main",
+        // MySQL: the database itself; Oracle: the connected user (filled in by the caller).
+        Driver::MySql | Driver::MariaDb | Driver::Oracle => "",
     }
 }
 
@@ -72,6 +82,8 @@ fn id_column(driver: Driver) -> NewColumn {
         Driver::Postgres => "integer",
         Driver::MsSql => "int",
         Driver::Sqlite => "INTEGER",
+        Driver::MySql | Driver::MariaDb => "int",
+        Driver::Oracle => "number(10)",
     };
     NewColumn { name: "id".into(), data_type: data_type.into(), not_null: true, primary_key: true, default: String::new() }
 }
@@ -133,7 +145,7 @@ impl CreateDialog {
         }
     }
 
-    fn sql(&self) -> String {
+    pub fn sql(&self) -> String {
         match &self.target {
             CreateTarget::Database => create_database_sql(self.driver, &self.name),
             CreateTarget::Table { schema, .. } => create_table_sql(self.driver, schema, &self.name, &self.columns),
@@ -241,7 +253,7 @@ impl CreateDialog {
             }
             ui.end_row();
             if let CreateTarget::Table { schema, .. } = &mut self.target
-                && driver != Driver::Sqlite
+                && !driver.flat_schema()
             {
                 ui.label(tr("Schema:"));
                 if schemas.is_empty() {
