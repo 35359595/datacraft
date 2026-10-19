@@ -4,10 +4,15 @@ DataGrip-style database client for macOS (Islands theme), written in Rust with e
 
 ![DataCraft table data editor](docs/screenshots/table-editor.png)
 
-- **Engines:** PostgreSQL, SQL Server and SQLite.
+- **Engines:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle and SQLite. Oracle needs the
+  [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) installed.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
 - **SQL consoles:** highlighting, autocompletion, ⌘↩ (statement under the cursor or selection) and ⌘⇧↩ (everything; `GO` batches on SQL Server). Each console runs against the database you pick.
-- **Table data editor:** WHERE / ORDER BY filters, per-column value filters, in-place editing (update, insert, delete rows) with a preview of the generated SQL, saved in a single transaction.
+  Reformat code (⌥⌘L), comment lines (⌘/), duplicate / delete line, find and replace, query history (⌥⌘E),
+  explain plan (⇧⌘E) and cancel the running query.
+- **Table data editor:** WHERE / ORDER BY filters, per-column value and text filters, in-place editing (update, insert, delete, clone rows) with a preview of the generated SQL, saved in a single transaction. Record view (⇧↩).
+- **Database objects:** create, rename, truncate and drop databases and tables; import CSV / TSV files into a table.
+- **Read-only data sources:** only queries run; editing and DDL are disabled.
 - **Export:** results to CSV, TSV, JSON, SQL `INSERT`s or Markdown, to the clipboard or a file.
 - **Zoom:** IDE zoom (⌘+ / ⌘− / ⌘0) and editor font size (⌥⌘+ / ⌥⌘−).
 - **Native macOS menu bar** with the usual shortcuts.
@@ -48,8 +53,8 @@ cargo test
 scripts/test_mssql.sh <host>   # real SQL Server (non-destructive: only #temp tables), asks for the password
 ```
 
-The PostgreSQL live tests run with `cargo test -- --ignored` and the `DATACRAFT_PG_*` variables
-(see `src/db/postgres.rs`).
+The live tests run with `cargo test -- --ignored` and the `DATACRAFT_PG_*`, `DATACRAFT_MY_*` and
+`DATACRAFT_ORA_*` variables (see `src/db/postgres.rs`, `src/db/mysql.rs` and `src/db/oracle.rs`).
 
 Demo mode for screenshots: `DATACRAFT_DEMO=path.db cargo run` (see the header of `src/app.rs`).
 
@@ -62,10 +67,15 @@ Bundled fonts keep their own open license (SIL OFL 1.1); see [assets/fonts/READM
 
 Cliente de bases de datos para macOS al estilo de DataGrip (tema Islands), escrito en Rust con egui.
 
-- **Motores:** PostgreSQL, SQL Server y SQLite.
+- **Motores:** PostgreSQL, MySQL, MariaDB, SQL Server, Oracle y SQLite. Oracle requiere tener instalado el
+  [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html).
 - **Database Explorer:** todas las bases del servidor (se cargan al expandirlas), esquemas, tablas, vistas, columnas y claves primarias.
 - **Consolas SQL:** resaltado, autocompletado, ⌘↩ (sentencia bajo el cursor o selección) y ⌘⇧↩ (todo; lotes `GO` en SQL Server). Cada consola ejecuta en la base que elijas.
-- **Editor de datos de tabla:** filtros WHERE / ORDER BY, filtros de valores por columna, edición en el sitio (modificar, insertar y borrar filas) con vista previa del SQL generado, que se guarda en una sola transacción.
+  Formatear código (⌥⌘L), comentar líneas (⌘/), duplicar / borrar línea, buscar y reemplazar, historial de consultas (⌥⌘E),
+  plan de ejecución (⇧⌘E) y cancelar la consulta en curso.
+- **Editor de datos de tabla:** filtros WHERE / ORDER BY, filtros de valores y de texto por columna, edición en el sitio (modificar, insertar, borrar y clonar filas) con vista previa del SQL generado, que se guarda en una sola transacción. Vista de registro (⇧↩).
+- **Objetos de la base:** crear, renombrar, vaciar y eliminar bases de datos y tablas; importar ficheros CSV / TSV a una tabla.
+- **Data sources de solo lectura:** solo se ejecutan consultas; la edición y el DDL quedan desactivados.
 - **Exportación:** resultados a CSV, TSV, JSON, `INSERT`s SQL o Markdown, al portapapeles o a un fichero.
 - **Zoom:** zoom del IDE (⌘+ / ⌘− / ⌘0) y tamaño de fuente del editor (⌥⌘+ / ⌥⌘−).
 - **Menú nativo de macOS** con los atajos habituales.
@@ -102,8 +112,8 @@ cargo test
 scripts/test_mssql.sh <host>   # SQL Server real (no destructivo: solo tablas #temp), pide la contraseña
 ```
 
-Los tests en vivo de PostgreSQL se ejecutan con `cargo test -- --ignored` y las variables
-`DATACRAFT_PG_*` (ver `src/db/postgres.rs`).
+Los tests en vivo se ejecutan con `cargo test -- --ignored` y las variables `DATACRAFT_PG_*`,
+`DATACRAFT_MY_*` y `DATACRAFT_ORA_*` (ver `src/db/postgres.rs`, `src/db/mysql.rs` y `src/db/oracle.rs`).
 
 Modo demo para capturas: `DATACRAFT_DEMO=ruta.db cargo run` (ver la cabecera de `src/app.rs`).
 

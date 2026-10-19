@@ -90,7 +90,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Running again will discard the pending grid changes.", "Al volver a ejecutar se perderán los cambios pendientes del grid."),
     ("Discard", "Descartar"),
     ("Version {version}", "Versión {version}"),
-    ("Lightweight SQL client for PostgreSQL, SQL Server and SQLite.", "Cliente SQL ligero para PostgreSQL, SQL Server y SQLite."),
+    ("Lightweight SQL client for PostgreSQL, MySQL, MariaDB, SQL Server, Oracle and SQLite.", "Cliente SQL ligero para PostgreSQL, MySQL, MariaDB, SQL Server, Oracle y SQLite."),
     ("Made with Rust, egui and tokio", "Hecho con Rust, egui y tokio"),
     ("Max rows per query:", "Máx. filas por consulta:"),
     ("Copy SQL", "Copiar SQL"),
