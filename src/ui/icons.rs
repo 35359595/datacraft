@@ -337,5 +337,8 @@ pub fn driver_color(driver: Driver, p: &Palette) -> Color32 {
         Driver::Postgres => p.db_icon,
         Driver::MsSql => Color32::from_rgb(0xC9, 0x46, 0x46),
         Driver::Sqlite => Color32::from_rgb(0x3F, 0x9B, 0xD8),
+        Driver::MySql => Color32::from_rgb(0x00, 0x75, 0x8F),
+        Driver::MariaDb => Color32::from_rgb(0xC0, 0x76, 0x5A),
+        Driver::Oracle => Color32::from_rgb(0xC7, 0x46, 0x34),
     }
 }

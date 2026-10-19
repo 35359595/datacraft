@@ -16,10 +16,7 @@ pub enum Change {
 
 /// Identifier quoted for the dialect.
 pub fn quote_ident(driver: Driver, name: &str) -> String {
-    match driver {
-        Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
-        Driver::Postgres | Driver::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
+    driver.quote_ident(name)
 }
 
 /// SQL literal for a value. `None` = NULL. SQL Server uses `N'..'` so Unicode isn't lost.
@@ -30,7 +27,9 @@ pub fn literal(driver: Driver, value: &Cell) -> String {
             let escaped = v.replace('\'', "''");
             match driver {
                 Driver::MsSql => format!("N'{escaped}'"),
-                Driver::Postgres | Driver::Sqlite => format!("'{escaped}'"),
+                // MySQL also treats a backslash as an escape inside strings.
+                Driver::MySql | Driver::MariaDb => format!("'{}'", escaped.replace('\\', "\\\\")),
+                Driver::Postgres | Driver::Sqlite | Driver::Oracle => format!("'{escaped}'"),
             }
         }
     }

@@ -76,10 +76,10 @@ pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<State
 /// Fragments to send to the server when running a whole script or a selection.
 /// SQL Server: batches separated only by `GO` (a `DECLARE` or a `BEGIN…END` with `;` stay together).
 /// SQLite: the whole script (the driver already walks it statement by statement, honoring triggers).
-/// PostgreSQL: statements by `;` (dollar-quoting protects function bodies).
+/// PostgreSQL, MySQL and Oracle: statements by `;` (dollar-quoting protects PG function bodies).
 pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
     match driver {
-        Driver::Postgres => split_statements(script, driver),
+        Driver::Postgres | Driver::MySql | Driver::MariaDb | Driver::Oracle => split_statements(script, driver),
         Driver::MsSql | Driver::Sqlite => {
             let dialect = Dialect::for_driver(driver);
             let mut out = Vec::new();
@@ -510,6 +510,22 @@ impl Dialect {
                 nested_comments: false,
                 tsql_names: true,
                 go_separator: true,
+            },
+            Driver::MySql | Driver::MariaDb => Dialect {
+                brackets: false,
+                backticks: true,
+                dollar_quotes: false,
+                nested_comments: false,
+                tsql_names: false,
+                go_separator: false,
+            },
+            Driver::Oracle => Dialect {
+                brackets: false,
+                backticks: false,
+                dollar_quotes: false,
+                nested_comments: false,
+                tsql_names: false,
+                go_separator: false,
             },
         }
     }

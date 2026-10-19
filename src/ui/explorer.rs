@@ -2,7 +2,7 @@
 //! (Islands style).
 
 use crate::app::{ConnState, ConnStatus};
-use crate::db::{DatabaseInfo, Driver, ObjectKind, SchemaInfo, TableInfo};
+use crate::db::{DatabaseInfo, ObjectKind, SchemaInfo, TableInfo};
 use crate::i18n::tr;
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, pal};
@@ -247,7 +247,7 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
                 actions.push(ExplorerAction::NewConnection);
                 ui.close();
             }
-            let can_db = connected && sel_driver.is_some_and(|d| d != Driver::Sqlite);
+            let can_db = connected && sel_driver.is_some_and(|d| d.has_databases());
             if ui.add_enabled(can_db, egui::Button::new(tr("New Database…"))).clicked()
                 && let Some(id) = sel_conn
             {
@@ -440,7 +440,7 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
             ui.close();
         }
         ui.separator();
-        if c.cfg.driver != Driver::Sqlite && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+        if c.cfg.driver.has_databases() && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
             actions.push(ExplorerAction::NewDatabase(id));
             ui.close();
         }
@@ -502,15 +502,15 @@ fn database_rows(
     let dkey = format!("d:{id}:{}", d.name);
     let open = state.expanded.contains(&dkey) || (filtering && has_match);
     let loading = c.loading.contains(&d.name);
-    let sqlite = c.cfg.driver == Driver::Sqlite;
-    // SQLite: a single "main" schema, same as the database; its tables are shown directly.
-    let flat = sqlite && d.schemas.as_ref().is_some_and(|ss| ss.len() == 1);
+    let multi_db = c.cfg.driver.has_databases();
+    // SQLite ("main") and MySQL (the database itself): a single schema; its tables are shown directly.
+    let flat = c.cfg.driver.flat_schema() && d.schemas.as_ref().is_some_and(|ss| ss.len() == 1);
     let badge = d.schemas.as_ref().map(|ss| {
         if flat { ss.iter().map(|s| s.tables.len()).sum::<usize>().to_string() } else { ss.len().to_string() }
     });
     let detail = if loading {
         Some((tr("loading…"), p.muted))
-    } else if d.current && !sqlite {
+    } else if d.current && multi_db {
         Some((tr("default"), p.muted))
     } else {
         None
@@ -548,7 +548,7 @@ fn database_rows(
             actions.push(ExplorerAction::NewTable { conn: id, db: db_name.clone(), schema: None });
             ui.close();
         }
-        if !sqlite && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+        if multi_db && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
             actions.push(ExplorerAction::NewDatabase(id));
             ui.close();
         }
@@ -561,7 +561,7 @@ fn database_rows(
             ui.ctx().copy_text(db_name.clone());
             ui.close();
         }
-        if !sqlite {
+        if multi_db {
             ui.separator();
             // The connection's default database cannot be dropped from its own session.
             let btn = egui::Button::new(RichText::new(tr("Drop…")).color(p.error));

@@ -4,6 +4,8 @@
 //! know each engine's native types.
 
 pub mod mssql;
+pub mod mysql;
+pub mod oracle;
 pub mod postgres;
 pub mod sqlite;
 
@@ -15,16 +17,22 @@ pub enum Driver {
     Postgres,
     Sqlite,
     MsSql,
+    MySql,
+    MariaDb,
+    Oracle,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 3] = [Driver::Postgres, Driver::MsSql, Driver::Sqlite];
+    pub const ALL: [Driver; 6] = [Driver::Postgres, Driver::MySql, Driver::MariaDb, Driver::MsSql, Driver::Oracle, Driver::Sqlite];
 
     pub fn label(self) -> &'static str {
         match self {
             Driver::Postgres => "PostgreSQL",
             Driver::Sqlite => "SQLite",
             Driver::MsSql => "SQL Server",
+            Driver::MySql => "MySQL",
+            Driver::MariaDb => "MariaDB",
+            Driver::Oracle => "Oracle",
         }
     }
 
@@ -32,7 +40,29 @@ impl Driver {
         match self {
             Driver::Postgres => 5432,
             Driver::MsSql => 1433,
+            Driver::MySql | Driver::MariaDb => 3306,
+            Driver::Oracle => 1521,
             Driver::Sqlite => 0,
+        }
+    }
+
+    /// Engines where each database has a single schema with its own name (SQLite: "main"),
+    /// shown flattened in the explorer.
+    pub fn flat_schema(self) -> bool {
+        matches!(self, Driver::Sqlite | Driver::MySql | Driver::MariaDb)
+    }
+
+    /// Engines whose server has several databases that can be created and dropped from the app.
+    pub fn has_databases(self) -> bool {
+        !matches!(self, Driver::Sqlite | Driver::Oracle)
+    }
+
+    /// Identifier quoted for the dialect.
+    pub fn quote_ident(self, name: &str) -> String {
+        match self {
+            Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
+            Driver::MySql | Driver::MariaDb => format!("`{}`", name.replace('`', "``")),
+            Driver::Postgres | Driver::Sqlite | Driver::Oracle => format!("\"{}\"", name.replace('"', "\"\"")),
         }
     }
 }
@@ -74,11 +104,15 @@ impl ConnectionConfig {
             database: match driver {
                 Driver::Postgres => "postgres".into(),
                 Driver::MsSql => "master".into(),
-                Driver::Sqlite => String::new(),
+                // Oracle: service name of the pluggable database.
+                Driver::Oracle => "FREEPDB1".into(),
+                Driver::Sqlite | Driver::MySql | Driver::MariaDb => String::new(),
             },
             user: match driver {
                 Driver::Postgres => "postgres".into(),
                 Driver::MsSql => "sa".into(),
+                Driver::MySql | Driver::MariaDb => "root".into(),
+                Driver::Oracle => "system".into(),
                 Driver::Sqlite => String::new(),
             },
             password: String::new(),
@@ -161,6 +195,9 @@ pub enum Session {
     Postgres(postgres::PgSession),
     Sqlite(sqlite::SqliteSession),
     MsSql(Box<mssql::MsSession>),
+    /// MySQL and MariaDB.
+    MySql(Box<mysql::MySession>),
+    Oracle(Box<oracle::OraSession>),
 }
 
 impl Session {
@@ -169,6 +206,8 @@ impl Session {
             Driver::Postgres => Session::Postgres(postgres::PgSession::connect(cfg).await?),
             Driver::Sqlite => Session::Sqlite(sqlite::SqliteSession::connect(cfg).await?),
             Driver::MsSql => Session::MsSql(Box::new(mssql::MsSession::connect(cfg).await?)),
+            Driver::MySql | Driver::MariaDb => Session::MySql(Box::new(mysql::MySession::connect(cfg).await?)),
+            Driver::Oracle => Session::Oracle(Box::new(oracle::OraSession::connect(cfg).await?)),
         })
     }
 
@@ -179,6 +218,8 @@ impl Session {
             Session::Postgres(s) => s.execute(sql, max_rows).await,
             Session::Sqlite(s) => s.execute(sql, max_rows).await,
             Session::MsSql(s) => s.execute(sql, max_rows).await,
+            Session::MySql(s) => s.execute(sql, max_rows).await,
+            Session::Oracle(s) => s.execute(sql, max_rows).await,
         }
     }
 
@@ -188,6 +229,8 @@ impl Session {
             Session::Postgres(s) => s.current_database().await,
             Session::Sqlite(_) => Ok("main".into()),
             Session::MsSql(s) => s.current_database().await,
+            Session::MySql(s) => s.current_database().await,
+            Session::Oracle(s) => s.current_database().await,
         }
     }
 
@@ -197,6 +240,8 @@ impl Session {
             Session::Postgres(s) => s.list_databases().await,
             Session::Sqlite(_) => Ok(vec!["main".into()]),
             Session::MsSql(s) => s.list_databases().await,
+            Session::MySql(s) => s.list_databases().await,
+            Session::Oracle(s) => s.list_databases().await,
         }
     }
 
@@ -206,10 +251,11 @@ impl Session {
         self.introspect().await
     }
 
-    /// SQL Server: `USE [db]`. A no-op on the other engines (each session is bound to one database).
+    /// SQL Server and MySQL: `USE db`. A no-op on the other engines (each session is bound to one database).
     pub async fn use_database(&mut self, db: &str) -> anyhow::Result<()> {
         match self {
             Session::MsSql(s) if !db.is_empty() => s.use_database(db).await,
+            Session::MySql(s) if !db.is_empty() => s.use_database(db).await,
             _ => Ok(()),
         }
     }
@@ -222,6 +268,8 @@ impl Session {
             Session::Postgres(s) => s.apply_changes(statements).await,
             Session::Sqlite(s) => s.apply_changes(statements).await,
             Session::MsSql(s) => s.apply_changes(statements).await,
+            Session::MySql(s) => s.apply_changes(statements).await,
+            Session::Oracle(s) => s.apply_changes(statements).await,
         }
     }
 
@@ -231,6 +279,8 @@ impl Session {
             Session::Postgres(s) => s.is_closed(),
             Session::Sqlite(_) => false,
             Session::MsSql(s) => s.is_closed(),
+            Session::MySql(s) => s.is_closed(),
+            Session::Oracle(s) => s.is_closed(),
         }
     }
 
@@ -240,6 +290,8 @@ impl Session {
             Session::Postgres(s) => s.introspect().await,
             Session::Sqlite(s) => s.introspect().await,
             Session::MsSql(s) => s.introspect().await,
+            Session::MySql(s) => s.introspect().await,
+            Session::Oracle(s) => s.introspect().await,
         }
     }
 
@@ -249,6 +301,8 @@ impl Session {
             Driver::Postgres => format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\"")),
             Driver::Sqlite => format!("\"{}\"", table.replace('"', "\"\"")),
             Driver::MsSql => format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]")),
+            // MySQL: the schema is the database.
+            Driver::MySql | Driver::MariaDb | Driver::Oracle => format!("{}.{}", driver.quote_ident(schema), driver.quote_ident(table)),
         }
     }
 }

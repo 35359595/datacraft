@@ -403,7 +403,7 @@ impl Console {
                     self.db = None;
                     ui.close();
                 }
-                if c.driver == Driver::Sqlite {
+                if c.driver == Driver::Sqlite || c.driver == Driver::Oracle {
                     continue;
                 }
                 let effective = if this { self.db.clone().or_else(|| c.default_db.clone()) } else { None };

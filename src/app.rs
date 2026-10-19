@@ -1190,7 +1190,11 @@ impl DataCraftApp {
                 self.worker.send(Request::Refresh(conn));
             }
             CreateTarget::Table { db, schema } => {
-                let schema = if d.driver == Driver::Sqlite { "main".to_string() } else { schema.trim().to_string() };
+                let schema = match d.driver {
+                    Driver::Sqlite => "main".to_string(),
+                    Driver::MySql | Driver::MariaDb => db.clone(),
+                    _ => schema.trim().to_string(),
+                };
                 let tref = TableRef { conn, db: db.clone(), schema: schema.clone(), table: name.clone() };
                 self.explorer.expanded.insert(format!("c:{conn}"));
                 self.explorer.expanded.insert(explorer::db_key(conn, &db));
@@ -1838,8 +1842,8 @@ impl DataCraftApp {
             if let Some(c) = console {
                 match &c.table {
                     Some(t) => {
-                        // SQLite: the "main" schema is the same as the database (the explorer omits it too).
-                        if conn.is_none_or(|x| x.cfg.driver != Driver::Sqlite) {
+                        // SQLite / MySQL: the schema is the same as the database (the explorer omits it too).
+                        if conn.is_none_or(|x| !x.cfg.driver.flat_schema()) {
                             crumbs.push((Some(Ico::Schema), t.schema.clone()));
                         }
                         crumbs.push((Some(Ico::Folder), "tables".into()));
@@ -2456,7 +2460,7 @@ pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str
     let t = Session::quote_table(driver, schema, table);
     let mut sql = match driver {
         Driver::MsSql => format!("SELECT TOP ({max_rows}) * FROM {t}"),
-        Driver::Postgres | Driver::Sqlite => format!("SELECT * FROM {t}"),
+        _ => format!("SELECT * FROM {t}"),
     };
     let w = where_clause.trim().trim_end_matches(';');
     if !w.is_empty() {
@@ -2466,8 +2470,10 @@ pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str
     if !o.is_empty() {
         sql.push_str(&format!(" ORDER BY {o}"));
     }
-    if driver != Driver::MsSql {
-        sql.push_str(&format!(" LIMIT {max_rows}"));
+    match driver {
+        Driver::MsSql => {}
+        Driver::Oracle => sql.push_str(&format!(" FETCH FIRST {max_rows} ROWS ONLY")),
+        _ => sql.push_str(&format!(" LIMIT {max_rows}")),
     }
     sql
 }

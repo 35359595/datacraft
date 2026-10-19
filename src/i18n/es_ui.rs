@@ -21,6 +21,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Could not create {path}: {error}", "No se pudo crear {path}: {error}"),
     ("Port:", "Puerto:"),
     ("Database:", "Base de datos:"),
+    ("Service:", "Servicio:"),
     ("User:", "Usuario:"),
     ("Password:", "Contraseña:"),
     ("Trust server certificate", "Confiar en el certificado del servidor"),
