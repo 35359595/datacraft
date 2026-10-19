@@ -15,7 +15,8 @@
 //! resizable), `DATACRAFT_DEMO_WINDOW=<width>x<height>` resizes the window at startup
 //! (may go below the normal minimum) and `DATACRAFT_DEMO_MULTI=1` uses a console with
 //! several queries, run with "Run all" (one result tab each).
-//! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked.
+//! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
+//! `<column>=<text>` types that text in its search box (which also filters the grid).
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
@@ -1694,7 +1695,7 @@ impl DataCraftApp {
 
                 }
                 theme::Side::Right => {
-                ui.add_space(10.0);
+                ui.add_space(5.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let gear = theme::icon_button_sized(ui, Ico::Gear, true, tr("Settings"), 30.0);
                 egui::Popup::menu(&gear).show(|ui| {
@@ -1997,7 +1998,7 @@ impl DataCraftApp {
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 let more = theme::icon_button(ui, Ico::MoreVert, true, tr("Tabs"));
                 egui::Popup::menu(&more).show(|ui| {
                     if ui.add(egui::Button::new(tr("New console")).shortcut_text("⇧⌘N")).clicked() {
