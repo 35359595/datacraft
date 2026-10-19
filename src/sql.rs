@@ -17,34 +17,225 @@ pub struct Statement {
 /// `$tag$...$tag$` (PostgreSQL), `--` and `/* */` comments. Separators: `;` and, on SQL Server,
 /// a line containing only `GO` (case-insensitive). Skips empty or comment-only fragments.
 /// `text` is trimmed and has no trailing `;`.
+///
+/// Oracle: a line with only `/` also ends a statement, and PL/SQL blocks (`BEGIN`, `DECLARE`,
+/// `CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE`) run to the next `/` line or, without one,
+/// to the `;` after their outermost `END` (which they keep). MySQL / MariaDB: stored routines
+/// run to the `;` after their outermost `END`, and `DELIMITER x` lines change the separator.
 pub fn split_statements(script: &str, driver: Driver) -> Vec<Statement> {
     let dialect = Dialect::for_driver(driver);
+    let oracle = driver == Driver::Oracle;
+    let mysql = matches!(driver, Driver::MySql | Driver::MariaDb);
+    let track = oracle || mysql;
+    // Start of every `/` line (Oracle), to know whether a block has one ahead.
+    let slashes: Vec<usize> = if dialect.slash_separator {
+        Lexer::new(script, dialect)
+            .filter(|t| is_slash_line(script, t))
+            .map(|t| t.start)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut out = Vec::new();
-    // Range of significant tokens (neither whitespace nor comment) of the current statement.
-    let mut current: Option<(usize, usize)> = None;
-    let mut flush = |current: &mut Option<(usize, usize)>| {
-        if let Some((start, end)) = current.take() {
+    let mut cur = Pending::default();
+    // MySQL client `DELIMITER` other than `;`.
+    let mut delimiter: Option<String> = None;
+
+    let mut lx = Lexer::new(script, dialect);
+    while let Some(tok) = lx.next() {
+        if matches!(tok.kind, Kind::Whitespace | Kind::LineComment | Kind::BlockComment) {
+            continue;
+        }
+        let text = &script[tok.start..tok.end];
+        if mysql
+            && cur.range.is_none()
+            && tok.kind == Kind::Word
+            && text.eq_ignore_ascii_case("delimiter")
+            && script[..tok.start].rsplit('\n').next().is_some_and(|l| l.trim().is_empty())
+        {
+            let line_end = script[tok.end..].find('\n').map_or(script.len(), |i| tok.end + i);
+            let rest = &script[tok.end..line_end];
+            if rest.starts_with(|c: char| c.is_ascii_whitespace())
+                && let Some(d) = rest.split_whitespace().next()
+            {
+                delimiter = (d != ";").then(|| d.to_string());
+                lx.pos = line_end;
+                continue;
+            }
+        }
+        if let Some(d) = &delimiter {
+            if !matches!(tok.kind, Kind::Str | Kind::QuotedIdent)
+                && let Some(k) = find_delimiter(script, tok, d)
+            {
+                if k > tok.start {
+                    cur.extend(tok.start, k);
+                }
+                cur.flush(script, &mut out);
+                lx.pos = k + d.len();
+            } else {
+                cur.extend(tok.start, tok.end);
+            }
+            continue;
+        }
+        if (dialect.slash_separator && is_slash_line(script, &tok))
+            || (dialect.go_separator && tok.kind == Kind::Word && is_go_line(script, &tok))
+        {
+            cur.flush(script, &mut out);
+            continue;
+        }
+        if tok.kind == Kind::Semicolon {
+            if let Some((start, _)) = cur.range
+                && track
+                && is_block_statement(&cur.head, oracle)
+            {
+                cur.blocks.token(";", false, oracle);
+                let slash_ahead = slashes.partition_point(|&p| p < start) < slashes.len();
+                if (oracle && slash_ahead) || !cur.blocks.stack.is_empty() {
+                    cur.extend(tok.start, tok.end);
+                    continue;
+                }
+                if oracle {
+                    // PL/SQL keeps the `;` after its `END`.
+                    cur.extend(tok.start, tok.end);
+                }
+            }
+            cur.flush(script, &mut out);
+            continue;
+        }
+        cur.extend(tok.start, tok.end);
+        if track {
+            let is_word = tok.kind == Kind::Word;
+            let up = if is_word { text.to_ascii_uppercase() } else { text.to_string() };
+            if is_word && cur.head.len() < 10 {
+                cur.head.push(up.clone());
+            }
+            cur.blocks.token(&up, is_word, oracle);
+        }
+    }
+    cur.flush(script, &mut out);
+    out
+}
+
+/// Statement being collected by [`split_statements`].
+#[derive(Default)]
+struct Pending {
+    /// Range of significant tokens (neither whitespace nor comment).
+    range: Option<(usize, usize)>,
+    /// First words, uppercased (to recognize blocks).
+    head: Vec<String>,
+    blocks: Blocks,
+}
+
+impl Pending {
+    fn extend(&mut self, start: usize, end: usize) {
+        match &mut self.range {
+            Some((_, e)) => *e = end,
+            None => self.range = Some((start, end)),
+        }
+    }
+
+    fn flush(&mut self, script: &str, out: &mut Vec<Statement>) {
+        if let Some((start, end)) = self.range {
             out.push(Statement {
                 text: script[start..end].to_string(),
                 start,
                 end,
             });
         }
-    };
-
-    for tok in Lexer::new(script, dialect) {
-        match tok.kind {
-            Kind::Whitespace | Kind::LineComment | Kind::BlockComment => {}
-            Kind::Semicolon => flush(&mut current),
-            Kind::Word if dialect.go_separator && is_go_line(script, &tok) => flush(&mut current),
-            _ => match &mut current {
-                Some((_, end)) => *end = tok.end,
-                None => current = Some((tok.start, tok.end)),
-            },
-        }
+        *self = Pending::default();
     }
-    flush(&mut current);
-    out
+}
+
+/// Nesting of procedural blocks (PL/SQL, MySQL stored programs) inside a statement.
+#[derive(Default)]
+struct Blocks {
+    /// Open levels; `true` = declaration section (`DECLARE`, `IS`/`AS` of a subprogram or
+    /// package) whose `BEGIN` does not open another level.
+    stack: Vec<bool>,
+    /// After `PROCEDURE`/`FUNCTION`/`PACKAGE`/`TYPE BODY` (Oracle): the next `IS`/`AS` opens
+    /// a declaration section.
+    header: bool,
+    /// Previous significant token (words uppercased).
+    prev: String,
+}
+
+impl Blocks {
+    fn token(&mut self, t: &str, is_word: bool, oracle: bool) {
+        if is_word {
+            let after_end = self.prev == "END";
+            // Where a procedural statement can start (`IF(…)` and `REPEAT(…)` are also functions).
+            let stmt_start = matches!(
+                self.prev.as_str(),
+                "" | ";" | ":" | ">" | "BEGIN" | "THEN" | "ELSE" | "DO" | "LOOP" | "REPEAT" | "DECLARE" | "IS" | "AS"
+            );
+            match t {
+                "BEGIN" => match self.stack.last_mut() {
+                    Some(decl @ true) => *decl = false,
+                    _ => self.stack.push(false),
+                },
+                "DECLARE" if oracle => self.stack.push(true),
+                "END" => {
+                    self.stack.pop();
+                }
+                "CASE" | "LOOP" if !after_end => self.stack.push(false),
+                "IF" if !after_end && stmt_start => self.stack.push(false),
+                "WHILE" | "REPEAT" if !oracle && !after_end && stmt_start => self.stack.push(false),
+                "PROCEDURE" | "FUNCTION" | "PACKAGE" if oracle => self.header = true,
+                "BODY" if oracle && self.prev == "TYPE" => self.header = true,
+                "IS" | "AS" if oracle && self.header => {
+                    self.stack.push(true);
+                    self.header = false;
+                }
+                _ => {}
+            }
+        } else if t == ";" {
+            self.header = false;
+        }
+        self.prev = t.to_string();
+    }
+}
+
+/// Does a statement starting with the words `head` contain procedural blocks whose inner `;`
+/// do not end it? Oracle: anonymous blocks and stored PL/SQL; MySQL / MariaDB: stored
+/// routines, triggers, events and `BEGIN NOT ATOMIC` (a plain `BEGIN` starts a transaction).
+fn is_block_statement(head: &[String], oracle: bool) -> bool {
+    let words: Vec<&str> = head.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["BEGIN" | "DECLARE", ..] if oracle => true,
+        ["BEGIN", "NOT", "ATOMIC", ..] => !oracle,
+        ["CREATE", rest @ ..] => {
+            let mut definer = false;
+            for w in rest {
+                match *w {
+                    "OR" | "REPLACE" => {}
+                    "EDITIONABLE" | "NONEDITIONABLE" if oracle => {}
+                    "DEFINER" | "AGGREGATE" if !oracle => definer |= *w == "DEFINER",
+                    "PROCEDURE" | "FUNCTION" | "TRIGGER" => return true,
+                    "PACKAGE" | "TYPE" => return oracle,
+                    "EVENT" => return !oracle,
+                    // The user and host of `DEFINER = user@host`.
+                    _ if definer => {}
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Position of the client delimiter `d` starting within `tok` (`END$$` is a single word).
+/// Inside a word it only matches if it doesn't start with a letter, digit or `_`.
+fn find_delimiter(script: &str, tok: Token, d: &str) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let d = d.as_bytes();
+    let inner_ok = !(d[0].is_ascii_alphanumeric() || d[0] == b'_' || d[0] >= 0x80);
+    (tok.start..tok.end).find(|&k| {
+        (k == tok.start || inner_ok)
+            && script.is_char_boundary(k)
+            && bytes.len() >= k + d.len()
+            && bytes[k..k + d.len()].eq_ignore_ascii_case(d)
+    })
 }
 
 /// Statement containing the `cursor` position (in bytes). If the cursor is in the space between
@@ -111,6 +302,16 @@ pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
 
 /// Colored LayoutJob for `egui::TextEdit::layouter`.
 pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text::LayoutJob {
+    highlight_dialect(text, Dialect::PERMISSIVE, dark_mode, font)
+}
+
+/// Like [`highlight`], with the lexical rules of `driver` (MySQL `\'` escapes, Oracle `q'[…]'`).
+#[allow(dead_code)] // For editors that know their engine.
+pub fn highlight_for(text: &str, driver: Driver, dark_mode: bool, font: egui::FontId) -> egui::text::LayoutJob {
+    highlight_dialect(text, Dialect::for_driver(driver), dark_mode, font)
+}
+
+fn highlight_dialect(text: &str, dialect: Dialect, dark_mode: bool, font: egui::FontId) -> egui::text::LayoutJob {
     let palette = if dark_mode {
         Palette::DARK
     } else {
@@ -119,7 +320,7 @@ pub fn highlight(text: &str, dark_mode: bool, font: egui::FontId) -> egui::text:
     let mut job = LayoutJob::default();
     let mut pending: Option<(usize, usize, Style)> = None;
 
-    for tok in Lexer::new(text, Dialect::PERMISSIVE) {
+    for tok in Lexer::new(text, dialect) {
         let style = Style::of(&tok, text);
         // Group consecutive tokens with the same style so the sections don't pile up.
         match &mut pending {
@@ -425,6 +626,16 @@ fn is_keyword(word: &str) -> bool {
     KEYWORDS.binary_search(&upper.as_str()).is_ok()
 }
 
+/// Is `tok` a `/` alone on its line (Oracle: runs the statement or PL/SQL block above)?
+fn is_slash_line(script: &str, tok: &Token) -> bool {
+    if tok.kind != Kind::Op || &script[tok.start..tok.end] != "/" {
+        return false;
+    }
+    let line_start = script[..tok.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = script[tok.end..].find('\n').map_or(script.len(), |i| tok.end + i);
+    script[line_start..tok.start].trim().is_empty() && script[tok.end..line_end].trim().is_empty()
+}
+
 /// Is `tok` a `GO` alone on its line (allowing spaces and a trailing `--` comment)?
 fn is_go_line(script: &str, tok: &Token) -> bool {
     if !script[tok.start..tok.end].eq_ignore_ascii_case("go") {
@@ -669,8 +880,10 @@ pub fn format_sql(text: &str, driver: Driver, indent: usize, is_ident: &dyn Fn(&
         let word = upper(tok);
         let is_word = tok.kind == Kind::Word;
 
-        // T-SQL `GO`: alone on its line, ends the batch.
-        if is_word && dialect.go_separator && is_go_line(text, tok) {
+        // T-SQL `GO` / Oracle `/`: alone on its line, ends the batch.
+        if (is_word && dialect.go_separator && is_go_line(text, tok))
+            || (dialect.slash_separator && is_slash_line(text, tok))
+        {
             out.newline(0, blank);
             out.s.push_str(raw);
             force_nl = true;
@@ -746,12 +959,16 @@ pub fn format_sql(text: &str, driver: Driver, indent: usize, is_ident: &dyn Fn(&
         }
         let closing =
             tok.kind == Kind::Semicolon || (tok.kind == Kind::Punct && matches!(raw, "," | ")" | "."));
-        if nl.is_none() && (force_nl || (blank && !closing)) {
+        // Adjacent literals only concatenate with a newline between them (`'a'\n'b'`).
+        let split_literal =
+            src_nl && tok.kind == Kind::Str && prev_sig.is_some_and(|p| p.kind == Kind::Str);
+        if nl.is_none() && (force_nl || (blank && !closing) || split_literal) {
             nl = Some(lvl.cont_col());
         }
-        // A T-SQL `go` that is not a batch separator must never end up alone on its line
-        // (it would become one): it stays with the previous token and the next one with it.
-        let fake_go = is_word && dialect.go_separator && word == "GO";
+        // A T-SQL `go` / Oracle `/` that is not a batch separator must never end up alone on
+        // its line (it would become one): it stays with the previous token and the next one with it.
+        let fake_go = (is_word && dialect.go_separator && word == "GO")
+            || (dialect.slash_separator && tok.kind == Kind::Op && raw == "/");
         if (fake_go || after_fake_go) && !force_nl {
             nl = None;
         }
@@ -912,6 +1129,12 @@ struct Dialect {
     go_separator: bool,
     /// `#` starts a line comment (MySQL / MariaDB).
     hash_comments: bool,
+    /// `\` escapes the next char in `'…'` and `"…"` strings, and `"…"` is a string (MySQL / MariaDB).
+    backslash_escapes: bool,
+    /// Oracle alternative quoting: `q'[…]'`, `nq'{…}'`…
+    q_quotes: bool,
+    /// A line with only `/` ends the statement or PL/SQL block (Oracle, SQL*Plus style).
+    slash_separator: bool,
 }
 
 impl Dialect {
@@ -924,6 +1147,9 @@ impl Dialect {
         tsql_names: true,
         go_separator: false,
         hash_comments: false,
+        backslash_escapes: false,
+        q_quotes: false,
+        slash_separator: false,
     };
 
     fn for_driver(driver: Driver) -> Self {
@@ -936,6 +1162,9 @@ impl Dialect {
                 tsql_names: false,
                 go_separator: false,
                 hash_comments: false,
+                backslash_escapes: false,
+                q_quotes: false,
+                slash_separator: false,
             },
             Driver::Sqlite => Dialect {
                 brackets: true,
@@ -945,6 +1174,9 @@ impl Dialect {
                 tsql_names: false,
                 go_separator: false,
                 hash_comments: false,
+                backslash_escapes: false,
+                q_quotes: false,
+                slash_separator: false,
             },
             Driver::MsSql => Dialect {
                 brackets: true,
@@ -954,6 +1186,9 @@ impl Dialect {
                 tsql_names: true,
                 go_separator: true,
                 hash_comments: false,
+                backslash_escapes: false,
+                q_quotes: false,
+                slash_separator: false,
             },
             Driver::MySql | Driver::MariaDb => Dialect {
                 brackets: false,
@@ -963,6 +1198,9 @@ impl Dialect {
                 tsql_names: false,
                 go_separator: false,
                 hash_comments: true,
+                backslash_escapes: true,
+                q_quotes: false,
+                slash_separator: false,
             },
             Driver::Oracle => Dialect {
                 brackets: false,
@@ -972,6 +1210,9 @@ impl Dialect {
                 tsql_names: false,
                 go_separator: false,
                 hash_comments: false,
+                backslash_escapes: false,
+                q_quotes: true,
+                slash_separator: true,
             },
         }
     }
@@ -1061,6 +1302,34 @@ impl<'a> Lexer<'a> {
         (rest.get(i) == Some(&b'$')).then_some(i + 1)
     }
 
+    /// If there is an Oracle `q'<d>…<d>'` (optionally `n`-prefixed) literal at the current
+    /// position, returns its length (to the end of the text if it is not closed).
+    fn q_quote_len(&self) -> Option<usize> {
+        let rest = &self.src[self.pos..];
+        let skip = usize::from(matches!(rest.first(), Some(b'n' | b'N')));
+        if !matches!(rest.get(skip), Some(b'q' | b'Q')) || rest.get(skip + 1) != Some(&b'\'') {
+            return None;
+        }
+        let open = *rest.get(skip + 2)?;
+        if open.is_ascii_whitespace() || open == b'\'' || open >= 0x80 {
+            return None;
+        }
+        let close = match open {
+            b'[' => b']',
+            b'{' => b'}',
+            b'(' => b')',
+            b'<' => b'>',
+            c => c,
+        };
+        let body = skip + 3;
+        Some(
+            rest[body..]
+                .windows(2)
+                .position(|w| w[0] == close && w[1] == b'\'')
+                .map_or(rest.len(), |i| body + i + 2),
+        )
+    }
+
     fn is_word_byte(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
     }
@@ -1087,13 +1356,25 @@ impl<'a> Lexer<'a> {
             }
             b'\'' => {
                 self.pos += 1;
-                self.eat_quoted(b'\'', true, false);
+                self.eat_quoted(b'\'', true, self.dialect.backslash_escapes);
+                Kind::Str
+            }
+            // Oracle `q'[…]'` / `nq'{…}'`: nothing inside is special.
+            b'q' | b'Q' | b'n' | b'N' if self.dialect.q_quotes && self.q_quote_len().is_some() => {
+                self.pos += self.q_quote_len().unwrap_or(1);
                 Kind::Str
             }
             // String prefixes: E'..' (escapes with \), N'..', X'..', B'..'.
             b'e' | b'E' | b'n' | b'N' | b'x' | b'X' | b'b' | b'B' if next == Some(b'\'') => {
                 self.pos += 2;
-                self.eat_quoted(b'\'', true, matches!(b, b'e' | b'E'));
+                let backslash = matches!(b, b'e' | b'E') || self.dialect.backslash_escapes;
+                self.eat_quoted(b'\'', true, backslash);
+                Kind::Str
+            }
+            // MySQL: `"…"` is a string with `\` escapes.
+            b'"' if self.dialect.backslash_escapes => {
+                self.pos += 1;
+                self.eat_quoted(b'"', true, true);
                 Kind::Str
             }
             b'"' => {
@@ -1673,7 +1954,8 @@ mod tests {
             ",", ";", ".", "a", "t", "date", "1", "'x y'", "\"q\"", "[b]", "`c`", "-- note\n", "/* c */", "=", "-",
             "*", "::", "$1", "$$ body $$", "@v", "#t", "\n", "\n\n", "go\n", "  ", "1.5", "e", "n", "'b'", "[", "]",
             "<", ">", "!", "/", "+", "_utf8", "q", "{", "}", "exists", "distinct", "is", "having", "limit", "apply",
-            "cross", "outer", "default", "returning",
+            "cross", "outer", "default", "returning", "'a\\'b'", "\"x\\\"y\"", "\\", "'", "q'[s; t]'", "nq'{u}'",
+            "begin", "declare", "if", "loop", "procedure", "create", "is", "/\n", "\n/\n", "'p'\n'q'", "delimiter",
         ];
         let mut seed = 0x2545F491u64;
         let mut rnd = |n: usize| {
@@ -1693,6 +1975,10 @@ mod tests {
             }
             for d in Driver::ALL {
                 fmt_core(&s, d, &[]);
+                // The splitter keeps exact, ordered byte ranges.
+                check_ranges(&s, &split_statements(&s, d));
+                check_ranges(&s, &split_batches(&s, d));
+                let _ = statement_at(&s, rnd(s.len() + 1), d);
             }
         }
     }
@@ -1719,5 +2005,179 @@ mod tests {
         assert_eq!(texts("SELECT 1 # a; b\n; SELECT 2", Driver::MySql), ["SELECT 1", "SELECT 2"]);
         // Elsewhere # is not a comment.
         assert_eq!(texts("SELECT #t; SELECT 2", Driver::MsSql).len(), 2);
+    }
+
+    fn check_ranges(s: &str, st: &[Statement]) {
+        let mut last = 0;
+        for x in st {
+            assert!(x.start >= last && x.start < x.end && x.end <= s.len(), "{st:?}");
+            assert_eq!(&s[x.start..x.end], x.text);
+            last = x.end;
+        }
+    }
+
+    #[test]
+    fn mysql_backslash_escapes() {
+        let s = "select 'a\\';b'; select 2";
+        assert_eq!(texts(s, Driver::MySql), ["select 'a\\';b'", "select 2"]);
+        assert_eq!(texts("select \"x\\\";y\", 'it''s;'; select 2", Driver::MariaDb).len(), 2);
+        assert_eq!(texts("select N'a\\';b'; select 2", Driver::MySql).len(), 2);
+        // Elsewhere a backslash is an ordinary char.
+        assert_eq!(texts("select 'C:\\'; select 2", Driver::Postgres), ["select 'C:\\'", "select 2"]);
+        assert_eq!(texts("select 'C:\\'; select 2", Driver::Oracle).len(), 2);
+        // PostgreSQL E'…' strings escape with backslash.
+        assert_eq!(texts("select E'a\\';b'; select 2", Driver::Postgres).len(), 2);
+        assert_eq!(texts("select e'a\\';b'; select 2", Driver::Postgres).len(), 2);
+        // The formatter leaves the literal intact.
+        let out = fmt("select 'don\\'t select  from x' from t", Driver::MySql);
+        assert_eq!(out, "SELECT 'don\\'t select  from x'\nFROM t");
+        let out = fmt("select \"a\\\" from  b\" , 1", Driver::MySql);
+        assert_eq!(out, "SELECT \"a\\\" from  b\",\n       1");
+        // Highlighting with the engine's rules.
+        let s = "select 'a\\';b' from t";
+        let job = highlight_for(s, Driver::MySql, false, egui::FontId::monospace(13.0));
+        let text: String =
+            job.sections.iter().map(|sec| &job.text[sec.byte_range.start.0..sec.byte_range.end.0]).collect();
+        assert_eq!(text, s);
+        let str_sec = job.sections.iter().find(|sec| sec.byte_range.start.0 == 7).unwrap();
+        assert_eq!(str_sec.byte_range.end.0, s.find(" from").unwrap());
+        assert_eq!(str_sec.format.color, Palette::LIGHT.string);
+    }
+
+    #[test]
+    fn oracle_plsql_blocks() {
+        let d = Driver::Oracle;
+        // Without `/`: up to the `;` of the outermost END, which is kept.
+        let s = "BEGIN\n  IF x THEN y; END IF;\n  FOR i IN 1..3 LOOP z; END LOOP;\n  CASE a WHEN 1 THEN b; END CASE;\nEND;\nselect 1 from dual;";
+        let st = split_statements(s, d);
+        check_ranges(s, &st);
+        assert_eq!(st.len(), 2, "{st:?}");
+        assert!(st[0].text.starts_with("BEGIN") && st[0].text.ends_with("END;"));
+        assert_eq!(st[1].text, "select 1 from dual");
+        let s = "DECLARE\n  n NUMBER := 1;\nBEGIN\n  BEGIN NULL; END;\n  n := 2;\nEND my_block;\nselect 2 from dual";
+        let t = texts(s, d);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END my_block;"));
+        let s = "CREATE OR REPLACE EDITIONABLE PROCEDURE p(a NUMBER) IS\n  v NUMBER;\n  CURSOR c IS SELECT 1 FROM dual;\nBEGIN\n  v := CASE WHEN a > 1 THEN 1 ELSE 2 END;\nEND p;\nSELECT 3 FROM dual;";
+        let t = texts(s, d);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END p;"));
+        let s = "CREATE OR REPLACE PACKAGE BODY pk AS\n  PROCEDURE a IS BEGIN NULL; END a;\n  FUNCTION b RETURN NUMBER IS BEGIN RETURN 1; END;\nBEGIN\n  NULL;\nEND pk;\nSELECT 4 FROM dual";
+        let t = texts(s, d);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END pk;"));
+        let s = "CREATE PACKAGE pk AS\n  PROCEDURE a;\n  FUNCTION b RETURN NUMBER;\nEND pk;\nSELECT 5 FROM dual";
+        assert_eq!(texts(s, d).len(), 2);
+        let s = "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t REFERENCING NEW AS n FOR EACH ROW\nBEGIN\n  :n.x := 1;\nEND;\nSELECT 6 FROM dual";
+        assert_eq!(texts(s, d).len(), 2);
+        let s = "CREATE TYPE BODY ty AS\n  MEMBER FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;\nEND;\nSELECT 7 FROM dual";
+        assert_eq!(texts(s, d).len(), 2);
+        let s = "CREATE TYPE ty AS OBJECT (a NUMBER);\nSELECT 8 FROM dual";
+        assert_eq!(texts(s, d), ["CREATE TYPE ty AS OBJECT (a NUMBER);", "SELECT 8 FROM dual"]);
+        // With `/`: up to that line, whatever the nesting looks like.
+        let s = "begin\n  x;\nend;\n/\nselect 1 from dual\n/\n  /\nDECLARE n NUMBER; BEGIN IF a THEN b; END IF; END;\n/";
+        let st = split_statements(s, d);
+        check_ranges(s, &st);
+        let t: Vec<_> = st.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(t, ["begin\n  x;\nend;", "select 1 from dual", "DECLARE n NUMBER; BEGIN IF a THEN b; END IF; END;"]);
+        // Plain SQL is still split by `;`; a `/` in an expression is a division.
+        assert_eq!(texts("select 4 / 2 from dual; select 1 from dual", d).len(), 2);
+        assert_eq!(texts("select 4\n/ 2 from dual", d).len(), 1);
+        // The block under the cursor is the whole block.
+        let s = "select 1 from dual;\nBEGIN\n  a;\n  b;\nEND;\n/\nselect 2 from dual;";
+        let pos = s.find("b;").unwrap();
+        let st = statement_at(s, pos, d).unwrap();
+        assert_eq!(st.text, "BEGIN\n  a;\n  b;\nEND;");
+        assert_eq!(&s[st.start..st.end], st.text);
+        assert_eq!(split_batches(s, d).len(), 3);
+        // Other engines don't treat `/` or BEGIN specially.
+        assert_eq!(texts("BEGIN; SELECT 1; COMMIT", Driver::Postgres).len(), 3);
+        assert_eq!(texts("BEGIN; SELECT 1; COMMIT", Driver::MySql).len(), 3);
+    }
+
+    #[test]
+    fn oracle_q_quotes() {
+        let d = Driver::Oracle;
+        for s in [
+            "select q'[it's; x]' from dual; select 2 from dual",
+            "select Q'{a ' ; }' from dual; select 2 from dual",
+            "select q'(a ';' )' from dual; select 2 from dual",
+            "select q'<a;>' from dual; select 2 from dual",
+            "select q'!a;'!' from dual; select 2 from dual",
+            "select nq'[ñ;]' from dual; select 2 from dual",
+            "select NQ'#x;#' from dual; select 2 from dual",
+        ] {
+            let st = split_statements(s, d);
+            check_ranges(s, &st);
+            assert_eq!(st.len(), 2, "{s}");
+        }
+        assert_eq!(fmt("select q'[select  ; from]' as x from dual", d), "SELECT q'[select  ; from]' AS x\nFROM dual");
+        // Elsewhere `q` is a name.
+        assert_eq!(texts("select q'x'; select 2", Driver::Postgres).len(), 2);
+        assert_eq!(texts("select q 'a;' from t", d).len(), 1);
+        // Unclosed: to the end, no panic.
+        assert_eq!(texts("select q'[abc; def", d).len(), 1);
+        assert_eq!(texts("select q'", d).len(), 1);
+    }
+
+    #[test]
+    fn mysql_stored_routines() {
+        let d = Driver::MySql;
+        let s = "CREATE PROCEDURE p() BEGIN select 1; select 2; END; select 3";
+        let st = split_statements(s, d);
+        check_ranges(s, &st);
+        let t: Vec<_> = st.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(t, ["CREATE PROCEDURE p() BEGIN select 1; select 2; END", "select 3"]);
+        let s = "CREATE DEFINER=`root`@`%` PROCEDURE p(n INT)\nBEGIN\n  DECLARE i INT DEFAULT 0;\n  IF n > 0 THEN SET i = IF(n > 5, 1, 2); END IF;\n  lbl: WHILE i < n DO SET i = i + 1; END WHILE lbl;\n  REPEAT SET i = i - 1; UNTIL i = 0 END REPEAT;\n  l2: LOOP LEAVE l2; END LOOP;\n  CASE i WHEN 0 THEN SELECT REPEAT('x', 2); ELSE BEGIN END; END CASE;\nEND;\nselect 4";
+        let t = texts(s, d);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("END CASE;\nEND"));
+        let s = "create definer = admin@localhost function f() returns int deterministic begin return 1; end;\nselect f()";
+        assert_eq!(texts(s, Driver::MariaDb).len(), 2);
+        // A routine without BEGIN ends at its `;`.
+        assert_eq!(texts("CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW SET NEW.a = 1; select 1", d).len(), 2);
+        assert_eq!(texts("CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM t; DELETE FROM u; END; select 1", d).len(), 2);
+        assert_eq!(texts("BEGIN NOT ATOMIC SELECT 1; SELECT 2; END; SELECT 3", Driver::MariaDb).len(), 2);
+        // Transactions and other CREATEs are plain statements.
+        assert_eq!(texts("BEGIN; INSERT INTO t VALUES (1); COMMIT;", d).len(), 3);
+        assert_eq!(texts("CREATE TABLE t (begin_at INT); SELECT 1", d).len(), 2);
+        // Statement under the cursor.
+        let s = "select 0;\nCREATE PROCEDURE p() BEGIN select 1; select 2; END;\nselect 3;";
+        let st = statement_at(s, s.find("select 2").unwrap(), d).unwrap();
+        assert!(st.text.starts_with("CREATE PROCEDURE") && st.text.ends_with("END"));
+    }
+
+    #[test]
+    fn mysql_delimiter_directive() {
+        let d = Driver::MySql;
+        let s = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\nEND$$\nCREATE FUNCTION f() RETURNS INT RETURN 1 $$\ndelimiter ;\nSELECT 'a;b'; SELECT 2;";
+        let st = split_statements(s, d);
+        check_ranges(s, &st);
+        let t: Vec<_> = st.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(
+            t,
+            ["CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\nEND", "CREATE FUNCTION f() RETURNS INT RETURN 1", "SELECT 'a;b'", "SELECT 2"]
+        );
+        // `//` and a delimiter inside strings or comments.
+        let s = "DELIMITER //\nSELECT '//' /* // */; SELECT 2 //\nSELECT 3//";
+        assert_eq!(texts(s, d), ["SELECT '//' /* // */; SELECT 2", "SELECT 3"]);
+        // A word delimiter only matches as a whole token.
+        assert_eq!(texts("DELIMITER go\nSELECT category go SELECT 1", d), ["SELECT category", "SELECT 1"]);
+        // `delimiter` as a column name is not a directive.
+        assert_eq!(texts("SELECT a,\ndelimiter x FROM t; SELECT 2", d).len(), 2);
+        // Only on MySQL.
+        assert_eq!(texts("DELIMITER $$\nSELECT 1$$", Driver::Postgres).len(), 1);
+    }
+
+    #[test]
+    fn format_adjacent_literals_and_slash() {
+        // PostgreSQL concatenates adjacent literals only across a newline: keep it.
+        let out = fmt("select 'a'\n'b', 'c' 'd' from t", Driver::Postgres);
+        assert_eq!(out, "SELECT 'a'\n       'b',\n       'c' 'd'\nFROM t");
+        // Oracle `/` lines stay alone; a division never ends up alone on a line.
+        let out = fmt("begin null; end;\n/\nselect 4 / 2 from dual", Driver::Oracle);
+        assert_eq!(out, "BEGIN NULL;\nEND;\n/\nSELECT 4 / 2\nFROM dual");
+        let out = fmt("select 1;\n/ from dual", Driver::Oracle);
+        assert_eq!(texts(&out, Driver::Oracle).len(), texts("select 1;\n/ from dual", Driver::Oracle).len());
     }
 }
