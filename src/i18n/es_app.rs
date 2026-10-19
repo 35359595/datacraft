@@ -96,6 +96,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Copy SQL", "Copiar SQL"),
     ("Saving…", "Guardando…"),
     ("Table “{name}” created", "Tabla «{name}» creada"),
+    ("{n} rows imported into “{table}”", "{n} filas importadas en «{table}»"),
     ("Read-only connection", "Conexión de solo lectura"),
     ("Read-only connection: only queries can run (SELECT, WITH, SHOW, EXPLAIN…)", "Conexión de solo lectura: solo se pueden ejecutar consultas (SELECT, WITH, SHOW, EXPLAIN…)"),
     ("Table “{name}” truncated", "Tabla «{name}» vaciada"),

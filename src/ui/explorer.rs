@@ -53,6 +53,7 @@ pub enum ExplorerAction {
     /// Confirm and drop a table or view.
     DropObject(TableRef, ObjectKind),
     TruncateTable(TableRef),
+    ImportData(TableRef),
     RenameTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
@@ -789,6 +790,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             ui.close();
         }
         if t.kind == ObjectKind::Table {
+            if ui.button(tr("Import Data from File…")).clicked() {
+                actions.push(ExplorerAction::ImportData(tref.clone()));
+                ui.close();
+            }
             if ui.button(tr("Rename…")).clicked() {
                 actions.push(ExplorerAction::RenameTable(tref.clone()));
                 ui.close();

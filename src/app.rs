@@ -18,6 +18,8 @@
 //! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
 //! `<column>=<text>` types that text in its search box (which also filters the grid).
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
+//! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
+//! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
@@ -34,6 +36,7 @@ use crate::ui::connection_dialog::{ConnectionDialog, DialogResult, TestState};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
+use crate::ui::import_dialog::{ImportDialog, ImportResult};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -246,6 +249,7 @@ pub struct DataCraftApp {
     create: Option<CreateDialog>,
     /// Confirmation to drop a database, table or view.
     drop: Option<DropDialog>,
+    import: Option<ImportDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -317,6 +321,7 @@ impl DataCraftApp {
             confirm_delete: None,
             create: None,
             drop: None,
+            import: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -580,6 +585,17 @@ impl DataCraftApp {
                                 self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None });
                             }
                             self.drop = Some(d);
+                        }
+                        if let Ok(csv) = std::env::var("DATACRAFT_DEMO_IMPORT")
+                            && let Some(t) = self.explorer.selected_table.clone()
+                        {
+                            self.open_import(t);
+                            if let Some(d) = self.import.as_mut() {
+                                d.load(std::path::Path::new(&csv));
+                            }
+                            if std::env::var("DATACRAFT_DEMO_IMPORT_SUBMIT").is_ok_and(|v| v == "1") {
+                                self.submit_import();
+                            }
                         }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
@@ -1172,6 +1188,7 @@ impl DataCraftApp {
                 }
                 ExplorerAction::DropObject(t, kind) => self.open_object_dialog(t, kind.into()),
                 ExplorerAction::TruncateTable(t) => self.open_object_dialog(t, DropKind::Truncate),
+                ExplorerAction::ImportData(t) => self.open_import(t),
                 ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
@@ -1198,6 +1215,59 @@ impl DataCraftApp {
         ro
     }
 
+    /// "Import Data from File" into a table whose structure is loaded.
+    fn open_import(&mut self, t: TableRef) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
+        let Some(driver) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected).map(|c| c.cfg.driver) else { return };
+        let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table).map(<[ColumnInfo]>::to_vec) else {
+            self.error(tr("Table structure not loaded yet").to_string());
+            return;
+        };
+        self.import = Some(ImportDialog::new(t.conn, driver, t.db, t.schema, t.table, columns));
+    }
+
+    /// Demo mode: runs the import as if "Import" had been clicked.
+    fn submit_import(&mut self) {
+        let Some(d) = self.import.as_mut() else { return };
+        let statements = d.start();
+        if !statements.is_empty() {
+            let (conn, db) = (d.conn, Some(d.db.clone()));
+            self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+        }
+    }
+
+    /// Reply to an import's INSERTs.
+    fn import_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.import.as_mut() else { return };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            return;
+        }
+        let Some(d) = self.import.take() else { return };
+        self.reload_table_editors(d.conn, &d.db, &d.schema, &d.table);
+        self.info(trf("{n} rows imported into “{table}”", &[("n", &d.imported), ("table", &d.table)]));
+    }
+
+    /// Reloads the open data editors of a table (that aren't busy).
+    fn reload_table_editors(&mut self, conn: ConnId, db: &str, schema: &str, table: &str) {
+        let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+        let editors: Vec<usize> = (0..self.consoles.len())
+            .filter(|&i| {
+                let c = &self.consoles[i];
+                c.conn == Some(conn)
+                    && c.db.as_deref().or(default_db.as_deref()) == Some(db)
+                    && c.table.as_ref().is_some_and(|t| t.schema == schema && t.table == table)
+                    && !c.is_busy()
+            })
+            .collect();
+        for i in editors {
+            self.reload_table(i);
+        }
+    }
+
     /// Drop / truncate / rename confirmation for a table or view.
     fn open_object_dialog(&mut self, t: TableRef, kind: DropKind) {
         if self.refuse_read_only(t.conn) {
@@ -1222,6 +1292,10 @@ impl DataCraftApp {
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
             self.drop_done(result);
+            return;
+        }
+        if self.import.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.import_done(result);
             return;
         }
         let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && d.running) else {
@@ -1290,19 +1364,7 @@ impl DataCraftApp {
             }
             DropKind::Truncate => {
                 // Open data editors of that table show the (now empty) data again.
-                let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
-                let editors: Vec<usize> = (0..self.consoles.len())
-                    .filter(|&i| {
-                        let c = &self.consoles[i];
-                        c.conn == Some(conn)
-                            && c.db.as_deref().or(default_db.as_deref()) == Some(d.db.as_str())
-                            && c.table.as_ref().is_some_and(|t| t.schema == d.schema && t.table == d.name)
-                            && !c.is_busy()
-                    })
-                    .collect();
-                for i in editors {
-                    self.reload_table(i);
-                }
+                self.reload_table_editors(conn, &d.db, &d.schema, &d.name);
                 self.info(trf("Table “{name}” truncated", &[("name", &d.name)]));
             }
             DropKind::Table | DropKind::View | DropKind::Rename => {
@@ -1521,6 +1583,7 @@ impl DataCraftApp {
             || self.confirm_delete.is_some()
             || self.create.is_some()
             || self.drop.is_some()
+            || self.import.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2295,6 +2358,17 @@ impl DataCraftApp {
                     Some(CreateResult::Cancel) => self.create = None,
                     None => {}
                 }
+            }
+        }
+
+        if let Some(d) = self.import.as_mut() {
+            match d.show(ctx) {
+                Some(ImportResult::Import(statements)) => {
+                    let (conn, db) = (d.conn, Some(d.db.clone()));
+                    self.worker.send(Request::RunDdl { conn, db, statements, close_db: None });
+                }
+                Some(ImportResult::Cancel) => self.import = None,
+                None => {}
             }
         }
 
