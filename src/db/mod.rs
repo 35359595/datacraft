@@ -194,11 +194,14 @@ pub(crate) fn not_single_row(n: u64, stmt: &str) -> anyhow::Error {
 }
 
 /// Cancels the query a session is running, from outside that session.
+#[derive(Clone)]
 pub enum CancelHandle {
     Postgres(tokio_postgres::CancelToken),
     Sqlite(std::sync::Arc<rusqlite::InterruptHandle>),
     /// MySQL / MariaDB: `KILL QUERY <thread id>` from a second connection.
     MySql(Box<mysql_async::OptsBuilder>, u32),
+    /// Oracle: `break_execution` on the same connection.
+    Oracle(std::sync::Arc<::oracle::Connection>),
 }
 
 impl CancelHandle {
@@ -207,6 +210,11 @@ impl CancelHandle {
             CancelHandle::Postgres(t) => t.cancel_query(tokio_postgres::NoTls).await.map_err(anyhow::Error::from),
             CancelHandle::Sqlite(h) => {
                 h.interrupt();
+                Ok(())
+            }
+            CancelHandle::Oracle(conn) => {
+                let conn = std::sync::Arc::clone(conn);
+                tokio::task::spawn_blocking(move || conn.break_execution()).await??;
                 Ok(())
             }
             CancelHandle::MySql(opts, id) => {
@@ -330,6 +338,7 @@ impl Session {
                 let (opts, id) = s.cancel_target();
                 Some(CancelHandle::MySql(Box::new(opts), id))
             }
+            Session::Oracle(s) => Some(CancelHandle::Oracle(s.break_handle())),
             _ => None,
         }
     }

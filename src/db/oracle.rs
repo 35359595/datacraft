@@ -26,7 +26,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const OWNER_CHUNK: usize = 500;
 
 pub struct OraSession {
-    conn: Arc<Mutex<Connection>>,
+    /// Shared so `break_execution` can cancel a running statement from another thread;
+    /// `gate` serializes the session's own calls.
+    conn: Arc<Connection>,
+    gate: Arc<Mutex<()>>,
     /// Set after connection-level errors: the session is no longer usable.
     broken: bool,
     /// Container/database name, computed once so the explorer node stays stable.
@@ -45,7 +48,12 @@ impl OraSession {
             .await
             .map_err(|_| anyhow!(trf("Timed out connecting to {host}:{port}", &[("host", &host), ("port", &port)])))??
             .map_err(ora_error)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)), broken: false, db_name: None })
+        Ok(Self { conn: Arc::new(conn), gate: Arc::new(Mutex::new(())), broken: false, db_name: None })
+    }
+
+    /// Connection handle to cancel the running statement (`break_execution`).
+    pub fn break_handle(&self) -> Arc<Connection> {
+        Arc::clone(&self.conn)
     }
 
     /// Runs `f` with the connection on a blocking thread and marks the session as broken
@@ -53,14 +61,14 @@ impl OraSession {
     async fn with_conn<T, F>(&mut self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<T, oracle::Error> + Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, oracle::Error> + Send + 'static,
     {
-        let conn = Arc::clone(&self.conn);
+        let (conn, gate) = (Arc::clone(&self.conn), Arc::clone(&self.gate));
         let outcome = tokio::task::spawn_blocking(move || {
-            let Ok(mut conn) = conn.lock() else {
+            let Ok(_guard) = gate.lock() else {
                 return Err(anyhow!(tr("The Oracle connection became unusable")));
             };
-            f(&mut conn).map_err(ora_error)
+            f(&conn).map_err(ora_error)
         })
         .await;
         let result = match outcome {
@@ -68,7 +76,7 @@ impl OraSession {
             Err(e) => Err(anyhow!(e.to_string())),
         };
         if let Err(e) = &result
-            && (is_connection_lost(&format!("{e:#}")) || self.conn.is_poisoned())
+            && (is_connection_lost(&format!("{e:#}")) || self.gate.is_poisoned())
         {
             self.broken = true;
         }
@@ -109,17 +117,15 @@ impl OraSession {
 
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
         let statements = statements.to_vec();
-        let conn = Arc::clone(&self.conn);
+        let (conn, gate) = (Arc::clone(&self.conn), Arc::clone(&self.gate));
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-            let Ok(mut conn) = conn.lock() else {
+            let Ok(_guard) = gate.lock() else {
                 anyhow::bail!(tr("The Oracle connection became unusable"));
             };
-            conn.set_autocommit(false);
             let result = apply_in_transaction(&conn, &statements);
             if result.is_err() {
                 let _ = conn.rollback();
             }
-            conn.set_autocommit(true);
             result
         })
         .await;
@@ -148,10 +154,19 @@ impl OraSession {
 /// tries the usual places where people unpack it before giving up.
 fn open(user: &str, password: &str, connect_string: &str) -> Result<Connection, oracle::Error> {
     let connect = || -> Result<Connection, oracle::Error> {
-        let mut conn = Connector::new(user, password, connect_string).connect()?;
-        // The console runs each statement in auto-commit; `apply_changes` turns it off meanwhile.
-        conn.set_autocommit(true);
+        // Auto-commit stays off: `run` commits each console statement itself and
+        // `apply_changes` commits (or rolls back) its whole transaction.
+        let conn = Connector::new(user, password, connect_string).connect()?;
         let _ = conn.set_module("DataCraft");
+        // Dates and numbers as text in the same format the grid shows, so edited values,
+        // cloned rows and imports can be written back as plain literals.
+        conn.execute(
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS' \
+             NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF' \
+             NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM' \
+             NLS_NUMERIC_CHARACTERS = '.,'",
+            &[],
+        )?;
         Ok(conn)
     };
     match connect() {
@@ -403,11 +418,12 @@ fn run(conn: &Connection, sql: &str, display: String, max_rows: usize) -> Result
             rs.rows.push(kinds.iter().enumerate().map(|(i, k)| cell(&row, i, k)).collect());
         }
     } else {
-        // Auto-commit is on, so DML is committed by this same call.
         stmt.execute(&[])?;
         if stmt.is_dml() {
             rs.affected = Some(stmt.row_count()?);
         }
+        // The console works in auto-commit mode.
+        conn.commit()?;
     }
     rs.elapsed = start.elapsed();
     Ok(rs)
@@ -515,7 +531,7 @@ fn type_label(
     }
 }
 
-fn load_schemas(conn: &mut Connection) -> Result<Vec<SchemaInfo>, oracle::Error> {
+fn load_schemas(conn: &Connection) -> Result<Vec<SchemaInfo>, oracle::Error> {
     let user: String = conn.query_row_as("SELECT USER FROM dual", &[])?;
 
     let mut owners: Vec<String> = match conn.query_as::<String>(&owners_sql(true), &[]) {

@@ -133,10 +133,16 @@ struct Live {
     sessions: HashMap<String, SharedSession>,
 }
 
-/// A console's `Execute` in progress.
+/// A console's `Execute` in progress. Registered before waiting for the session, so a
+/// cancel that arrives meanwhile is not lost.
+#[derive(Default)]
 struct Running {
-    native: Option<CancelHandle>,
-    /// Abandons the query (engines without `native`).
+    /// Native cancel of the session's running statement (once the session is held).
+    native: std::sync::Mutex<Option<CancelHandle>>,
+    /// true while a statement of THIS execution is running on the server (a native cancel
+    /// outside that window could hit another console's query on a shared session).
+    in_flight: std::sync::atomic::AtomicBool,
+    /// Abandons the query (engines without native cancel, or if it failed).
     abandon: tokio::sync::Notify,
     cancelled: std::sync::atomic::AtomicBool,
 }
@@ -326,25 +332,52 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             out
         }
         Request::Cancel { console } => {
+            use std::sync::atomic::Ordering::SeqCst;
             let running = state.running.lock().unwrap_or_else(|e| e.into_inner()).get(&console).cloned();
             if let Some(r) = running {
-                r.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                match &r.native {
-                    Some(h) => {
-                        if h.cancel().await.is_err() {
+                r.cancelled.store(true, SeqCst);
+                let native = r.native.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                // The statement may not have reached the server yet when the first cancel
+                // arrives: retry while this same execution is still running a statement.
+                let still_running = || {
+                    r.in_flight.load(SeqCst)
+                        && state.running.lock().unwrap_or_else(|e| e.into_inner()).get(&console).is_some_and(|x| Arc::ptr_eq(x, &r))
+                };
+                for _ in 0..25 {
+                    if !still_running() {
+                        break;
+                    }
+                    match &native {
+                        Some(h) if h.cancel().await.is_ok() => {}
+                        _ => {
                             r.abandon.notify_one();
+                            break;
                         }
                     }
-                    None => r.abandon.notify_one(),
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                // Still running after ~5 s of native cancels: abandon it.
+                if still_running() {
+                    r.abandon.notify_one();
                 }
             }
             vec![]
         }
         Request::Execute { conn, db, console, statements, max_rows } => {
+            use std::sync::atomic::Ordering::SeqCst;
             let start = Instant::now();
+            let running = Arc::new(Running::default());
+            state.running.lock().unwrap_or_else(|e| e.into_inner()).insert(console, running.clone());
+            let unregister = |state: &State| {
+                let mut map = state.running.lock().unwrap_or_else(|e| e.into_inner());
+                if map.get(&console).is_some_and(|r| Arc::ptr_eq(r, &running)) {
+                    map.remove(&console);
+                }
+            };
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
                 Ok(s) => s,
                 Err(e) => {
+                    unregister(state);
                     return vec![Response::Executed {
                         console,
                         results: vec![],
@@ -354,12 +387,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 }
             };
             let mut s = session.lock().await;
-            let running = Arc::new(Running {
-                native: s.cancel_handle(),
-                abandon: tokio::sync::Notify::new(),
-                cancelled: std::sync::atomic::AtomicBool::new(false),
-            });
-            state.running.lock().unwrap_or_else(|e| e.into_inner()).insert(console, running.clone());
+            *running.native.lock().unwrap_or_else(|e| e.into_inner()) = s.cancel_handle();
             let statements_tail = statements.last().cloned();
             let mut results = Vec::new();
             let mut error = None;
@@ -368,17 +396,21 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 error = Some(format!("{e:#}"));
             } else {
                 for stmt in statements {
-                    let result = if running.native.is_some() {
-                        s.execute(&stmt, max_rows).await
-                    } else {
-                        tokio::select! {
-                            r = s.execute(&stmt, max_rows) => r,
-                            _ = running.abandon.notified() => {
-                                abandoned = true;
-                                Err(anyhow::anyhow!(tr("Query cancelled")))
-                            }
+                    // `in_flight` first: either this sees `cancelled` or the canceller sees
+                    // `in_flight` (and retries until the statement stops).
+                    running.in_flight.store(true, SeqCst);
+                    if running.cancelled.load(SeqCst) {
+                        running.in_flight.store(false, SeqCst);
+                        break;
+                    }
+                    let result = tokio::select! {
+                        r = s.execute(&stmt, max_rows) => r,
+                        _ = running.abandon.notified() => {
+                            abandoned = true;
+                            Err(anyhow::anyhow!(tr("Query cancelled")))
                         }
                     };
+                    running.in_flight.store(false, SeqCst);
                     match result {
                         Ok(rs) => results.extend(rs),
                         Err(e) => {
@@ -386,7 +418,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                             break;
                         }
                     }
-                    if running.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    if abandoned {
                         break;
                     }
                 }
@@ -399,8 +431,8 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             {
                 let _ = s.execute(&last, 0).await;
             }
-            state.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&console);
-            if running.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            unregister(state);
+            if running.cancelled.load(SeqCst) {
                 error = Some(tr("Query cancelled").to_string());
             }
             // An abandoned query leaves the session in an unknown state: it is closed.
@@ -540,6 +572,7 @@ mod tests {
         cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
         cfg.user = var("DATACRAFT_MY_USER");
         cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
         let w = Worker::start(egui::Context::default());
         w.send(Request::Connect(cfg));
         wait_for(&w, |r| matches!(r, Response::Connected { .. }));
