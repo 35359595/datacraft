@@ -21,6 +21,8 @@ const BLOB_PREVIEW: usize = 64;
 
 pub struct SqliteSession {
     conn: Arc<Mutex<Connection>>,
+    /// Interrupts the running statement (`sqlite3_interrupt`) without taking the lock.
+    interrupt: Arc<rusqlite::InterruptHandle>,
 }
 
 impl SqliteSession {
@@ -38,7 +40,12 @@ impl SqliteSession {
             Connection::open_with_flags(&path, flags).with_context(|| trf("Could not open {path}", &[("path", &path)]))
         })
         .await??;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        let interrupt = Arc::new(conn.get_interrupt_handle());
+        Ok(Self { conn: Arc::new(Mutex::new(conn)), interrupt })
+    }
+
+    pub fn interrupt_handle(&self) -> Arc<rusqlite::InterruptHandle> {
+        Arc::clone(&self.interrupt)
     }
 
     /// Runs `f` with the connection on a blocking thread.

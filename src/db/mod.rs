@@ -193,6 +193,24 @@ pub(crate) fn not_single_row(n: u64, stmt: &str) -> anyhow::Error {
     ))
 }
 
+/// Cancels the query a session is running, from outside that session.
+pub enum CancelHandle {
+    Postgres(tokio_postgres::CancelToken),
+    Sqlite(std::sync::Arc<rusqlite::InterruptHandle>),
+}
+
+impl CancelHandle {
+    pub async fn cancel(&self) -> anyhow::Result<()> {
+        match self {
+            CancelHandle::Postgres(t) => t.cancel_query(tokio_postgres::NoTls).await.map_err(anyhow::Error::from),
+            CancelHandle::Sqlite(h) => {
+                h.interrupt();
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Open session against a specific engine.
 pub enum Session {
     Postgres(postgres::PgSession),
@@ -273,6 +291,16 @@ impl Session {
             Session::MsSql(s) => s.apply_changes(statements).await,
             Session::MySql(s) => s.apply_changes(statements).await,
             Session::Oracle(s) => s.apply_changes(statements).await,
+        }
+    }
+
+    /// Native way to cancel this session's running query, if the engine has one. Without it
+    /// the worker abandons the query and closes the session.
+    pub fn cancel_handle(&self) -> Option<CancelHandle> {
+        match self {
+            Session::Postgres(s) => Some(CancelHandle::Postgres(s.cancel_token())),
+            Session::Sqlite(s) => Some(CancelHandle::Sqlite(s.interrupt_handle())),
+            _ => None,
         }
     }
 

@@ -91,6 +91,11 @@ impl PgSession {
         self.client.is_closed()
     }
 
+    /// Token to cancel the running query from another connection (`pg_cancel_backend`).
+    pub fn cancel_token(&self) -> tokio_postgres::CancelToken {
+        self.client.cancel_token()
+    }
+
     pub async fn execute(&mut self, sql: &str, max_rows: usize) -> anyhow::Result<Vec<ResultSet>> {
         let statement = sql.trim().to_string();
         let mut stream = std::pin::pin!(self.client.simple_query_raw(sql).await.map_err(pg_error)?);

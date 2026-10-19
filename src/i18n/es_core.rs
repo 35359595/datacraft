@@ -46,4 +46,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Minimize", "Minimizar"),
     ("Bring All to Front", "Traer todo al frente"),
     ("DataCraft Help", "Ayuda de DataCraft"),
+    ("Query cancelled", "Consulta cancelada"),
+    ("Query cancelled; the connection was closed and will reopen on the next run", "Consulta cancelada; la conexión se ha cerrado y se reabrirá en la próxima ejecución"),
 ];

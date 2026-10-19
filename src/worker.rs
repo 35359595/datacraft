@@ -5,7 +5,7 @@
 //! session (with `USE [db]` before each operation on SQL Server); PostgreSQL opens one
 //! session per database, because a PG connection cannot switch databases.
 
-use crate::db::{ConnectionConfig, DatabaseInfo, Driver, ResultSet, SchemaInfo, Session};
+use crate::db::{CancelHandle, ConnectionConfig, DatabaseInfo, Driver, ResultSet, SchemaInfo, Session};
 use crate::i18n::{tr, trf};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +46,9 @@ pub enum Request {
     /// `Execute`. `close_db`: database whose own session (PostgreSQL) is closed first, so
     /// it can be dropped.
     RunDdl { conn: ConnId, db: Option<String>, statements: Vec<String>, close_db: Option<String> },
+    /// Cancels what a console's `Execute` is running. Engines without a native cancel
+    /// abandon the query and close the session (it reconnects on the next run).
+    Cancel { console: ConsoleId },
 }
 
 pub enum Response {
@@ -130,9 +133,18 @@ struct Live {
     sessions: HashMap<String, SharedSession>,
 }
 
+/// A console's `Execute` in progress.
+struct Running {
+    native: Option<CancelHandle>,
+    /// Abandons the query (engines without `native`).
+    abandon: tokio::sync::Notify,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Default)]
 struct State {
     live: Mutex<HashMap<ConnId, Live>>,
+    running: std::sync::Mutex<HashMap<ConsoleId, Arc<Running>>>,
     /// Epoch per connection: changes with every Connect/Disconnect.
     epochs: std::sync::Mutex<HashMap<ConnId, u64>>,
 }
@@ -313,6 +325,21 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
             out
         }
+        Request::Cancel { console } => {
+            let running = state.running.lock().unwrap_or_else(|e| e.into_inner()).get(&console).cloned();
+            if let Some(r) = running {
+                r.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                match &r.native {
+                    Some(h) => {
+                        if h.cancel().await.is_err() {
+                            r.abandon.notify_one();
+                        }
+                    }
+                    None => r.abandon.notify_one(),
+                }
+            }
+            vec![]
+        }
         Request::Execute { conn, db, console, statements, max_rows } => {
             let start = Instant::now();
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
@@ -327,25 +354,54 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 }
             };
             let mut s = session.lock().await;
+            let running = Arc::new(Running {
+                native: s.cancel_handle(),
+                abandon: tokio::sync::Notify::new(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            });
+            state.running.lock().unwrap_or_else(|e| e.into_inner()).insert(console, running.clone());
             let mut results = Vec::new();
             let mut error = None;
+            let mut abandoned = false;
             if let Err(e) = s.use_database(&target).await {
                 error = Some(format!("{e:#}"));
             } else {
                 for stmt in statements {
-                    match s.execute(&stmt, max_rows).await {
+                    let result = if running.native.is_some() {
+                        s.execute(&stmt, max_rows).await
+                    } else {
+                        tokio::select! {
+                            r = s.execute(&stmt, max_rows) => r,
+                            _ = running.abandon.notified() => {
+                                abandoned = true;
+                                Err(anyhow::anyhow!(tr("Query cancelled")))
+                            }
+                        }
+                    };
+                    match result {
                         Ok(rs) => results.extend(rs),
                         Err(e) => {
                             error = Some(format!("{e:#}"));
                             break;
                         }
                     }
+                    if running.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                 }
             }
-            let lost = s.is_closed();
+            state.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&console);
+            if running.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                error = Some(tr("Query cancelled").to_string());
+            }
+            // An abandoned query leaves the session in an unknown state: it is closed.
+            let lost = abandoned || s.is_closed();
             drop(s);
             let mut out = vec![Response::Executed { console, results, error: error.clone(), elapsed: start.elapsed() }];
-            if lost {
+            if abandoned {
+                state.forget(conn, &session).await;
+                out.push(Response::ConnectFailed { conn, error: tr("Query cancelled; the connection was closed and will reopen on the next run").to_string() });
+            } else if lost {
                 // Forget the broken session; the UI will reconnect on the next run.
                 state.forget(conn, &session).await;
                 let detail = error.unwrap_or_default();
@@ -379,4 +435,50 @@ async fn load_databases(session: &mut Session, default_db: &str) -> anyhow::Resu
             DatabaseInfo { schemas: if current { schemas.take() } else { None }, current, name }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_for(w: &Worker, pred: impl Fn(&Response) -> bool) -> Response {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            for r in w.poll() {
+                if pred(&r) {
+                    return r;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for the worker");
+    }
+
+    #[test]
+    fn cancels_a_running_sqlite_query() {
+        let dir = std::env::temp_dir().join(format!("datacraft-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap().execute_batch("create table t(x)").unwrap();
+        let w = Worker::start(egui::Context::default());
+        let mut cfg = ConnectionConfig::new(7, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        // Endless recursive CTE: only a cancel stops it.
+        let endless = "with recursive c(n) as (select 1 union all select n + 1 from c) select count(*) from c".to_string();
+        w.send(Request::Execute { conn: 7, db: None, console: 1, statements: vec![endless], max_rows: 10 });
+        std::thread::sleep(Duration::from_millis(300));
+        w.send(Request::Cancel { console: 1 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 1, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert_eq!(error.as_deref(), Some(tr("Query cancelled")));
+        // The session is still usable.
+        w.send(Request::Execute { conn: 7, db: None, console: 2, statements: vec!["select 1".into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 2, .. }));
+        let Response::Executed { error, results, .. } = r else { unreachable!() };
+        assert!(error.is_none() && results.len() == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
