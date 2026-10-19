@@ -32,6 +32,8 @@ const SYSTEM_DATABASES: [&str; 2] = ["mysql", "sys"];
 
 pub struct MySession {
     conn: Conn,
+    /// Options the connection was opened with (to open the one that cancels its queries).
+    opts: OptsBuilder,
     /// Set on I/O or protocol errors: the connection is no longer usable.
     broken: bool,
 }
@@ -79,12 +81,13 @@ impl MySession {
             .with_danger_accept_invalid_certs(cfg.trust_cert)
             .with_danger_skip_domain_validation(cfg.trust_cert);
 
-        let conn = match open(base.clone().ssl_opts(ssl)).await {
+        let with_tls = base.clone().ssl_opts(ssl);
+        let (conn, opts) = match open(with_tls.clone()).await {
             // Server without TLS: plain connection.
             Err(Some(mysql_async::Error::Driver(DriverError::NoClientSslFlagFromServer))) => {
-                open(base).await
+                (open(base.clone()).await, base)
             }
-            other => other,
+            other => (other, with_tls),
         };
         let conn = conn.map_err(|e| match e {
             None => anyhow!(trf("Timed out connecting to {host}:{port}", &[("host", &host), ("port", &port)])),
@@ -95,7 +98,12 @@ impl MySession {
             .context(io.to_string()),
             Some(other) => my_error(other),
         })?;
-        Ok(Self { conn, broken: false })
+        Ok(Self { conn, opts, broken: false })
+    }
+
+    /// Options and server thread id to `KILL QUERY` this session's running statement.
+    pub fn cancel_target(&self) -> (OptsBuilder, u32) {
+        (self.opts.clone().db_name(None::<String>), self.conn.id())
     }
 
     pub async fn execute(&mut self, sql: &str, max_rows: usize) -> anyhow::Result<Vec<ResultSet>> {

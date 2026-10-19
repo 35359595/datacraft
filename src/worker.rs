@@ -481,4 +481,31 @@ mod tests {
         assert!(error.is_none() && results.len() == 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).
+    #[test]
+    #[ignore]
+    fn cancels_a_running_mysql_query() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(8, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        let start = Instant::now();
+        w.send(Request::Execute { conn: 8, db: None, console: 1, statements: vec!["select sleep(30)".into()], max_rows: 10 });
+        std::thread::sleep(Duration::from_millis(500));
+        w.send(Request::Cancel { console: 1 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 1, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert_eq!(error.as_deref(), Some(tr("Query cancelled")));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        w.send(Request::Execute { conn: 8, db: None, console: 2, statements: vec!["select 1".into()], max_rows: 10 });
+        let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 2, .. }));
+        let Response::Executed { error, .. } = r else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+    }
 }
