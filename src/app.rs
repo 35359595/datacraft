@@ -20,8 +20,8 @@
 //! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
-//! `DATACRAFT_DEMO_DROP=table` opens the confirmation to drop the first table;
-//! `table-submit` also drops it.
+//! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
+//! rename (to `<name>_renamed`) the first table; with `-submit` (e.g. `rename-submit`) it also runs it.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -558,14 +558,23 @@ impl DataCraftApp {
                             self.active = 0;
                         }
                         let demo_drop = std::env::var("DATACRAFT_DEMO_DROP").unwrap_or_default();
-                        if demo_drop.starts_with("table")
+                        let demo_kind = match demo_drop.split('-').next() {
+                            Some("table") => Some(DropKind::Table),
+                            Some("truncate") => Some(DropKind::Truncate),
+                            Some("rename") => Some(DropKind::Rename),
+                            _ => None,
+                        };
+                        if let Some(kind) = demo_kind
                             && let Some(t) = self.explorer.selected_table.clone()
                             && let Some(driver) = self.conn(conn).map(|c| c.cfg.driver)
                         {
-                            let mut d = DropDialog::object(conn, driver, DropKind::Table, t.db.clone(), t.schema, t.table);
-                            if demo_drop == "table-submit" {
+                            let mut d = DropDialog::object(conn, driver, kind, t.db.clone(), t.schema, t.table);
+                            if kind == DropKind::Rename {
+                                d.new_name = format!("{}_renamed", d.name);
+                            }
+                            if demo_drop.ends_with("-submit") {
                                 d.running = true;
-                                let statements = vec![crate::ui::drop_dialog::drop_sql(driver, DropKind::Table, &d.schema, &d.name)];
+                                let statements = vec![d.sql()];
                                 self.worker.send(Request::RunDdl { conn, db: Some(t.db), statements, close_db: None });
                             }
                             self.drop = Some(d);
@@ -1133,11 +1142,9 @@ impl DataCraftApp {
                         self.drop = Some(DropDialog::database(id, c.cfg.driver, db));
                     }
                 }
-                ExplorerAction::DropObject(t, kind) => {
-                    if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
-                        self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind.into(), t.db, t.schema, t.table));
-                    }
-                }
+                ExplorerAction::DropObject(t, kind) => self.open_object_dialog(t, kind.into()),
+                ExplorerAction::TruncateTable(t) => self.open_object_dialog(t, DropKind::Truncate),
+                ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1151,6 +1158,13 @@ impl DataCraftApp {
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
                 ExplorerAction::Hide => self.show_explorer = false,
             }
+        }
+    }
+
+    /// Drop / truncate / rename confirmation for a table or view.
+    fn open_object_dialog(&mut self, t: TableRef, kind: DropKind) {
+        if let Some(c) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) {
+            self.drop = Some(DropDialog::object(t.conn, c.cfg.driver, kind, t.db, t.schema, t.table));
         }
     }
 
@@ -1234,7 +1248,24 @@ impl DataCraftApp {
                 }
                 self.worker.send(Request::Refresh(conn));
             }
-            DropKind::Table | DropKind::View => {
+            DropKind::Truncate => {
+                // Open data editors of that table show the (now empty) data again.
+                let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+                let editors: Vec<usize> = (0..self.consoles.len())
+                    .filter(|&i| {
+                        let c = &self.consoles[i];
+                        c.conn == Some(conn)
+                            && c.db.as_deref().or(default_db.as_deref()) == Some(d.db.as_str())
+                            && c.table.as_ref().is_some_and(|t| t.schema == d.schema && t.table == d.name)
+                            && !c.is_busy()
+                    })
+                    .collect();
+                for i in editors {
+                    self.reload_table(i);
+                }
+                self.info(trf("Table “{name}” truncated", &[("name", &d.name)]));
+            }
+            DropKind::Table | DropKind::View | DropKind::Rename => {
                 // Its data editors no longer have anything to show.
                 let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
                 let gone = |c: &Console| {
@@ -1254,8 +1285,15 @@ impl DataCraftApp {
                     c.loading.remove(&d.db);
                 }
                 self.load_database(conn, d.db.clone());
-                let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
-                self.info(trf(msg, &[("name", &d.name)]));
+                if d.kind == DropKind::Rename {
+                    let renamed = TableRef { table: d.new_name.trim().to_string(), ..tref };
+                    self.explorer.selected = Some(explorer::table_key(&renamed));
+                    self.explorer.selected_table = Some(renamed);
+                    self.info(trf("Table “{name}” renamed to “{new_name}”", &[("name", &d.name), ("new_name", &d.new_name.trim())]));
+                } else {
+                    let msg = if d.kind == DropKind::Table { "Table “{name}” dropped" } else { "View “{name}” dropped" };
+                    self.info(trf(msg, &[("name", &d.name)]));
+                }
             }
         }
     }
@@ -2228,7 +2266,7 @@ impl DataCraftApp {
                     let (conn, db, close_db) = match d.kind {
                         // Run from the connection's default database, never from the one being dropped.
                         DropKind::Database => (d.conn, None, Some(d.db.clone())),
-                        DropKind::Table | DropKind::View => (d.conn, Some(d.db.clone()), None),
+                        _ => (d.conn, Some(d.db.clone()), None),
                     };
                     self.worker.send(Request::RunDdl { conn, db, statements, close_db });
                 }

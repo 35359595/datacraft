@@ -52,6 +52,8 @@ pub enum ExplorerAction {
     DropDatabase(ConnId, String),
     /// Confirm and drop a table or view.
     DropObject(TableRef, ObjectKind),
+    TruncateTable(TableRef),
+    RenameTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     OpenTable(TableRef),
@@ -785,6 +787,16 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
             ui.close();
+        }
+        if t.kind == ObjectKind::Table {
+            if ui.button(tr("Rename…")).clicked() {
+                actions.push(ExplorerAction::RenameTable(tref.clone()));
+                ui.close();
+            }
+            if ui.button(tr("Truncate…")).clicked() {
+                actions.push(ExplorerAction::TruncateTable(tref.clone()));
+                ui.close();
+            }
         }
         if ui.button(RichText::new(tr("Drop…")).color(p.error)).clicked() {
             actions.push(ExplorerAction::DropObject(tref.clone(), t.kind));
