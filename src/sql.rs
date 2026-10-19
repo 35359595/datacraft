@@ -150,6 +150,7 @@ pub const KEYWORDS: &[&str] = &[
     "ANALYZE",
     "AND",
     "ANY",
+    "APPLY",
     "ARRAY",
     "AS",
     "ASC",
@@ -439,6 +440,443 @@ fn is_go_line(script: &str, tok: &Token) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Explain plan
+// ---------------------------------------------------------------------------
+
+/// Statements that show the execution plan of `stmt` on each engine, to run one by one
+/// (on SQL Server each one is its own batch: `SET SHOWPLAN_TEXT` must be alone in its batch).
+/// Empty if `stmt` has nothing to explain.
+pub fn explain_statements(stmt: &str, driver: Driver) -> Vec<String> {
+    let s = stmt.trim().trim_end_matches(';').trim_end();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    match driver {
+        Driver::Postgres | Driver::MySql | Driver::MariaDb => vec![format!("EXPLAIN {s}")],
+        Driver::Sqlite => vec![format!("EXPLAIN QUERY PLAN {s}")],
+        Driver::MsSql => vec!["SET SHOWPLAN_TEXT ON".into(), s.to_string(), "SET SHOWPLAN_TEXT OFF".into()],
+        Driver::Oracle => vec![
+            format!("EXPLAIN PLAN FOR {s}"),
+            "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY())".into(),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formatter
+// ---------------------------------------------------------------------------
+
+/// Keywords that are never used as plain identifiers in practice: always uppercased.
+/// The rest of [`KEYWORDS`] (types and nouns such as `date`, `type`, `key`, `text`) are
+/// uppercased only where they cannot be a table, column or alias name.
+const RESERVED: &[&str] = &[
+    "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "COMMIT",
+    "CONSTRAINT", "CREATE", "CROSS", "DECLARE", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "END",
+    "EXCEPT", "EXEC", "EXECUTE", "EXISTS", "EXPLAIN", "FALSE", "FOREIGN", "FROM", "FULL", "FUNCTION", "GRANT",
+    "GROUP", "HAVING", "IF", "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT", "INTO", "IS", "JOIN",
+    "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER",
+    "PRIMARY", "PROCEDURE", "REFERENCES", "RETURNING", "REVOKE", "RIGHT", "ROLLBACK", "SELECT", "SET", "SOME",
+    "TABLE", "THEN", "TOP", "TRIGGER", "TRUE", "TRUNCATE", "UNION", "UNIQUE", "UPDATE", "USING", "VALUES", "VIEW",
+    "WHEN", "WHERE", "WITH",
+];
+
+/// Words after which a non-reserved keyword is a name (`FROM date`, `AS type`...).
+const NAME_INTRODUCERS: &[&str] = &["AS", "FROM", "JOIN", "INTO", "UPDATE", "TABLE", "VIEW"];
+
+/// Keywords followed by a space before `(` (never added after other words: on MySQL a
+/// space between a built-in function and `(` changes how it is parsed).
+const SPACE_BEFORE_PAREN: &[&str] = &[
+    "AND", "AS", "ELSE", "EXCEPT", "EXISTS", "FROM", "IN", "INTERSECT", "JOIN", "NOT", "ON", "OR", "THEN", "UNION",
+    "USING", "WHEN", "WHERE",
+];
+
+const JOIN_MODIFIERS: &[&str] = &["INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "NATURAL"];
+
+/// Words that start a main clause (a comment right before one is indented like it).
+const CLAUSE_WORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "VALUES", "SET",
+    "JOIN", "RETURNING",
+];
+
+/// Clause of a query level, which decides how commas and `AND`/`OR` are laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Clause {
+    None,
+    With,
+    Select,
+    From,
+    Where,
+    Having,
+    Set,
+    Values,
+    Other,
+}
+
+impl Clause {
+    /// One item per line after a comma.
+    fn is_list(self) -> bool {
+        matches!(self, Clause::With | Clause::Select | Clause::Set | Clause::Values)
+    }
+}
+
+/// Nesting level: the whole statement or a parenthesis.
+struct Level {
+    /// Column where its lines start (the statement's or the one right after the `(`).
+    base: usize,
+    /// Statement or subquery (clauses go on their own lines); otherwise a plain parenthesis
+    /// (function arguments, column lists...) laid out on one line.
+    query: bool,
+    clause: Clause,
+    /// Column of the first item of a list clause, where the next items are aligned.
+    list_col: Option<usize>,
+    /// Inside `BETWEEN … AND`: that `AND` doesn't break the line.
+    between: bool,
+    case_depth: usize,
+    /// No token emitted in this level yet.
+    empty: bool,
+}
+
+impl Level {
+    fn new(base: usize, query: bool) -> Self {
+        Level { base, query, clause: Clause::None, list_col: None, between: false, case_depth: 0, empty: true }
+    }
+
+    /// Column for a line that continues the current clause.
+    fn cont_col(&self) -> usize {
+        if !self.query || self.empty {
+            self.base
+        } else if self.clause.is_list() {
+            self.list_col.unwrap_or(self.base + 4)
+        } else {
+            self.base + 4
+        }
+    }
+}
+
+/// Formatted output with column tracking.
+struct Out {
+    s: String,
+    /// Column where the text starts (the first line is not indented by the formatter).
+    indent0: usize,
+}
+
+impl Out {
+    fn col(&self) -> usize {
+        match self.s.rfind('\n') {
+            Some(i) => self.s[i + 1..].chars().count(),
+            None => self.indent0 + self.s.chars().count(),
+        }
+    }
+
+    fn at_line_start(&self) -> bool {
+        match self.s.rfind('\n') {
+            Some(i) => self.s[i + 1..].bytes().all(|b| b == b' '),
+            None => self.s.is_empty(),
+        }
+    }
+
+    /// New line (or the current one if it is still empty) indented to `col`; `blank` leaves
+    /// an empty line before it. Nothing at the very start of the text.
+    fn newline(&mut self, col: usize, blank: bool) {
+        let keep = self.s.trim_end_matches(' ').len();
+        self.s.truncate(keep);
+        if self.s.is_empty() {
+            return;
+        }
+        if !self.s.ends_with('\n') {
+            self.s.push('\n');
+        }
+        if blank && !self.s.ends_with("\n\n") {
+            self.s.push('\n');
+        }
+        self.s.extend(std::iter::repeat_n(' ', col));
+    }
+}
+
+/// Reformats SQL like DataGrip's "Reformat Code": keywords in uppercase, each main clause
+/// (`SELECT`, `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, joins, `UNION`,
+/// `VALUES`, `SET`, `RETURNING`) on its own line, one select / `SET` / `VALUES` / CTE item per
+/// line aligned with the first one, `AND` / `OR` of `WHERE` and `HAVING` on their own lines and
+/// subqueries aligned after their `(`.
+///
+/// Only whitespace and the case of keywords change: strings, comments, quoted identifiers
+/// and dollar-quoted bodies are copied verbatim, the spacing around operators is kept as
+/// typed (`::`, `->>`, `-1`, `$1`, `@var`), blank lines are kept and a line comment always
+/// ends its line. Non-reserved keywords that `is_ident` reports as known names (tables,
+/// columns, lowercase) keep their case. The result is stable: formatting it again changes
+/// nothing. `indent` is the column where `text` starts in the editor.
+pub fn format_sql(text: &str, driver: Driver, indent: usize, is_ident: &dyn Fn(&str) -> bool) -> String {
+    let dialect = Dialect::for_driver(driver);
+    let toks: Vec<Token> = Lexer::new(text, dialect).filter(|t| t.kind != Kind::Whitespace).collect();
+    let src = |t: &Token| &text[t.start..t.end];
+    let is_comment = |t: &Token| matches!(t.kind, Kind::LineComment | Kind::BlockComment);
+    let upper = |t: &Token| if t.kind == Kind::Word { src(t).to_ascii_uppercase() } else { src(t).to_string() };
+    // The next `n` significant tokens after `i` (words uppercased).
+    let peek = |i: usize, n: usize| -> Vec<String> {
+        toks[i + 1..].iter().filter(|t| !is_comment(t)).take(n).map(upper).collect()
+    };
+
+    let mut out = Out { s: String::with_capacity(text.len() + text.len() / 4), indent0: indent };
+    let mut stack = vec![Level::new(indent, true)];
+    let mut stmt_start = true;
+    let mut stmt_kind = String::new();
+    // A line comment was just emitted: the next token goes on a new line.
+    let mut force_nl = false;
+    // After a list comma: column of the next item's line.
+    let mut comma_nl: Option<usize> = None;
+    // Remaining words of a multi-word clause keyword (`GROUP BY`, `LEFT OUTER JOIN`).
+    let mut phrase_left = 0usize;
+    let mut want_list_col = false;
+    let mut prev: Option<Token> = None;
+    let mut prev_sig: Option<Token> = None;
+    let mut prev_word = String::new();
+    let mut prev_end = 0usize;
+    // `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`: `VALUES(x)` is a function there.
+    let mut upsert = false;
+    let mut after_fake_go = false;
+
+    for (i, tok) in toks.iter().enumerate() {
+        let gap = &text[prev_end..tok.start];
+        prev_end = tok.end;
+        let had_ws = !gap.is_empty();
+        let src_nl = gap.contains('\n');
+        let blank = gap.matches('\n').count() >= 2;
+        let raw = src(tok);
+
+        if is_comment(tok) {
+            let lvl = stack.last().expect("root level");
+            let next_breaks = peek(i, 1)
+                .first()
+                .is_some_and(|w| CLAUSE_WORDS.contains(&w.as_str()) || JOIN_MODIFIERS.contains(&w.as_str()));
+            let col = if stmt_start {
+                stack[0].base
+            } else if next_breaks && lvl.query {
+                lvl.base
+            } else {
+                comma_nl.unwrap_or_else(|| lvl.cont_col())
+            };
+            if force_nl || src_nl {
+                out.newline(col, blank);
+            } else if !out.at_line_start() {
+                out.s.push(' ');
+            }
+            out.s.push_str(if tok.kind == Kind::LineComment { raw.trim_end() } else { raw });
+            force_nl = tok.kind == Kind::LineComment;
+            prev = Some(*tok);
+            continue;
+        }
+
+        let word = upper(tok);
+        let is_word = tok.kind == Kind::Word;
+
+        // T-SQL `GO`: alone on its line, ends the batch.
+        if is_word && dialect.go_separator && is_go_line(text, tok) {
+            out.newline(0, blank);
+            out.s.push_str(raw);
+            force_nl = true;
+            stack.truncate(1);
+            stack[0] = Level::new(indent, true);
+            stmt_start = true;
+            upsert = false;
+            comma_nl = None;
+            phrase_left = 0;
+            want_list_col = false;
+            prev = Some(*tok);
+            prev_sig = Some(*tok);
+            prev_word.clear();
+            continue;
+        }
+
+        let depth = stack.len();
+        let lvl = stack.last_mut().expect("root level");
+        let in_phrase = phrase_left > 0;
+        if in_phrase {
+            phrase_left -= 1;
+        }
+
+        // Main clause starting at this word?
+        let mut clause: Option<(Clause, usize)> = None;
+        if is_word && lvl.query && !in_phrase {
+            let next = peek(i, 4);
+            let n0 = next.first().map(String::as_str).unwrap_or("");
+            clause = match word.as_str() {
+                "WITH" if lvl.empty => Some((Clause::With, 1)),
+                "SELECT" => Some((Clause::Select, 1)),
+                "FROM" if prev_word != "DELETE" && prev_word != "DISTINCT" => Some((Clause::From, 1)),
+                "WHERE" => Some((Clause::Where, 1)),
+                "GROUP" | "ORDER" if n0 == "BY" => Some((Clause::Other, 2)),
+                "HAVING" => Some((Clause::Having, 1)),
+                "LIMIT" | "RETURNING" => Some((Clause::Other, 1)),
+                "UNION" | "INTERSECT" | "EXCEPT" => {
+                    Some((Clause::None, if n0 == "ALL" || n0 == "DISTINCT" { 2 } else { 1 }))
+                }
+                "VALUES" if prev_word != "DEFAULT" && !upsert => Some((Clause::Values, 1)),
+                "SET" if depth == 1 && stmt_kind == "UPDATE" => Some((Clause::Set, 1)),
+                "JOIN" | "STRAIGHT_JOIN" => Some((Clause::From, 1)),
+                w if JOIN_MODIFIERS.contains(&w) => {
+                    let k = next.iter().take_while(|n| JOIN_MODIFIERS.contains(&n.as_str())).count();
+                    matches!(next.get(k).map(String::as_str), Some("JOIN" | "APPLY")).then_some((Clause::From, k + 2))
+                }
+                _ => None,
+            };
+        }
+
+        // Where this token goes: a new line at some column, or the current line.
+        let mut nl: Option<usize> = None;
+        let pending_comma = comma_nl.take();
+        if stmt_start {
+            if !out.s.is_empty() {
+                nl = Some(lvl.base);
+            }
+        } else if clause.is_some() && !lvl.empty {
+            nl = Some(lvl.base);
+        } else if is_word
+            && (word == "AND" || word == "OR")
+            && !in_phrase
+            && matches!(lvl.clause, Clause::Where | Clause::Having)
+            && lvl.case_depth == 0
+        {
+            if word == "AND" && lvl.between {
+                lvl.between = false;
+            } else {
+                nl = Some(lvl.base + if word == "AND" { 2 } else { 3 });
+            }
+        } else if let Some(col) = pending_comma {
+            nl = Some(col);
+        }
+        let closing =
+            tok.kind == Kind::Semicolon || (tok.kind == Kind::Punct && matches!(raw, "," | ")" | "."));
+        if nl.is_none() && (force_nl || (blank && !closing)) {
+            nl = Some(lvl.cont_col());
+        }
+        // A T-SQL `go` that is not a batch separator must never end up alone on its line
+        // (it would become one): it stays with the previous token and the next one with it.
+        let fake_go = is_word && dialect.go_separator && word == "GO";
+        if (fake_go || after_fake_go) && !force_nl {
+            nl = None;
+        }
+        after_fake_go = fake_go;
+        match nl {
+            Some(col) => out.newline(col, blank && !closing),
+            None => {
+                if let Some(p) = prev
+                    && !out.at_line_start()
+                    && space_between(&p, src(&p), &prev_word, tok, raw, had_ws)
+                {
+                    out.s.push(' ');
+                }
+            }
+        }
+        force_nl = false;
+
+        if want_list_col && !in_phrase {
+            lvl.list_col = Some(out.col());
+            want_list_col = false;
+        }
+
+        // Keyword case.
+        let next_is_dot = peek(i, 1).first().is_some_and(|n| n == ".");
+        let prev_is_dot = prev_sig.is_some_and(|p| p.kind == Kind::Punct && src(&p) == ".");
+        let upper_it = is_word && is_keyword(raw) && !prev_is_dot && !next_is_dot && {
+            let reserved = RESERVED.contains(&word.as_str());
+            let cast_type = prev_word == "AS" && !lvl.query;
+            let name_pos = NAME_INTRODUCERS.contains(&prev_word.as_str()) && !cast_type;
+            reserved || (!name_pos && !is_ident(&raw.to_lowercase()))
+        };
+        out.s.push_str(if upper_it { &word } else { raw });
+
+        // State after the token.
+        lvl.empty = false;
+        if let Some((c, len)) = clause {
+            lvl.clause = c;
+            lvl.list_col = None;
+            lvl.between = false;
+            want_list_col = c.is_list();
+            phrase_left = len - 1;
+        }
+        if is_word {
+            match word.as_str() {
+                "CASE" => lvl.case_depth += 1,
+                "END" => lvl.case_depth = lvl.case_depth.saturating_sub(1),
+                "BETWEEN" => lvl.between = true,
+                _ => {}
+            }
+        }
+        if tok.kind == Kind::Punct
+            && raw == ","
+            && lvl.case_depth == 0
+            && (matches!(lvl.clause, Clause::With | Clause::Select | Clause::Set)
+                || (lvl.clause == Clause::Values && prev_sig.is_some_and(|p| src(&p) == ")")))
+        {
+            comma_nl = Some(lvl.list_col.unwrap_or(lvl.base + 4));
+        }
+        if stmt_start {
+            stmt_kind = word.clone();
+            stmt_start = false;
+        } else if is_word && word == "UPDATE" && lvl.query {
+            lvl.clause = Clause::Other;
+            upsert = true;
+        }
+        if tok.kind == Kind::Punct && raw == "(" {
+            let query = peek(i, 1).first().is_some_and(|n| matches!(n.as_str(), "SELECT" | "WITH" | "VALUES"));
+            let col = out.col();
+            stack.push(Level::new(col, query));
+        } else if tok.kind == Kind::Punct && raw == ")" {
+            if stack.len() > 1 {
+                stack.pop();
+            }
+        } else if tok.kind == Kind::Semicolon {
+            stack.truncate(1);
+            stack[0] = Level::new(indent, true);
+            stmt_start = true;
+            upsert = false;
+            comma_nl = None;
+            phrase_left = 0;
+            want_list_col = false;
+        }
+        prev = Some(*tok);
+        prev_sig = Some(*tok);
+        prev_word = if is_word { word } else { String::new() };
+    }
+    out.s
+}
+
+/// Whether a space goes between two tokens on the same line. Never glues tokens that were
+/// apart in a way that matters, nor separates operators typed together.
+fn space_between(p: &Token, ptext: &str, pword: &str, c: &Token, ctext: &str, had_ws: bool) -> bool {
+    let is = |t: &Token, text: &str, s: &str| t.kind == Kind::Punct && text == s;
+    if c.kind == Kind::Semicolon || is(c, ctext, ",") || is(c, ctext, ")") {
+        return false;
+    }
+    if is(p, ptext, ".") || is(c, ctext, ".") {
+        // `1 .x` / `x. 5` would lex as a number if glued.
+        return had_ws && (p.kind == Kind::Number || c.kind == Kind::Number);
+    }
+    if is(p, ptext, "(") {
+        return false;
+    }
+    if is(p, ptext, ",") || matches!(p.kind, Kind::LineComment | Kind::BlockComment) {
+        return true;
+    }
+    let tight =
+        |t: &Token, text: &str| t.kind == Kind::Op || (t.kind == Kind::Punct && matches!(text, "[" | "]" | "{" | "}"));
+    if tight(p, ptext) || tight(c, ctext) {
+        return had_ws;
+    }
+    // Prefixed literals (`_utf8'x'`, Oracle `q'[…]'`): keep them glued.
+    if !had_ws
+        && matches!(c.kind, Kind::Str | Kind::QuotedIdent)
+        && matches!(p.kind, Kind::Word | Kind::Number | Kind::Str | Kind::QuotedIdent)
+    {
+        return false;
+    }
+    if is(c, ctext, "(") {
+        return had_ws || (p.kind == Kind::Word && SPACE_BEFORE_PAREN.contains(&pword));
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
 
@@ -472,6 +910,8 @@ struct Dialect {
     /// `@var` and `#temp` as words (T-SQL).
     tsql_names: bool,
     go_separator: bool,
+    /// `#` starts a line comment (MySQL / MariaDB).
+    hash_comments: bool,
 }
 
 impl Dialect {
@@ -483,6 +923,7 @@ impl Dialect {
         nested_comments: true,
         tsql_names: true,
         go_separator: false,
+        hash_comments: false,
     };
 
     fn for_driver(driver: Driver) -> Self {
@@ -494,6 +935,7 @@ impl Dialect {
                 nested_comments: true,
                 tsql_names: false,
                 go_separator: false,
+                hash_comments: false,
             },
             Driver::Sqlite => Dialect {
                 brackets: true,
@@ -502,6 +944,7 @@ impl Dialect {
                 nested_comments: false,
                 tsql_names: false,
                 go_separator: false,
+                hash_comments: false,
             },
             Driver::MsSql => Dialect {
                 brackets: true,
@@ -510,6 +953,7 @@ impl Dialect {
                 nested_comments: false,
                 tsql_names: true,
                 go_separator: true,
+                hash_comments: false,
             },
             Driver::MySql | Driver::MariaDb => Dialect {
                 brackets: false,
@@ -518,6 +962,7 @@ impl Dialect {
                 nested_comments: false,
                 tsql_names: false,
                 go_separator: false,
+                hash_comments: true,
             },
             Driver::Oracle => Dialect {
                 brackets: false,
@@ -526,6 +971,7 @@ impl Dialect {
                 nested_comments: false,
                 tsql_names: false,
                 go_separator: false,
+                hash_comments: false,
             },
         }
     }
@@ -628,6 +1074,10 @@ impl<'a> Lexer<'a> {
                 Kind::Whitespace
             }
             b'-' if next == Some(b'-') => {
+                self.eat_while(|b| b != b'\n');
+                Kind::LineComment
+            }
+            b'#' if self.dialect.hash_comments => {
                 self.eat_while(|b| b != b'\n');
                 Kind::LineComment
             }
@@ -1029,5 +1479,245 @@ mod tests {
         let c = color_of("-- c");
         assert!(c.italics && c.color == Palette::LIGHT.comment);
         assert_eq!(color_of(" t ").color, Palette::LIGHT.text);
+    }
+
+    // ------------------------------------------------------------------ formatter
+
+    /// Significant tokens (words compared without case, line comments trimmed).
+    fn token_texts(s: &str, d: Driver) -> Vec<(Kind, String)> {
+        Lexer::new(s, Dialect::for_driver(d))
+            .filter(|t| t.kind != Kind::Whitespace)
+            .map(|t| {
+                let text = &s[t.start..t.end];
+                let text = match t.kind {
+                    Kind::Word => text.to_ascii_uppercase(),
+                    Kind::LineComment => text.trim_end().to_string(),
+                    _ => text.to_string(),
+                };
+                (t.kind, text)
+            })
+            .collect()
+    }
+
+    /// Formats checking that only whitespace / keyword case changed and that it is stable.
+    fn fmt_core(s: &str, d: Driver, idents: &[&str]) -> String {
+        let is_ident = |w: &str| idents.contains(&w);
+        let out = format_sql(s, d, 0, &is_ident);
+        assert_eq!(token_texts(s, d), token_texts(&out, d), "tokens changed:\n{s}\n---\n{out}");
+        let again = format_sql(&out, d, 0, &is_ident);
+        assert_eq!(out, again, "not idempotent:\n{out}\n---\n{again}");
+        out
+    }
+
+    fn fmt_with(s: &str, d: Driver, idents: &[&str]) -> String {
+        let out = fmt_core(s, d, idents);
+        assert!(!out.lines().any(|l| l.ends_with(' ')), "trailing spaces:\n{out}");
+        out
+    }
+
+    fn fmt(s: &str, d: Driver) -> String {
+        fmt_with(s, d, &[])
+    }
+
+    #[test]
+    fn format_basic_select() {
+        let out = fmt("select o.id, u.name, o.total from orders o join users u on u.id = o.user_id where o.total > 10 and u.name like 'a%' order by o.total desc limit 5", Driver::Postgres);
+        assert_eq!(
+            out,
+            "SELECT o.id,\n       u.name,\n       o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\n  AND u.name LIKE 'a%'\nORDER BY o.total DESC\nLIMIT 5"
+        );
+        // A single item stays on the SELECT line.
+        assert_eq!(fmt("SELECT *   FROM t", Driver::Sqlite), "SELECT *\nFROM t");
+        assert_eq!(fmt("select count(*) from t", Driver::Sqlite), "SELECT count(*)\nFROM t");
+    }
+
+    #[test]
+    fn format_joins_groups_and_set_ops() {
+        let out = fmt(
+            "select a, count(*) from t left outer join u on t.id=u.id cross join v group by a having count(*) > 1 or a is null union all select 1, 2",
+            Driver::MySql,
+        );
+        assert_eq!(
+            out,
+            "SELECT a,\n       count(*)\nFROM t\nLEFT OUTER JOIN u ON t.id=u.id\nCROSS JOIN v\nGROUP BY a\nHAVING count(*) > 1\n   OR a IS NULL\nUNION ALL\nSELECT 1,\n       2"
+        );
+        // LEFT( is a function, not a join.
+        assert_eq!(fmt("select left(name, 2) from t", Driver::MySql), "SELECT LEFT(name, 2)\nFROM t");
+        // T-SQL APPLY.
+        assert!(fmt("select * from a cross apply f(a.x) b", Driver::MsSql).contains("\nCROSS APPLY f(a.x) b"));
+    }
+
+    #[test]
+    fn format_dml() {
+        assert_eq!(
+            fmt("insert into t (a, b) values (1, 'x'), (2, 'y')", Driver::Postgres),
+            "INSERT INTO t (a, b)\nVALUES (1, 'x'),\n       (2, 'y')"
+        );
+        assert_eq!(
+            fmt("update t set a = 1, b = 'z' where id = 3 returning id", Driver::Postgres),
+            "UPDATE t\nSET a = 1,\n    b = 'z'\nWHERE id = 3\nRETURNING id"
+        );
+        assert_eq!(fmt("delete from t where a between 1 and 5 and b = 2", Driver::Sqlite), "DELETE FROM t\nWHERE a BETWEEN 1 AND 5\n  AND b = 2");
+        // ALTER … SET is not an UPDATE clause; DEFAULT VALUES stays together.
+        assert_eq!(fmt("alter table t alter column c set default 1", Driver::Postgres), "ALTER TABLE t ALTER COLUMN c SET DEFAULT 1");
+        assert_eq!(fmt("insert into t default values", Driver::Postgres), "INSERT INTO t DEFAULT VALUES");
+        // MySQL ON DUPLICATE KEY UPDATE: VALUES() is a function there and keeps no space.
+        let out = fmt("insert into t (a) values (1) on duplicate key update a = values(a), b = 2", Driver::MySql);
+        assert!(out.ends_with("ON duplicate KEY UPDATE a = VALUES(a), b = 2"), "{out}");
+    }
+
+    #[test]
+    fn format_subqueries_and_ctes() {
+        assert_eq!(
+            fmt("select * from (select a, b from t where x = 1) s where s.a in (select id from u)", Driver::Postgres),
+            "SELECT *\nFROM (SELECT a,\n             b\n      FROM t\n      WHERE x = 1) s\nWHERE s.a IN (SELECT id\n              FROM u)"
+        );
+        assert_eq!(
+            fmt("with a as (select 1 as x), b as (select 2 as y) select * from a, b", Driver::Postgres),
+            "WITH a AS (SELECT 1 AS x),\n     b AS (SELECT 2 AS y)\nSELECT *\nFROM a, b"
+        );
+        assert_eq!(fmt("select exists(select 1 from t)", Driver::Postgres), "SELECT EXISTS (SELECT 1\n               FROM t)");
+        // Non-query parentheses stay on one line, even with clause words inside.
+        assert_eq!(fmt("select extract(year from d), trim(both 'x' from s) from t", Driver::Postgres), "SELECT extract(year FROM d),\n       trim(BOTH 'x' FROM s)\nFROM t");
+        assert_eq!(
+            fmt("select row_number() over (partition by a order by b) from t", Driver::Postgres),
+            "SELECT row_number() OVER (PARTITION BY a ORDER BY b)\nFROM t"
+        );
+        assert_eq!(fmt("select a is distinct from b from t", Driver::Postgres), "SELECT a IS DISTINCT FROM b\nFROM t");
+    }
+
+    #[test]
+    fn format_case_and_between() {
+        assert_eq!(
+            fmt("select case when a > 1 and b < 2 then 'x' else 'y' end as c from t where a between 1 and 2 or b = 1", Driver::Sqlite),
+            "SELECT CASE WHEN a > 1 AND b < 2 THEN 'x' ELSE 'y' END AS c\nFROM t\nWHERE a BETWEEN 1 AND 2\n   OR b = 1"
+        );
+    }
+
+    #[test]
+    fn format_keeps_strings_comments_and_quotes() {
+        // Keywords inside strings, quoted identifiers and comments are untouched.
+        let out = fmt("select 'select from where', \"from\" , [order], `group` -- select x from y\nfrom t /* where and or */ where a='and or'", Driver::Sqlite);
+        assert_eq!(
+            out,
+            "SELECT 'select from where',\n       \"from\",\n       [order],\n       `group` -- select x from y\nFROM t /* where and or */\nWHERE a='and or'"
+        );
+        // Line comment on its own line keeps its line; the next token never joins it.
+        let out = fmt("-- header\nselect a, -- first\n b\nfrom t", Driver::Postgres);
+        assert_eq!(out, "-- header\nSELECT a, -- first\n       b\nFROM t");
+        // Comment before a clause goes at the clause's indentation.
+        assert_eq!(fmt("select a\n-- the table\nfrom t", Driver::Postgres), "SELECT a\n-- the table\nFROM t");
+        // MySQL # comments.
+        let out = fmt("select a # from x\nfrom t", Driver::MySql);
+        assert_eq!(out, "SELECT a # from x\nFROM t");
+    }
+
+    #[test]
+    fn format_dialect_quoting() {
+        // PG dollar quotes, casts, JSON operators and parameters keep their spacing.
+        let s = "create function f() returns int as $$ begin\n  select  1 from t;  return 1; end $$ language plpgsql;\nselect x::text, j->>'k', -1, $1 from t where a=$2";
+        let out = fmt(s, Driver::Postgres);
+        assert!(out.contains("$$ begin\n  select  1 from t;  return 1; end $$"), "{out}");
+        assert!(out.ends_with("SELECT x::TEXT,\n       j->>'k',\n       -1,\n       $1\nFROM t\nWHERE a=$2"), "{out}");
+        // T-SQL brackets, variables, temp tables and GO.
+        let out = fmt("declare @n int = 5\nselect [Order Id], @n from #tmp where [x] = @n\ngo\nselect 1", Driver::MsSql);
+        assert_eq!(out, "DECLARE @n INT = 5\nSELECT [Order Id],\n       @n\nFROM #tmp\nWHERE [x] = @n\ngo\nSELECT 1");
+        // MySQL backticks and user variables.
+        assert_eq!(fmt("select `from`, @x:=1 from `select`", Driver::MySql), "SELECT `from`,\n       @x:=1\nFROM `select`");
+        // Prefixed literals stay glued.
+        assert_eq!(fmt("select _utf8'x', N'y'", Driver::MySql), "SELECT _utf8'x',\n       N'y'");
+    }
+
+    #[test]
+    fn format_statements_and_blank_lines() {
+        let out = fmt("select 1;select 2;\n\n\nselect 3", Driver::Sqlite);
+        assert_eq!(out, "SELECT 1;\nSELECT 2;\n\nSELECT 3");
+        let out = fmt("CREATE TABLE IF NOT EXISTS t (id integer primary key, name text not null, price real);", Driver::Sqlite);
+        assert_eq!(out, "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL);");
+    }
+
+    #[test]
+    fn format_keyword_case_of_names() {
+        // Non-reserved keywords used as names keep their case; reserved ones are uppercased.
+        let out = fmt("select t.date, type from text as key where date > 1", Driver::Postgres);
+        assert_eq!(out, "SELECT t.date,\n       TYPE\nFROM text AS key\nWHERE DATE > 1");
+        let out = fmt_with("select t.date, type from text where date > 1", Driver::Postgres, &["type", "date"]);
+        assert_eq!(out, "SELECT t.date,\n       type\nFROM text\nWHERE date > 1");
+        // CAST(… AS type) is a type, not an alias.
+        assert_eq!(fmt("select cast(x as int) as n", Driver::Postgres), "SELECT CAST(x AS INT) AS n");
+    }
+
+    #[test]
+    fn format_indent_and_robustness() {
+        let is_ident = |_: &str| false;
+        // Starting at column 4: the next lines align with it.
+        assert_eq!(format_sql("select a, b from t", Driver::Postgres, 4, &is_ident), "SELECT a,\n           b\n    FROM t");
+        for d in Driver::ALL {
+            for s in [
+                "", "   ", "SELECT 'abc", "SELECT /* abc", "select (((", "))) from", "select ,,, ;;", "-- x", "a -- x\n-- y\nb",
+                "SELECT $$ abc", "SELECT [abc", "go", "SELECT 1\nGO\nGO", "select case end end end", "SELECT 'canción 🎵' AS título FROM café",
+            ] {
+                let out = format_sql(s, d, 0, &is_ident);
+                assert_eq!(token_texts(s, d), token_texts(&out, d), "{s:?} {d:?}");
+                assert_eq!(format_sql(&out, d, 0, &is_ident), out, "{s:?} {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn format_random_token_soup() {
+        // Pseudo-random scripts: only whitespace / keyword case may change, and it is stable.
+        let vocab = [
+            "select", "from", "where", "and", "or", "between", "case", "when", "then", "end", "group", "by", "order",
+            "left", "join", "on", "union", "all", "values", "update", "set", "insert", "into", "with", "as", "(", ")",
+            ",", ";", ".", "a", "t", "date", "1", "'x y'", "\"q\"", "[b]", "`c`", "-- note\n", "/* c */", "=", "-",
+            "*", "::", "$1", "$$ body $$", "@v", "#t", "\n", "\n\n", "go\n", "  ", "1.5", "e", "n", "'b'", "[", "]",
+            "<", ">", "!", "/", "+", "_utf8", "q", "{", "}", "exists", "distinct", "is", "having", "limit", "apply",
+            "cross", "outer", "default", "returning",
+        ];
+        let mut seed = 0x2545F491u64;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..1500 {
+            let len = 1 + rnd(40);
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(vocab[rnd(vocab.len())]);
+                if rnd(3) > 0 {
+                    s.push(' ');
+                }
+            }
+            for d in Driver::ALL {
+                fmt_core(&s, d, &[]);
+            }
+        }
+    }
+
+    #[test]
+    fn explain_per_dialect() {
+        assert_eq!(explain_statements("select 1;", Driver::Postgres), ["EXPLAIN select 1"]);
+        assert_eq!(explain_statements(" select 1 ", Driver::MySql), ["EXPLAIN select 1"]);
+        assert_eq!(explain_statements("select 1", Driver::MariaDb), ["EXPLAIN select 1"]);
+        assert_eq!(explain_statements("select 1", Driver::Sqlite), ["EXPLAIN QUERY PLAN select 1"]);
+        assert_eq!(
+            explain_statements("select 1", Driver::MsSql),
+            ["SET SHOWPLAN_TEXT ON", "select 1", "SET SHOWPLAN_TEXT OFF"]
+        );
+        assert_eq!(
+            explain_statements("select 1 from dual", Driver::Oracle),
+            ["EXPLAIN PLAN FOR select 1 from dual", "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY())"]
+        );
+        assert!(explain_statements("  ; ", Driver::Postgres).is_empty());
+    }
+
+    #[test]
+    fn mysql_hash_comments() {
+        assert_eq!(texts("SELECT 1 # a; b\n; SELECT 2", Driver::MySql), ["SELECT 1", "SELECT 2"]);
+        // Elsewhere # is not a comment.
+        assert_eq!(texts("SELECT #t; SELECT 2", Driver::MsSql).len(), 2);
     }
 }

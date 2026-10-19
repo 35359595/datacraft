@@ -113,6 +113,50 @@ pub struct Console {
     pub replace_view: Option<usize>,
     /// Format chosen in the data editor's "CSV ⌄" selector.
     pub export_format: results::ExportFormat,
+    /// Find / replace bar of the editor (open if Some).
+    find: Option<FindState>,
+    /// Query history popup (open if Some).
+    history: Option<HistoryState>,
+    /// Bottom-left corner of the toolbar's history button (popup anchor).
+    history_anchor: Option<egui::Pos2>,
+    /// Char position the editor scrolls to on the next frame.
+    scroll_to: Option<usize>,
+    /// The `DATACRAFT_DEMO_*` hooks of the console already ran.
+    demo_done: bool,
+}
+
+/// State of the editor's find / replace bar.
+struct FindState {
+    query: String,
+    replace: String,
+    show_replace: bool,
+    case_sensitive: bool,
+    /// Give the search field the focus on the next frame.
+    focus: bool,
+}
+
+/// State of the query history popup.
+struct HistoryState {
+    filter: String,
+    focus: bool,
+}
+
+/// Editor commands (shortcuts, toolbar and context menu).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditCmd {
+    Format,
+    ToggleComment,
+    Duplicate,
+    DeleteLine,
+    Explain,
+    History,
+    Find,
+    Replace,
+    FindNext,
+    FindPrev,
+    ReplaceOne,
+    ReplaceAll,
+    CloseFind,
 }
 
 /// State of a table data editor.
@@ -184,6 +228,11 @@ impl Console {
             table: None,
             replace_view: None,
             export_format: results::ExportFormat::Csv,
+            find: None,
+            history: None,
+            history_anchor: None,
+            scroll_to: None,
+            demo_done: false,
         }
     }
 
@@ -301,10 +350,462 @@ impl Console {
     /// Toolbar + editor of a console (inside the editor island).
     pub fn show_console(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
-        self.console_toolbar(ui, cx, &mut actions);
+        let mut cmds = self.demo_hooks();
+        cmds.extend(self.shortcut_cmds(ui));
+        self.console_toolbar(ui, cx, &mut actions, &mut cmds);
         hline(ui);
-        self.editor(ui, cx);
+        if self.find.is_some() {
+            self.find_bar(ui, &mut cmds);
+            hline(ui);
+        }
+        self.editor(ui, cx, &mut cmds);
+        let ctx = ui.ctx().clone();
+        for c in cmds {
+            self.apply_cmd(&ctx, cx, c, &mut actions);
+        }
+        if let Some(stmt) = self.history_popup(ui) {
+            self.insert_text(&ctx, &stmt);
+        }
         actions
+    }
+
+    /// Opens the find bar (with the selection as the search text if it is a single line).
+    /// `replace` also shows the replace row. For the app's Find / Replace menu commands.
+    pub fn open_find(&mut self, replace: bool) {
+        let selected = self.selection().filter(|s| !s.contains('\n')).map(str::to_string);
+        let prev = self.find.take();
+        let (query, repl, case_sensitive, shown) = match prev {
+            Some(f) => (f.query, f.replace, f.case_sensitive, f.show_replace),
+            None => (String::new(), String::new(), false, false),
+        };
+        self.find = Some(FindState {
+            query: selected.unwrap_or(query),
+            replace: repl,
+            show_replace: replace || shown,
+            case_sensitive,
+            focus: true,
+        });
+    }
+
+    /// Debug hooks for screenshots (demo mode only, read once):
+    /// `DATACRAFT_DEMO_FORMAT=1` reformats the console text, `DATACRAFT_DEMO_FIND=<text>`
+    /// opens find / replace searching `<text>` and `DATACRAFT_DEMO_HISTORY=1` opens the
+    /// query history popup.
+    fn demo_hooks(&mut self) -> Vec<EditCmd> {
+        let mut cmds = Vec::new();
+        if self.demo_done {
+            return cmds;
+        }
+        self.demo_done = true;
+        if std::env::var_os("DATACRAFT_DEMO").is_none() {
+            return cmds;
+        }
+        if std::env::var("DATACRAFT_DEMO_FORMAT").is_ok_and(|v| v == "1") {
+            self.cursor = None;
+            cmds.push(EditCmd::Format);
+        }
+        if let Ok(q) = std::env::var("DATACRAFT_DEMO_FIND") {
+            self.open_find(true);
+            if let Some(f) = self.find.as_mut() {
+                f.query = q;
+                f.focus = false;
+            }
+        }
+        if std::env::var("DATACRAFT_DEMO_HISTORY").is_ok_and(|v| v == "1") {
+            self.history = Some(HistoryState { filter: String::new(), focus: false });
+        }
+        cmds
+    }
+
+    /// Editor shortcuts, consumed before the editor sees them.
+    fn shortcut_cmds(&mut self, ui: &Ui) -> Vec<EditCmd> {
+        let mut cmds = Vec::new();
+        let editor_id = self.editor_id();
+        let (find_id, replace_id) = self.find_ids();
+        let (editor, find_q, find_r, none) = ui.memory(|m| {
+            (m.has_focus(editor_id), m.has_focus(find_id), m.has_focus(replace_id), m.focused().is_none())
+        });
+        if !(editor || find_q || find_r || none) {
+            return cmds;
+        }
+        let find_open = self.find.is_some();
+        let completing = self.completion.is_some();
+        let cmd = Modifiers::COMMAND;
+        let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
+        let alt_cmd = Modifiers::COMMAND | Modifiers::ALT;
+        ui.input_mut(|i| {
+            let mut take = |mods: Modifiers, key: Key, c: EditCmd| {
+                if take_key(i, mods, key) {
+                    cmds.push(c);
+                }
+            };
+            take(alt_cmd, Key::L, EditCmd::Format);
+            take(alt_cmd, Key::E, EditCmd::History);
+            take(shift_cmd, Key::E, EditCmd::Explain);
+            take(cmd, Key::F, EditCmd::Find);
+            take(cmd, Key::R, EditCmd::Replace);
+            if find_open {
+                take(shift_cmd, Key::G, EditCmd::FindPrev);
+                take(cmd, Key::G, EditCmd::FindNext);
+                take(Modifiers::SHIFT, Key::F3, EditCmd::FindPrev);
+                take(Modifiers::NONE, Key::F3, EditCmd::FindNext);
+                if find_q {
+                    take(Modifiers::SHIFT, Key::Enter, EditCmd::FindPrev);
+                    take(Modifiers::NONE, Key::Enter, EditCmd::FindNext);
+                }
+                if find_r {
+                    take(Modifiers::NONE, Key::Enter, EditCmd::ReplaceOne);
+                }
+                if find_q || find_r || (editor && !completing) {
+                    take(Modifiers::NONE, Key::Escape, EditCmd::CloseFind);
+                }
+            }
+            if editor {
+                take(cmd, Key::Slash, EditCmd::ToggleComment);
+                take(shift_cmd, Key::Slash, EditCmd::ToggleComment);
+                take(cmd, Key::D, EditCmd::Duplicate);
+                // DataGrip: ⌘⌫ on macOS, Ctrl+Y elsewhere (redo stays on Ctrl+Shift+Z).
+                take(cmd, if cfg!(target_os = "macos") { Key::Backspace } else { Key::Y }, EditCmd::DeleteLine);
+            }
+        });
+        cmds
+    }
+
+    fn find_ids(&self) -> (egui::Id, egui::Id) {
+        (egui::Id::new(("find_query", self.id)), egui::Id::new(("find_replace", self.id)))
+    }
+
+    fn apply_cmd(&mut self, ctx: &egui::Context, cx: &ConsoleCtx<'_>, cmd: EditCmd, actions: &mut Vec<ConsoleAction>) {
+        match cmd {
+            EditCmd::Format => self.reformat(ctx, cx),
+            EditCmd::ToggleComment => self.edit_lines(ctx, toggle_line_comment),
+            EditCmd::Duplicate => self.edit_lines(ctx, duplicate_lines),
+            EditCmd::DeleteLine => self.edit_lines(ctx, delete_lines),
+            EditCmd::Explain => {
+                if !self.is_busy() {
+                    let stmt = match self.selection() {
+                        Some(sel) => sql::split_statements(sel, cx.driver).into_iter().next(),
+                        None => sql::statement_at(&self.text, self.cursor_byte(), cx.driver),
+                    };
+                    let statements = stmt.map(|s| sql::explain_statements(&s.text, cx.driver)).unwrap_or_default();
+                    actions.push(ConsoleAction::RunStatements(statements));
+                }
+            }
+            EditCmd::History => {
+                self.history = match self.history {
+                    Some(_) => None,
+                    None => Some(HistoryState { filter: String::new(), focus: true }),
+                };
+            }
+            EditCmd::Find => self.open_find(false),
+            EditCmd::Replace => self.open_find(true),
+            EditCmd::FindNext => self.find_step(ctx, true),
+            EditCmd::FindPrev => self.find_step(ctx, false),
+            EditCmd::ReplaceOne => self.replace_one(ctx),
+            EditCmd::ReplaceAll => self.replace_all(ctx),
+            EditCmd::CloseFind => {
+                self.find = None;
+                ctx.memory_mut(|m| m.request_focus(self.editor_id()));
+            }
+        }
+    }
+
+    /// Applies a line transformation (text, selection) → (text, selection) to the editor.
+    fn edit_lines(&mut self, ctx: &egui::Context, f: fn(&str, usize, usize) -> (String, usize, usize)) {
+        let len = self.text.chars().count();
+        let (a, b) = self.cursor.unwrap_or((len, len));
+        let (text, na, nb) = f(&self.text, a, b);
+        self.text = text;
+        self.completion = None;
+        self.set_cursor(ctx, na, nb);
+        self.scroll_to = Some(nb);
+        ctx.memory_mut(|m| m.request_focus(self.editor_id()));
+    }
+
+    /// Reformat Code: the selection or, without one, the whole console (like DataGrip).
+    fn reformat(&mut self, ctx: &egui::Context, cx: &ConsoleCtx<'_>) {
+        let len = self.text.chars().count();
+        let sel = self.cursor.filter(|(a, b)| a != b && self.selection().is_some());
+        let (s, e) = sel.unwrap_or((0, len));
+        let (bs, be) = (char_to_byte(&self.text, s), char_to_byte(&self.text, e));
+        let seg = &self.text[bs..be];
+        let core_start = bs + (seg.len() - seg.trim_start().len());
+        let core_end = be - (seg.len() - seg.trim_end().len());
+        if core_start >= core_end {
+            return;
+        }
+        let core = &self.text[core_start..core_end];
+        let line_start = self.text[..core_start].rfind('\n').map_or(0, |i| i + 1);
+        let indent = self.text[line_start..core_start].chars().count();
+        let names: std::collections::HashSet<String> = cx
+            .schemas
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|s| s.tables.iter())
+            .flat_map(|t| std::iter::once(t.name.to_lowercase()).chain(t.columns.iter().map(|c| c.name.to_lowercase())))
+            .collect();
+        let is_ident = |w: &str| names.contains(w);
+        let formatted = sql::format_sql(core, cx.driver, indent, &is_ident);
+        if formatted == core {
+            return;
+        }
+        let caret = self.cursor.map(|(_, b)| b).unwrap_or(0);
+        let keep = nonspace_count(&self.text, caret);
+        let mut text = String::with_capacity(self.text.len() + formatted.len());
+        text.push_str(&self.text[..core_start]);
+        text.push_str(&formatted);
+        text.push_str(&self.text[core_end..]);
+        self.text = text;
+        self.completion = None;
+        match sel {
+            // Keeps the reformatted block selected.
+            Some(_) => {
+                let new_e = e + self.text.chars().count() - len;
+                self.set_cursor(ctx, s, new_e);
+            }
+            None => {
+                let c = pos_of_nonspace(&self.text, keep);
+                self.set_cursor(ctx, c, c);
+                self.scroll_to = Some(c);
+            }
+        }
+    }
+
+    /// Replaces the selection (or inserts at the cursor) with `insert` and focuses the editor.
+    fn insert_text(&mut self, ctx: &egui::Context, insert: &str) {
+        let len = self.text.chars().count();
+        let (a, b) = self.cursor.unwrap_or((len, len));
+        let (bs, be) = (char_to_byte(&self.text, a), char_to_byte(&self.text, b));
+        self.text.replace_range(bs..be, insert);
+        let end = a + insert.chars().count();
+        self.set_cursor(ctx, end, end);
+        self.scroll_to = Some(end);
+        ctx.memory_mut(|m| m.request_focus(self.editor_id()));
+    }
+
+    /// Matches (char ranges) of the find bar's search text.
+    fn find_matches(&self) -> Vec<(usize, usize)> {
+        match &self.find {
+            Some(f) => find_matches(&self.text, &f.query, f.case_sensitive),
+            None => Vec::new(),
+        }
+    }
+
+    /// Selects the next (or previous) match after (before) the selection, wrapping around.
+    fn find_step(&mut self, ctx: &egui::Context, forward: bool) {
+        let matches = self.find_matches();
+        let len = self.text.chars().count();
+        let (a, b) = self.cursor.unwrap_or((0, 0)).min((len, len));
+        let target = if forward {
+            matches.iter().find(|m| m.0 >= b).or(matches.first())
+        } else {
+            matches.iter().rev().find(|m| m.1 <= a).or(matches.last())
+        };
+        if let Some(&(s, e)) = target {
+            self.set_cursor(ctx, s, e);
+            self.scroll_to = Some(s);
+        }
+    }
+
+    /// Replaces the selected match and moves to the next one (or just finds the next one).
+    fn replace_one(&mut self, ctx: &egui::Context) {
+        let Some(repl) = self.find.as_ref().map(|f| f.replace.clone()) else { return };
+        let matches = self.find_matches();
+        if let Some((a, b)) = self.cursor
+            && matches.contains(&(a, b))
+        {
+            let (bs, be) = (char_to_byte(&self.text, a), char_to_byte(&self.text, b));
+            self.text.replace_range(bs..be, &repl);
+            let end = a + repl.chars().count();
+            self.set_cursor(ctx, end, end);
+        }
+        self.find_step(ctx, true);
+    }
+
+    fn replace_all(&mut self, ctx: &egui::Context) {
+        let Some(repl) = self.find.as_ref().map(|f| f.replace.clone()) else { return };
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        self.text = replace_ranges(&self.text, &matches, &repl);
+        let len = self.text.chars().count();
+        let c = self.cursor.map(|(_, b)| b).unwrap_or(0).min(len);
+        self.set_cursor(ctx, c, c);
+    }
+
+    /// Find / replace bar above the editor.
+    fn find_bar(&mut self, ui: &mut Ui, cmds: &mut Vec<EditCmd>) {
+        let p = pal(ui);
+        let (find_id, replace_id) = self.find_ids();
+        let matches = self.find_matches();
+        let current = self.cursor.and_then(|c| matches.iter().position(|m| *m == c));
+        let Some(f) = self.find.as_mut() else { return };
+        let mut changed = false;
+        let row = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| {
+            let w = ui.available_width();
+            ui.allocate_ui_with_layout(vec2(w, 32.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_size(vec2(w, 32.0));
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                add(ui);
+            });
+        };
+        fn field<'t>(text: &'t mut String, id: egui::Id, hint: &str, color: egui::Color32) -> egui::TextEdit<'t> {
+            egui::TextEdit::singleline(text)
+                .id(id)
+                .hint_text(RichText::new(hint).color(color))
+                .font(FontId::monospace(13.0))
+                .desired_width(260.0)
+        }
+        row(ui, &mut |ui| {
+            let chevron = if f.show_replace { Ico::ChevronDown } else { Ico::ChevronRight };
+            if theme::icon_button_sized(ui, chevron, true, tr("Show or hide replace (⌘R)"), 22.0).clicked() {
+                f.show_replace = !f.show_replace;
+            }
+            let resp = ui.add(field(&mut f.query, find_id, tr("Text to find"), p.disabled));
+            if f.focus {
+                resp.request_focus();
+                f.focus = false;
+            }
+            changed = resp.changed();
+            let has_matches = !matches.is_empty();
+            if theme::flat_button(ui, None, "↑", FontId::proportional(14.0), false, has_matches)
+                .on_hover_text(tr("Previous match (⇧⌘G)"))
+                .clicked()
+            {
+                cmds.push(EditCmd::FindPrev);
+            }
+            if theme::flat_button(ui, None, "↓", FontId::proportional(14.0), false, has_matches)
+                .on_hover_text(tr("Next match (⌘G)"))
+                .clicked()
+            {
+                cmds.push(EditCmd::FindNext);
+            }
+            if ui
+                .add(egui::Button::selectable(f.case_sensitive, RichText::new("Aa").font(theme::bold(12.5))))
+                .on_hover_text(tr("Match case"))
+                .clicked()
+            {
+                f.case_sensitive = !f.case_sensitive;
+                changed = true;
+            }
+            ui.add_space(6.0);
+            if !f.query.is_empty() {
+                let (text, color) = match (matches.len(), current) {
+                    (0, _) => (tr("No matches").to_string(), p.error),
+                    (n, Some(i)) => (format!("{}/{n}", i + 1), p.muted),
+                    (1, None) => (tr("1 result").to_string(), p.muted),
+                    (n, None) => (trf("{n} results", &[("n", &n)]), p.muted),
+                };
+                ui.label(RichText::new(text).color(color).size(12.5));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if theme::icon_button_sized(ui, Ico::Close, true, tr("Close (Esc)"), 22.0).clicked() {
+                    cmds.push(EditCmd::CloseFind);
+                }
+            });
+        });
+        if f.show_replace {
+            row(ui, &mut |ui| {
+                ui.add_space(26.0);
+                ui.add(field(&mut f.replace, replace_id, tr("Replace with"), p.disabled));
+                let any = !matches.is_empty();
+                if ui.add_enabled(any, egui::Button::new(tr("Replace"))).clicked() {
+                    cmds.push(EditCmd::ReplaceOne);
+                }
+                if ui.add_enabled(any, egui::Button::new(tr("Replace all"))).clicked() {
+                    cmds.push(EditCmd::ReplaceAll);
+                }
+            });
+        }
+        // Incremental search: the first match from the selection start.
+        if changed {
+            let a = self.cursor.map(|c| c.0).unwrap_or(0);
+            let matches = self.find_matches();
+            if let Some(&(s, e)) = matches.iter().find(|m| m.0 >= a).or(matches.first()) {
+                let ctx = ui.ctx().clone();
+                self.set_cursor(&ctx, s, e);
+                self.scroll_to = Some(s);
+            }
+        }
+    }
+
+    /// Query history popup under the toolbar button. Returns the statement to insert.
+    fn history_popup(&mut self, ui: &Ui) -> Option<String> {
+        let anchor = self.history_anchor?;
+        let h = self.history.as_mut()?;
+        let p = pal(ui);
+        let area_id = egui::Id::new(("query_history", self.id));
+        let entries = history_entries(&self.log, &h.filter);
+        let mut picked = None;
+        let mut close = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let inner = egui::Area::new(area_id).order(egui::Order::Foreground).fixed_pos(anchor).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(8).show(ui, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr("Query History")).font(theme::bold(13.0)).color(p.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!entries.is_empty(), egui::Button::new(RichText::new(tr("Copy all queries")).size(12.0)).frame(false))
+                            .clicked()
+                        {
+                            let all: Vec<&str> = entries.iter().rev().map(|e| e.statement.trim()).collect();
+                            ui.ctx().copy_text(all.join(";\n\n") + ";\n");
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut h.filter)
+                        .hint_text(RichText::new(tr("Filter queries")).color(p.disabled))
+                        .desired_width(f32::INFINITY),
+                );
+                if h.focus {
+                    resp.request_focus();
+                    h.focus = false;
+                }
+                ui.add_space(4.0);
+                if entries.is_empty() {
+                    let msg = if self.log.iter().any(|e| !e.statement.is_empty()) { tr("No matches") } else { tr("No queries executed yet") };
+                    ui.label(RichText::new(msg).color(p.muted));
+                    return;
+                }
+                let list_h = (entries.len() as f32 * 26.0).min(340.0);
+                egui::ScrollArea::vertical().min_scrolled_height(list_h).max_height(340.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for e in &entries {
+                        let one_line: String = e.statement.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, 5.0, p.row_hover);
+                        }
+                        let cy = rect.center().y;
+                        ui.painter().text(pos2(rect.left() + 6.0, cy), egui::Align2::LEFT_CENTER, &e.time, FontId::proportional(11.5), p.muted);
+                        let text_rect = Rect::from_min_max(pos2(rect.left() + 70.0, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
+                        let galley = ui.painter().layout(one_line, FontId::monospace(12.5), p.text, f32::INFINITY);
+                        ui.painter().with_clip_rect(text_rect).galley(pos2(text_rect.left(), cy - galley.size().y / 2.0), galley, p.text);
+                        let resp = resp.on_hover_text(RichText::new(e.statement.trim()).monospace());
+                        if resp.clicked() {
+                            picked = Some(e.statement.trim().to_string());
+                        }
+                    }
+                });
+            });
+        });
+        let area_rect = inner.response.rect;
+        let clicked_outside = ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|pos| !area_rect.contains(pos) && pos.distance(anchor) > 30.0)
+        });
+        if clicked_outside || picked.is_some() {
+            close = true;
+        }
+        if close {
+            self.history = None;
+        }
+        picked
     }
 
     /// Content of a console's results island.
@@ -436,7 +937,13 @@ impl Console {
         }
     }
 
-    fn console_toolbar(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
+    fn console_toolbar(
+        &mut self,
+        ui: &mut Ui,
+        cx: &ConsoleCtx<'_>,
+        actions: &mut Vec<ConsoleAction>,
+        cmds: &mut Vec<EditCmd>,
+    ) {
         let busy = self.is_busy();
         toolbar_row(ui, |ui| {
             theme::split_row(ui, |ui, side| match side {
@@ -447,9 +954,17 @@ impl Console {
             if theme::icon_button(ui, Ico::PlayAll, !busy, tr("Run all (⌘⇧↩)")).clicked() {
                 actions.push(ConsoleAction::RunAll);
             }
+            if theme::icon_button(ui, Ico::Structure, !busy, tr("Explain plan of the current statement (⇧⌘E)")).clicked() {
+                cmds.push(EditCmd::Explain);
+            }
             theme::toolbar_separator(ui);
-            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), tr("Show execution log")).clicked() {
-                self.result_tab = ResultTab::Output;
+            let hist = theme::icon_button(ui, Ico::History, true, tr("Query history (⌥⌘E)"));
+            self.history_anchor = Some(hist.rect.left_bottom() + vec2(0.0, 4.0));
+            if hist.clicked() {
+                cmds.push(EditCmd::History);
+            }
+            if theme::icon_button(ui, Ico::Search, true, tr("Find and replace (⌘F)")).clicked() {
+                cmds.push(EditCmd::Find);
             }
             self.tx_dropdown(ui);
             theme::icon_button(ui, Ico::Stop, false, tr("Cancel (not available)"));
@@ -701,11 +1216,12 @@ impl Console {
         }
     }
 
-    fn editor(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) {
+    fn editor(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, cmds: &mut Vec<EditCmd>) {
         let pal = palette(cx.dark);
         let font = FontId::monospace(cx.font_size);
         let editor_id = self.editor_id();
         let focused = ui.memory(|m| m.has_focus(editor_id));
+        let busy = self.is_busy();
 
         // Autocompletion keys: consumed before the TextEdit sees them.
         let mut accept = false;
@@ -756,18 +1272,36 @@ impl Console {
         let dark = cx.dark;
         let font_size = cx.font_size;
         let hl_cache = &mut self.hl_cache;
+        // Find bar matches are painted with a background (the selected one stronger).
+        let search = self.find.as_ref().filter(|f| !f.query.is_empty()).map(|f| (f.query.clone(), f.case_sensitive));
+        let selected = self.cursor;
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| -> Arc<egui::Galley> {
             let text = buf.as_str();
             let mut h = std::collections::hash_map::DefaultHasher::new();
             text.hash(&mut h);
             dark.hash(&mut h);
             font_size.to_bits().hash(&mut h);
+            search.hash(&mut h);
+            if search.is_some() {
+                selected.hash(&mut h);
+            }
             let key = h.finish();
             let job = match hl_cache {
                 Some((k, job)) if *k == key => job.clone(),
                 _ => {
                     let mut job = sql::highlight(text, dark, FontId::monospace(font_size));
                     job.wrap.max_width = f32::INFINITY;
+                    if let Some((q, case)) = &search {
+                        let (other, current) = match_colors(dark);
+                        let ranges: Vec<_> = find_matches(text, q, *case)
+                            .into_iter()
+                            .map(|m| {
+                                let color = if Some(m) == selected { current } else { other };
+                                (char_to_byte(text, m.0)..char_to_byte(text, m.1), color)
+                            })
+                            .collect();
+                        mark_ranges(&mut job, &ranges);
+                    }
                     *hl_cache = Some((key, job.clone()));
                     job
                 }
@@ -782,6 +1316,7 @@ impl Console {
 
         let mut typed_dot = false;
         let mut new_cursor = None;
+        let scroll_target = self.scroll_to.take();
         let mut popup_anchor = None;
 
         egui::Frame::NONE.fill(pal.editor_bg).show(ui, |ui| {
@@ -850,6 +1385,11 @@ impl Console {
                             let r = output.galley.pos_from_cursor(primary);
                             popup_anchor = Some(output.galley_pos + r.left_bottom().to_vec2() + vec2(0.0, 2.0));
                         }
+                        if let Some(c) = scroll_target {
+                            let r = output.galley.pos_from_cursor(CCursor::new(c)).translate(output.galley_pos.to_vec2());
+                            ui.scroll_to_rect(r.expand2(vec2(40.0, row_h)), Some(egui::Align::Center));
+                        }
+                        output.response.context_menu(|ui| editor_menu(ui, busy, cmds));
                     });
                 });
         });
@@ -1011,6 +1551,305 @@ impl Console {
     }
 }
 
+/// Removes a key press with exactly these modifiers (⌘/Ctrl, ⌥, ⇧) from the frame's events.
+fn take_key(i: &mut egui::InputState, mods: Modifiers, key: Key) -> bool {
+    let before = i.events.len();
+    i.events.retain(|e| {
+        !matches!(e, Event::Key { key: k, pressed: true, modifiers: m, .. }
+            if *k == key && m.command == mods.command && m.alt == mods.alt && m.shift == mods.shift
+                && (mods.command || !m.ctrl))
+    });
+    before != i.events.len()
+}
+
+/// Editor context menu (DataGrip's editor popup, with its shortcuts).
+fn editor_menu(ui: &mut Ui, busy: bool, cmds: &mut Vec<EditCmd>) {
+    ui.set_min_width(250.0);
+    let delete_line = if cfg!(target_os = "macos") { "⌘⌫" } else { "Ctrl+Y" };
+    let items: [(Option<EditCmd>, &str, &str, bool); 10] = [
+        (Some(EditCmd::Explain), tr("Explain Plan"), "⇧⌘E", !busy),
+        (None, "", "", true),
+        (Some(EditCmd::Format), tr("Reformat Code"), "⌥⌘L", true),
+        (Some(EditCmd::ToggleComment), tr("Comment with Line Comment"), "⌘/", true),
+        (Some(EditCmd::Duplicate), tr("Duplicate Line or Selection"), "⌘D", true),
+        (Some(EditCmd::DeleteLine), tr("Delete Line"), delete_line, true),
+        (None, "", "", true),
+        (Some(EditCmd::Find), tr("Find…"), "⌘F", true),
+        (Some(EditCmd::Replace), tr("Replace…"), "⌘R", true),
+        (Some(EditCmd::History), tr("Query History"), "⌥⌘E", true),
+    ];
+    for (cmd, label, shortcut, enabled) in items {
+        match cmd {
+            None => {
+                ui.separator();
+            }
+            Some(c) => {
+                if ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked() {
+                    cmds.push(c);
+                    ui.close();
+                }
+            }
+        }
+    }
+}
+
+/// Background of the find matches (other ones, selected one).
+fn match_colors(dark: bool) -> (egui::Color32, egui::Color32) {
+    use egui::Color32;
+    if dark {
+        (Color32::from_rgb(0x32, 0x59, 0x3D), Color32::from_rgb(0x2E, 0x6E, 0x9E))
+    } else {
+        (Color32::from_rgb(0xFF, 0xEB, 0x99), Color32::from_rgb(0xF5, 0xC2, 0x4C))
+    }
+}
+
+/// Paints the background of byte ranges of `job`, splitting its sections where needed.
+fn mark_ranges(job: &mut LayoutJob, ranges: &[(std::ops::Range<usize>, egui::Color32)]) {
+    use egui::text::{ByteIndex, LayoutSection};
+    if ranges.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(job.sections.len() + ranges.len() * 2);
+    for sec in job.sections.drain(..) {
+        let (s, e) = (sec.byte_range.start.0, sec.byte_range.end.0);
+        let mut cuts = vec![s, e];
+        for (r, _) in ranges {
+            for x in [r.start, r.end] {
+                if x > s && x < e {
+                    cuts.push(x);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let mut format = sec.format.clone();
+            if let Some((_, c)) = ranges.iter().find(|(r, _)| r.start <= w[0] && w[1] <= r.end) {
+                format.background = *c;
+            }
+            out.push(LayoutSection {
+                leading_space: if w[0] == s { sec.leading_space } else { 0.0 },
+                byte_range: ByteIndex(w[0])..ByteIndex(w[1]),
+                format,
+            });
+        }
+    }
+    job.sections = out;
+}
+
+/// Non-overlapping occurrences (char ranges) of `needle` in `text`.
+fn find_matches(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let fold = |c: char| if case_sensitive { c } else { c.to_lowercase().next().unwrap_or(c) };
+    let hay: Vec<char> = text.chars().map(fold).collect();
+    let pat: Vec<char> = needle.chars().map(fold).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + pat.len() <= hay.len() {
+        if hay[i..i + pat.len()] == pat[..] {
+            out.push((i, i + pat.len()));
+            i += pat.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `text` with the (sorted, non-overlapping) char ranges replaced by `with`.
+fn replace_ranges(text: &str, ranges: &[(usize, usize)], with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for &(s, e) in ranges {
+        let (bs, be) = (char_to_byte(text, s), char_to_byte(text, e));
+        out.push_str(&text[last..bs]);
+        out.push_str(with);
+        last = be;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Number of non-whitespace chars before char position `pos`.
+fn nonspace_count(text: &str, pos: usize) -> usize {
+    text.chars().take(pos).filter(|c| !c.is_whitespace()).count()
+}
+
+/// Char position right after the `n`-th non-whitespace char (inverse of [`nonspace_count`]).
+fn pos_of_nonspace(text: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, c) in text.chars().enumerate() {
+        if !c.is_whitespace() {
+            seen += 1;
+            if seen == n {
+                return i + 1;
+            }
+        }
+    }
+    text.chars().count()
+}
+
+/// Char ranges `[start, end)` (without the `\n`) of the lines touched by the selection `a..b`.
+/// A selection ending at the start of a line doesn't touch that line.
+fn touched_lines(chars: &[char], a: usize, b: usize) -> Vec<(usize, usize)> {
+    let (a, mut b) = (a.min(chars.len()), b.min(chars.len()));
+    if b > a && chars[b - 1] == '\n' {
+        b -= 1;
+    }
+    let mut start = a;
+    while start > 0 && chars[start - 1] != '\n' {
+        start -= 1;
+    }
+    let mut lines = Vec::new();
+    loop {
+        let end = chars[start..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| start + i);
+        lines.push((start, end));
+        if end >= b || end >= chars.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    lines
+}
+
+/// Start of the line containing char `pos`.
+fn line_start(chars: &[char], pos: usize) -> usize {
+    chars[..pos.min(chars.len())].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1)
+}
+
+/// Comment / uncomment with `-- ` the lines touched by the selection (DataGrip's ⌘/): if
+/// every non-blank line is commented they are uncommented, otherwise `-- ` is added at the
+/// start of each one. Without a selection the caret moves to the next line.
+fn toggle_line_comment(text: &str, a: usize, b: usize) -> (String, usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let (a, b) = (a.min(b).min(chars.len()), a.max(b).min(chars.len()));
+    let lines = touched_lines(&chars, a, b);
+    let content = |&(s, e): &(usize, usize)| chars[s..e].iter().any(|c| !c.is_whitespace());
+    let mut targets: Vec<(usize, usize)> = lines.iter().copied().filter(content).collect();
+    if targets.is_empty() {
+        targets = lines.clone();
+    }
+    let commented = |&(s, e): &(usize, usize)| {
+        let first = (s..e).find(|&i| !chars[i].is_whitespace());
+        first.is_some_and(|i| i + 1 < e && chars[i] == '-' && chars[i + 1] == '-')
+    };
+    let uncomment = targets.iter().filter(|l| content(l)).count() > 0 && targets.iter().all(commented);
+    // Edits (position, removed chars, inserted text), ascending.
+    let edits: Vec<(usize, usize, &str)> = targets
+        .iter()
+        .map(|&(s, e)| {
+            if uncomment {
+                let i = (s..e).find(|&i| !chars[i].is_whitespace()).unwrap_or(s);
+                let del = if i + 2 < e && chars[i + 2] == ' ' { 3 } else { 2 };
+                (i, del, "")
+            } else {
+                (s, 0, "-- ")
+            }
+        })
+        .collect();
+    let mut out = String::with_capacity(text.len() + edits.len() * 3);
+    let mut last = 0;
+    for &(pos, del, ins) in &edits {
+        out.extend(&chars[last..pos]);
+        out.push_str(ins);
+        last = pos + del;
+    }
+    out.extend(&chars[last..]);
+    let map = |p: usize, after: bool| -> usize {
+        let mut acc: isize = 0;
+        for &(pos, del, ins) in &edits {
+            let ins = ins.chars().count() as isize;
+            if p < pos || (p == pos && del == 0 && !after) {
+                break;
+            }
+            if p < pos + del {
+                return (pos as isize + acc) as usize;
+            }
+            acc += ins - del as isize;
+        }
+        (p as isize + acc) as usize
+    };
+    if a != b {
+        return (out, map(a, false), map(b, true));
+    }
+    // No selection: the caret goes down one line, same column (like DataGrip).
+    let new: Vec<char> = out.chars().collect();
+    let c = map(a, true);
+    let col = c - line_start(&new, c);
+    let next = new[c..].iter().position(|&ch| ch == '\n').map(|i| c + i + 1);
+    let caret = match next {
+        Some(ns) => {
+            let ne = new[ns..].iter().position(|&ch| ch == '\n').map_or(new.len(), |i| ns + i);
+            ns + col.min(ne - ns)
+        }
+        None => c,
+    };
+    (out, caret, caret)
+}
+
+/// Duplicates the selection after itself (selecting the copy) or, without one, the caret's
+/// line below it (caret on the same column of the copy).
+fn duplicate_lines(text: &str, a: usize, b: usize) -> (String, usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let (a, b) = (a.min(b).min(chars.len()), a.max(b).min(chars.len()));
+    let mut out: String;
+    if a != b {
+        out = chars[..b].iter().collect();
+        out.extend(&chars[a..b]);
+        out.extend(&chars[b..]);
+        return (out, b, b + (b - a));
+    }
+    let (s, e) = touched_lines(&chars, a, a)[0];
+    out = chars[..e].iter().collect();
+    out.push('\n');
+    out.extend(&chars[s..e]);
+    out.extend(&chars[e..]);
+    let caret = a + (e - s) + 1;
+    (out, caret, caret)
+}
+
+/// Deletes the lines touched by the selection (or the caret's line), with their line break.
+/// The caret stays at the same column of the line that takes their place.
+fn delete_lines(text: &str, a: usize, b: usize) -> (String, usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let (a, b) = (a.min(b).min(chars.len()), a.max(b).min(chars.len()));
+    let lines = touched_lines(&chars, a, b);
+    let (s, e) = (lines[0].0, lines[lines.len() - 1].1);
+    let col = a - s;
+    let (rs, re) = if e < chars.len() {
+        (s, e + 1)
+    } else if s > 0 {
+        (s - 1, e)
+    } else {
+        (s, e)
+    };
+    let mut out: String = chars[..rs].iter().collect();
+    out.extend(&chars[re..]);
+    let new: Vec<char> = out.chars().collect();
+    let ls = line_start(&new, rs.min(new.len()));
+    let le = new[ls..].iter().position(|&c| c == '\n').map_or(new.len(), |i| ls + i);
+    let caret = ls + col.min(le - ls);
+    (out, caret, caret)
+}
+
+/// Executed statements for the history popup: most recent first, without repeats
+/// (whitespace-insensitive) and containing `filter` (case-insensitive).
+fn history_entries<'a>(log: &'a [OutputEntry], filter: &str) -> Vec<&'a OutputEntry> {
+    let filter = filter.trim().to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    log.iter()
+        .rev()
+        .filter(|e| !e.statement.trim().is_empty())
+        .filter(|e| seen.insert(e.statement.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .filter(|e| filter.is_empty() || e.statement.to_lowercase().contains(&filter))
+        .collect()
+}
+
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
@@ -1170,6 +2009,114 @@ mod tests {
         let items = build_items("em", Some("users"), "", &s);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "email");
+    }
+
+    /// Runs a (text, a, b) → (text, a, b) transformation on a text where `|` marks the caret
+    /// or `[` `]` the selection, and returns the result marked the same way.
+    fn run(f: fn(&str, usize, usize) -> (String, usize, usize), marked: &str) -> String {
+        let mut text = String::new();
+        let (mut a, mut b) = (None, None);
+        for c in marked.chars() {
+            let n = text.chars().count();
+            match c {
+                '|' => (a, b) = (Some(n), Some(n)),
+                '[' => a = Some(n),
+                ']' => b = Some(n),
+                _ => text.push(c),
+            }
+        }
+        let (out, na, nb) = f(&text, a.unwrap(), b.unwrap());
+        let mut res = String::new();
+        for (i, c) in out.chars().chain(std::iter::once('\0')).enumerate() {
+            if na == nb && i == na {
+                res.push('|');
+            } else if na != nb && i == na {
+                res.push('[');
+            } else if na != nb && i == nb {
+                res.push(']');
+            }
+            if c != '\0' {
+                res.push(c);
+            }
+        }
+        res
+    }
+
+    #[test]
+    fn toggle_comment_lines() {
+        let t = toggle_line_comment;
+        // Caret: comments the line and moves down keeping the column.
+        assert_eq!(run(t, "sel|ect 1\nfrom t"), "-- select 1\nfrom t|");
+        assert_eq!(run(t, "-- sel|ect 1\nfrom t"), "select 1\nfro|m t");
+        assert_eq!(run(t, "select 1\nfr|om"), "select 1\n-- fr|om");
+        // Selection over several lines (blank ones untouched), kept around the same text.
+        assert_eq!(run(t, "[a\n\n  b\nc]\nd"), "[-- a\n\n--   b\n-- c]\nd");
+        assert_eq!(run(t, "[-- a\n\n  --b\n-- c]\nd"), "[a\n\n  b\nc]\nd");
+        // Mixed lines: comments all of them; a selection ending at column 0 skips that line.
+        assert_eq!(run(t, "[-- a\nb\n]c"), "[-- -- a\n-- b\n]c");
+        // Empty text / blank line.
+        assert_eq!(run(t, "|"), "-- |");
+        assert_eq!(run(t, "a\n|\nb"), "a\n-- \nb|");
+    }
+
+    #[test]
+    fn duplicate_and_delete_lines() {
+        assert_eq!(run(duplicate_lines, "ab|c\nd"), "abc\nab|c\nd");
+        assert_eq!(run(duplicate_lines, "x\nlast|"), "x\nlast\nlast|");
+        assert_eq!(run(duplicate_lines, "a[bc]d"), "abc[bc]d");
+        assert_eq!(run(delete_lines, "one\ntw|o\nthree"), "one\nth|ree");
+        assert_eq!(run(delete_lines, "one\nlast|"), "one|");
+        assert_eq!(run(delete_lines, "on|ly"), "|");
+        assert_eq!(run(delete_lines, "a\n[b\nc]\nd"), "a\n|d");
+        assert_eq!(run(delete_lines, "a\n[b\n]c"), "a\n|c");
+    }
+
+    #[test]
+    fn find_and_replace_text() {
+        assert_eq!(find_matches("Select select SELECT", "select", false), vec![(0, 6), (7, 13), (14, 20)]);
+        assert_eq!(find_matches("Select select SELECT", "select", true), vec![(7, 13)]);
+        assert_eq!(find_matches("aaaa", "aa", true), vec![(0, 2), (2, 4)]);
+        assert!(find_matches("abc", "", false).is_empty());
+        assert_eq!(find_matches("añoÑo", "ño", false), vec![(1, 3), (3, 5)]);
+        assert_eq!(replace_ranges("añoÑo x", &[(1, 3), (3, 5)], "N"), "aNN x");
+        // Caret mapping across reformatting (only whitespace changes).
+        let (a, b) = ("select  a ,b", "SELECT a,\n       b");
+        let n = nonspace_count(a, 10);
+        assert_eq!(n, 7);
+        assert_eq!(pos_of_nonspace(b, n), 8);
+        assert_eq!(pos_of_nonspace(b, 0), 0);
+    }
+
+    #[test]
+    fn history_dedup_and_filter() {
+        let e = |t: &str, s: &str| OutputEntry { time: t.into(), statement: s.into(), message: String::new(), is_error: false };
+        let log = vec![
+            e("10:00:00", "select 1"),
+            e("10:00:01", ""),
+            e("10:00:02", "SELECT * FROM users"),
+            e("10:00:03", "select  1"),
+        ];
+        let h = history_entries(&log, "");
+        assert_eq!(h.iter().map(|e| e.time.as_str()).collect::<Vec<_>>(), ["10:00:03", "10:00:02"]);
+        let h = history_entries(&log, " users ");
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].statement, "SELECT * FROM users");
+    }
+
+    #[test]
+    fn match_backgrounds_split_sections() {
+        let mut job = sql::highlight("select abc from t", false, FontId::monospace(13.0));
+        let c = egui::Color32::RED;
+        mark_ranges(&mut job, &[(8..10, c)]);
+        let text: String = job.sections.iter().map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0]).collect();
+        assert_eq!(text, "select abc from t");
+        let marked: Vec<_> = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == c)
+            .map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(marked, ["bc"]);
     }
 
     #[test]
