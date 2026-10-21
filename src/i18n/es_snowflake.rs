@@ -37,8 +37,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("<user defined>", "<definida por el usuario>"),
     ("<value>", "<valor>"),
     (
-        "User defined driver property. Key pair: set private_key_file (and private_key_file_pwd for an encrypted key) with Authentication → Authenticator.",
-        "Propiedad del controlador definida por el usuario. Par de claves: define private_key_file (y private_key_file_pwd para una clave cifrada) con Autenticación → Autenticador.",
+        "User defined driver property. Key pair: set private_key_file (and private_key_file_pwd for an encrypted key) with Authentication → Authenticator. Secret values (passwords, passphrases, tokens) are kept in the system keychain, not in the connections file.",
+        "Propiedad del controlador definida por el usuario. Par de claves: define private_key_file (y private_key_file_pwd para una clave cifrada) con Autenticación → Autenticador. Los valores secretos (contraseñas, frases de contraseña, tokens) se guardan en el llavero del sistema, no en el archivo de conexiones.",
     ),
     ("Key pair authentication needs the private_key_file property (Advanced tab)", "La autenticación con par de claves necesita la propiedad private_key_file (pestaña Avanzado)"),
     ("Unsupported authenticator: {name}", "Autenticador no compatible: {name}"),
@@ -52,4 +52,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("URL only", "Solo URL"),
     ("Succeeded", "Correcto"),
     ("Apply", "Aplicar"),
+    ("Not a valid {driver} URL: the fields keep their values", "No es una URL válida de {driver}: los campos conservan sus valores"),
+    ("Changes to {count} data source(s) have not been applied. Discard them?", "Los cambios en {count} origen(es) de datos no se han aplicado. ¿Descartarlos?"),
 ];

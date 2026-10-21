@@ -1170,7 +1170,7 @@ impl DataCraftApp {
                         let mut cfg = c.cfg.clone();
                         cfg.id = self.next_conn_id();
                         cfg.name = trf("{name} (copy)", &[("name", &cfg.name)]);
-                        config::store_password(cfg.id, &cfg.password);
+                        config::store_secrets(&cfg);
                         self.conns.push(ConnState::new(cfg));
                         self.persist_connections();
                     }
@@ -1438,7 +1438,7 @@ impl DataCraftApp {
     }
 
     fn save_connection(&mut self, cfg: ConnectionConfig) {
-        config::store_password(cfg.id, &cfg.password);
+        config::store_secrets(&cfg);
         let id = cfg.id;
         if cfg.read_only {
             self.revoke_editing(id);
@@ -1477,7 +1477,7 @@ impl DataCraftApp {
     fn delete_connection(&mut self, id: ConnId) {
         self.worker.send(Request::Disconnect(id));
         self.conns.retain(|c| c.cfg.id != id);
-        config::delete_password(id);
+        config::delete_secrets(id);
         for c in self.consoles.iter_mut().filter(|c| c.conn == Some(id)) {
             c.conn = None;
             c.db = None;
@@ -2719,10 +2719,24 @@ fn is_query(statement: &str) -> bool {
         .map(str::to_lowercase)
         .collect();
     // `SELECT … INTO` creates tables (PG, SQL Server) or writes files (MySQL); `EXPLAIN ANALYZE`
-    // runs the statement.
-    let writes = |w: &String| matches!(w.as_str(), "insert" | "update" | "delete" | "merge" | "into" | "analyze" | "analyse");
+    // runs the statement. `WITH … PROCEDURE … CALL` (Snowflake) runs an anonymous procedure, so
+    // DDL, grants and calls count as writes anywhere in the statement.
+    let writes = |w: &String| {
+        matches!(
+            w.as_str(),
+            "insert" | "update" | "delete" | "merge" | "into" | "analyze" | "analyse" | "call" | "procedure" | "function"
+                | "drop" | "create" | "alter" | "grant" | "revoke" | "execute" | "exec" | "truncate" | "copy" | "put"
+                | "remove" | "undrop"
+        )
+    };
+    // `$$…$$` bodies (Snowflake, PostgreSQL) hold code that runs as a block.
+    if statement.contains("$$") {
+        return false;
+    }
     match words.first().map(String::as_str) {
-        Some("select" | "show" | "explain" | "describe" | "desc" | "values" | "table" | "with") => !words.iter().any(writes),
+        // SHOW / DESCRIBE never write, whatever they name (`SHOW CREATE TABLE`).
+        Some("show" | "describe" | "desc") => true,
+        Some("select" | "explain" | "values" | "table" | "with") => !words.iter().any(writes),
         // SQL Server's explain plan.
         Some("set") => words.len() == 3 && words[1] == "showplan_text" && matches!(words[2].as_str(), "on" | "off"),
         _ => false,
@@ -3025,6 +3039,13 @@ mod tests {
         assert!(is_query("select 1"));
         assert!(is_query("  -- note\n SELECT * FROM t"));
         assert!(is_query("with x as (select 1) select * from x"));
+        // Snowflake anonymous procedures run anything (found in review of the Snowflake PR).
+        assert!(!is_query("WITH p AS PROCEDURE() RETURNS INT LANGUAGE SQL AS $$ BEGIN DROP TABLE t; RETURN 1; END $$ CALL p()"));
+        assert!(!is_query("with p as procedure() returns int language sql as 'begin return 1; end' call p()"));
+        assert!(!is_query("with x as (select 1) select * from x; drop table t"));
+        assert!(!is_query("select $$ text $$"));
+        assert!(is_query("SHOW CREATE TABLE t"));
+        assert!(is_query("describe procedure p(int)"));
         assert!(is_query("explain select 1"));
         assert!(!is_query("explain analyze delete from t"));
         assert!(!is_query("explain analyse delete from t"));

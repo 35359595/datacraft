@@ -41,6 +41,9 @@ const SESSION_EXPIRED: &str = "390112";
 const SESSION_GONE: &str = "390111";
 const MASTER_TOKEN_EXPIRED: &str = "390114";
 
+/// Longest wait for any single HTTP request (login, query, poll, chunk download).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Lifetime of the key-pair JWT; it is only used to log in.
 const JWT_LIFETIME_SECS: i64 = 60;
 
@@ -60,6 +63,9 @@ struct Inner {
     tokens: Mutex<Tokens>,
     /// Request id and text of the running query, for `abort-request`.
     running: Mutex<Option<(String, String)>>,
+    /// Set by a cancel that arrives while result chunks are downloading (the query itself is
+    /// over, so there is nothing to abort on the server): no further chunk is fetched.
+    stop_chunks: std::sync::atomic::AtomicBool,
     sequence: Mutex<u64>,
 }
 
@@ -76,7 +82,10 @@ pub struct SfCancel(Arc<Inner>);
 impl SfCancel {
     pub async fn cancel(&self) -> anyhow::Result<()> {
         let running = self.0.running.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let Some((request_id, sql)) = running else { return Ok(()) };
+        let Some((request_id, sql)) = running else {
+            self.0.stop_chunks.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        };
         let body = json!({ "sqlText": sql, "requestId": request_id });
         self.0.post_json("/queries/v1/abort-request", &[], &body, "application/json").await?;
         Ok(())
@@ -158,7 +167,17 @@ impl Inner {
     }
 
     /// Renews the session token with the master token; if that one expired too, logs in again.
+    /// If both fail the tokens are cleared, which marks the session broken (it reconnects on the
+    /// next run instead of failing every statement).
     async fn renew(&self) -> anyhow::Result<()> {
+        let result = self.try_renew().await;
+        if result.is_err() {
+            *self.tokens.lock().unwrap_or_else(|e| e.into_inner()) = Tokens::default();
+        }
+        result
+    }
+
+    async fn try_renew(&self) -> anyhow::Result<()> {
         let old = self.tokens.lock().unwrap_or_else(|e| e.into_inner()).session.clone();
         let resp = self
             .http
@@ -241,7 +260,17 @@ impl Inner {
             let Some(url) = resp["data"]["getResultUrl"].as_str().map(str::to_string) else {
                 bail!(tr("Snowflake did not say where to get the query result"));
             };
-            resp = self.get_json(&url).await?;
+            let mut polled = self.get_json(&url).await?;
+            // The session can expire during a long query: renew it and poll again.
+            if matches!(polled["code"].as_str().unwrap_or(""), SESSION_EXPIRED | SESSION_GONE | MASTER_TOKEN_EXPIRED) {
+                self.renew().await?;
+                polled = self.get_json(&url).await?;
+            }
+            // Keep the poll URL for the next round if a later answer doesn't repeat it.
+            if polled["data"]["getResultUrl"].is_null() && matches!(polled["code"].as_str().unwrap_or(""), QUERY_IN_PROGRESS | QUERY_IN_PROGRESS_ASYNC) {
+                polled["data"]["getResultUrl"] = json!(url);
+            }
+            resp = polled;
         }
     }
 }
@@ -354,7 +383,8 @@ pub fn apply_jdbc_url(cfg: &mut ConnectionConfig, url: &str) -> bool {
         Some(i) => (&rest[..i], rest[i..].trim_start_matches('/').trim_start_matches('?')),
         None => (rest, ""),
     };
-    super::url::set_authority(cfg, authority, 443);
+    let Some((host, port)) = super::url::parse_authority(authority, 443) else { return false };
+    (cfg.host, cfg.port) = (host, port);
     let mut fields: [String; 4] = Default::default();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -564,6 +594,10 @@ impl SfSession {
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            // Every request, chunk downloads included, as the JDBC driver's socket timeout. A
+            // long query doesn't hit it: the server answers "in progress" within ~45 s and the
+            // result is polled.
+            .timeout(REQUEST_TIMEOUT)
             .user_agent(format!("DataCraft/{} ({CLIENT_APP_ID} {CLIENT_APP_VERSION})", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(http_error)?;
@@ -575,6 +609,7 @@ impl SfSession {
             cfg: cfg.clone(),
             tokens: Mutex::new(tokens),
             running: Mutex::new(None),
+            stop_chunks: std::sync::atomic::AtomicBool::new(false),
             sequence: Mutex::new(0),
         };
         Ok(Self { inner: Arc::new(inner), broken: false })
@@ -590,6 +625,7 @@ impl SfSession {
 
     pub async fn execute(&mut self, sql: &str, max_rows: usize) -> anyhow::Result<Vec<ResultSet>> {
         let start = Instant::now();
+        self.inner.stop_chunks.store(false, std::sync::atomic::Ordering::SeqCst);
         let data = match self.inner.query(sql).await {
             Ok(d) => d,
             Err(e) => {
@@ -617,6 +653,9 @@ impl SfSession {
             for chunk in chunks {
                 if rows.len() >= max_rows {
                     break;
+                }
+                if self.inner.stop_chunks.load(std::sync::atomic::Ordering::SeqCst) {
+                    bail!(tr("Query cancelled"));
                 }
                 let Some(url) = chunk["url"].as_str() else { continue };
                 let chunk_rows = self.download_chunk(url, data).await?;
@@ -905,8 +944,8 @@ fn format_value(t: &ColType, raw: &str) -> String {
             .and_then(|days| NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::Duration::days(days)))
             .map(|d| d.format("%Y-%m-%d").to_string()),
         "time" => epoch_nanos(raw).and_then(|n| {
-            let secs = n.div_euclid(1_000_000_000) as u32;
-            let nanos = n.rem_euclid(1_000_000_000) as u32;
+            let secs = u32::try_from(n.div_euclid(1_000_000_000)).ok()?;
+            let nanos = u32::try_from(n.rem_euclid(1_000_000_000)).ok()?;
             let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)?;
             // Whole seconds as DataGrip shows times: no `.000`.
             let frac = if nanos == 0 { String::new() } else { fraction(nanos, t.scale) };
@@ -923,8 +962,8 @@ fn format_value(t: &ColType, raw: &str) -> String {
         }),
         // `seconds.nanos offset`, where offset = minutes east of UTC + 1440.
         "timestamp_tz" => raw.split_once(' ').and_then(|(ts, off)| {
-            let minutes = off.trim().parse::<i32>().ok()? - 1440;
-            let tz = FixedOffset::east_opt(minutes * 60)?;
+            let minutes = off.trim().parse::<i32>().ok()?.checked_sub(1440)?;
+            let tz = FixedOffset::east_opt(minutes.checked_mul(60)?)?;
             let dt = tz.timestamp_nanos(i64::try_from(epoch_nanos(ts)?).ok()?);
             Some(format!("{}{} {}", dt.format("%Y-%m-%d %H:%M:%S"), fraction(dt.timestamp_subsec_nanos(), t.scale), dt.format("%:z")))
         }),
@@ -945,7 +984,7 @@ fn epoch_nanos(raw: &str) -> Option<i128> {
     }
     let secs: i128 = secs.parse().ok()?;
     let nanos: i128 = if frac.is_empty() { 0 } else { format!("{frac:0<9}").parse().ok()? };
-    let total = secs * 1_000_000_000 + nanos;
+    let total = secs.checked_mul(1_000_000_000)?.checked_add(nanos)?;
     Some(if neg { -total } else { total })
 }
 
@@ -977,6 +1016,64 @@ mod tests {
         cfg.host = "ACME-XY12345.snowflakecomputing.com".into();
         cfg.user = "JDOE".into();
         cfg
+    }
+
+    /// A local server that answers every request with Snowflake's "session expired" (390112),
+    /// so renewing and logging in again both fail.
+    async fn expired_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"success":false,"code":"390112","message":"Session expired"}"#;
+                    let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A session whose renewal and re-login both fail is marked broken, so it reconnects on the
+    /// next run instead of failing every statement (found in review of the Snowflake PR).
+    #[tokio::test]
+    async fn failed_relogin_breaks_the_session() {
+        let mut cfg = sf();
+        cfg.password = "pw".into();
+        let inner = Inner {
+            http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base: expired_server().await,
+            cfg,
+            tokens: Mutex::new(Tokens { session: "s".into(), master: "m".into() }),
+            running: Mutex::new(None),
+            stop_chunks: std::sync::atomic::AtomicBool::new(false),
+            sequence: Mutex::new(0),
+        };
+        let mut session = SfSession { inner: Arc::new(inner), broken: false };
+        assert!(session.execute("select 1", 10).await.is_err());
+        assert!(session.inner.tokens.lock().unwrap().session.is_empty());
+        assert!(session.is_closed(), "a session that can't log in again must report itself closed");
+    }
+
+    /// Out-of-range values from the server fall back to the raw text instead of overflowing
+    /// (found in review of the Snowflake PR).
+    #[test]
+    fn huge_time_values_do_not_overflow() {
+        assert_eq!(epoch_nanos("170141183460469231731687303715884105727"), None);
+        assert_eq!(epoch_nanos("-12.5"), Some(-12_500_000_000));
+        for (kind, raw) in [
+            ("timestamp_tz", "1.0 99999999999"),
+            ("timestamp_tz", "1.0 2147483647"),
+            ("time", "99999999999999999999"),
+            ("timestamp_ntz", "170141183460469231731687303715884105727"),
+        ] {
+            let t = ColType::from_json(&json!({ "type": kind, "scale": 3 }));
+            assert_eq!(format_value(&t, raw), raw, "{kind}");
+        }
     }
 
     #[test]

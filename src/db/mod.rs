@@ -101,12 +101,25 @@ pub struct ConnectionConfig {
     pub auth: AuthMode,
     /// DataGrip's "Authenticator" field: the JDBC `authenticator` (`snowflake_jwt`, `oauth`…).
     pub authenticator: String,
-    /// Advanced tab: user-defined driver properties (`private_key_file`…), in table order.
+    /// Advanced tab: user-defined driver properties (`private_key_file`…), in table order. The
+    /// values of secret ones (see `is_secret_property`) are kept in the keychain, not in the file.
     pub properties: Vec<(String, String)>,
+    /// "Connection type: URL only": the URL replaces host, port and database in the dialog.
+    pub url_only: bool,
+    /// URL parameters without a field of their own (`?sslmode=require`, `;encrypt=true`…), kept so
+    /// the URL round-trips through the dialog.
+    pub url_extra: String,
     /// Before the Advanced tab the key file had its own field: read so `migrate` can move it
     /// into `properties`, never written back.
     #[serde(skip_serializing)]
     pub private_key_file: String,
+}
+
+/// Driver properties that hold secrets (`token`, `private_key_file_pwd`, `password`…): their
+/// values go to the keychain like the password, never to `connections.json`.
+pub fn is_secret_property(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    ["password", "pwd", "secret", "token", "passcode", "private_key_base64"].iter().any(|s| n.contains(s))
 }
 
 /// DataGrip's "Authentication" options for Snowflake.
@@ -159,6 +172,8 @@ impl ConnectionConfig {
             auth: AuthMode::default(),
             authenticator: String::new(),
             properties: Vec::new(),
+            url_only: false,
+            url_extra: String::new(),
             private_key_file: String::new(),
         }
     }
@@ -174,6 +189,24 @@ impl ConnectionConfig {
             Some((_, v)) => *v = value.to_string(),
             None => self.properties.push((name.to_string(), value.to_string())),
         }
+    }
+
+    /// Driver properties whose values are secrets, with their values (for the keychain).
+    pub fn secret_properties(&self) -> Vec<(String, String)> {
+        self.properties.iter().filter(|(k, v)| is_secret_property(k) && !v.is_empty()).cloned().collect()
+    }
+
+    /// The config as written to `connections.json`: no password, and secret property values blank
+    /// (their rows stay, so the Advanced table keeps its order).
+    pub fn without_secrets(&self) -> ConnectionConfig {
+        let mut c = self.clone();
+        c.password.clear();
+        for (k, v) in &mut c.properties {
+            if is_secret_property(k) {
+                v.clear();
+            }
+        }
+        c
     }
 
     /// Upgrades a config saved by an older version: the key file of the old "Key pair"

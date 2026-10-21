@@ -3,7 +3,7 @@
 //! Connection, Cancel, Apply and OK at the bottom.
 
 use crate::db::url::{apply_jdbc_url, jdbc_url};
-use crate::db::{AuthMode, ConnectionConfig, Driver, snowflake};
+use crate::db::{AuthMode, ConnectionConfig, Driver, is_secret_property, snowflake};
 use crate::i18n::{tr, trf};
 use crate::ui::icons::{self, Ico};
 use crate::ui::theme::{self, Palette, palette};
@@ -28,8 +28,6 @@ struct Item {
     cfg: ConnectionConfig,
     /// As last saved; None for a data source that doesn't exist yet.
     saved: Option<ConnectionConfig>,
-    /// "Connection type: URL only": the URL replaces host, port and database.
-    url_only: bool,
 }
 
 impl Item {
@@ -57,6 +55,8 @@ pub struct ConnectionDialog {
     /// Text of the URL field. Rebuilt from the fields every frame unless it is being edited, when
     /// it is parsed back into them instead.
     url: String,
+    /// Cancel / Escape with unapplied changes: asking before they are discarded.
+    confirm_discard: bool,
 }
 
 const LIST_WIDTH: f32 = 290.0;
@@ -81,15 +81,15 @@ impl ConnectionDialog {
     }
 
     fn with(existing: &[ConnectionConfig]) -> Self {
-        let items = existing.iter().map(|c| Item { cfg: c.clone(), saved: Some(c.clone()), url_only: false }).collect();
-        Self { items, selected: 0, removed: Vec::new(), test: (0, TestState::Idle), error: None, tab: Tab::General, url: String::new() }
+        let items = existing.iter().map(|c| Item { cfg: c.clone(), saved: Some(c.clone()) }).collect();
+        Self { items, selected: 0, removed: Vec::new(), test: (0, TestState::Idle), error: None, tab: Tab::General, url: String::new(), confirm_discard: false }
     }
 
     fn add(&mut self, id: u64, driver: Driver) {
         let mut cfg = ConnectionConfig::new(id, driver);
         // The id is a timestamp: it is not shown in the default name.
         cfg.name = driver.label().to_string();
-        self.items.push(Item { cfg, saved: None, url_only: false });
+        self.items.push(Item { cfg, saved: None });
         self.select(self.items.len() - 1);
     }
 
@@ -245,7 +245,7 @@ impl ConnectionDialog {
                 result = Some(r);
             }
             if theme::secondary_button(&mut footer_ui, tr("Cancel")).clicked() {
-                result = Some(DialogResult::Cancel);
+                result = self.cancel(dirty);
             }
             if let Some(e) = &self.error {
                 footer_ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -253,10 +253,49 @@ impl ConnectionDialog {
                 });
             }
         });
-        if result.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            result = Some(DialogResult::Cancel);
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if self.confirm_discard {
+            let changed = self.items.iter().filter(|i| i.dirty()).count() + self.removed.len();
+            let mut decision = None;
+            egui::Modal::new(egui::Id::new("confirm_discard_data_sources")).frame(confirm_frame(ctx, &p)).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new(tr("Unsaved changes")).font(theme::bold(15.0)));
+                ui.add_space(8.0);
+                ui.label(trf("Changes to {count} data source(s) have not been applied. Discard them?", &[("count", &changed)]));
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if theme::primary_button(ui, tr("Discard")).clicked() {
+                        decision = Some(true);
+                    }
+                    if theme::secondary_button(ui, tr("Cancel")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            // Escape here backs out of the question, not out of the window.
+            match decision.or(escape.then_some(false)) {
+                Some(true) => return Some(DialogResult::Cancel),
+                Some(false) => self.confirm_discard = false,
+                None => {}
+            }
+            return None;
+        }
+        if result.is_none() && escape {
+            let dirty = !self.removed.is_empty() || self.items.iter().any(Item::dirty);
+            result = self.cancel(dirty);
         }
         result
+    }
+
+    /// Cancel closes right away when nothing changed; otherwise it asks first.
+    fn cancel(&mut self, dirty: bool) -> Option<DialogResult> {
+        if dirty {
+            self.confirm_discard = true;
+            None
+        } else {
+            Some(DialogResult::Cancel)
+        }
     }
 
     /// Left pane: "Data Sources", the +/− toolbar and the project's data sources.
@@ -296,7 +335,7 @@ impl ConnectionDialog {
                 let mut cfg = self.items[self.selected].cfg.clone();
                 cfg.id = self.next_id();
                 cfg.name = trf("{name} (copy)", &[("name", &cfg.name)]);
-                self.items.push(Item { cfg, saved: None, url_only: false });
+                self.items.push(Item { cfg, saved: None });
                 self.select(self.items.len() - 1);
             }
         });
@@ -376,10 +415,10 @@ impl ConnectionDialog {
                 ui.end_row();
             } else {
                 ui.label(tr("Connection type:"));
-                segmented(ui, &mut item.url_only, [(false, tr("default")), (true, tr("URL only"))], p);
+                segmented(ui, &mut item.cfg.url_only, [(false, tr("default")), (true, tr("URL only"))], p);
                 ui.end_row();
 
-                if item.url_only {
+                if item.cfg.url_only {
                     url_row(ui, &mut item.cfg, &mut self.url, p);
                 } else {
                     ui.label("Host:");
@@ -396,7 +435,7 @@ impl ConnectionDialog {
                 auth_rows(ui, &mut item.cfg);
             }
 
-            if !item.url_only {
+            if !item.cfg.url_only {
                 match item.cfg.driver {
                     Driver::Sqlite => {}
                     Driver::Snowflake => {
@@ -463,15 +502,23 @@ impl ConnectionDialog {
             let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
             let name_rect = Rect::from_min_size(rect.min, vec2(name_w, ROW_H));
             let value_rect = Rect::from_min_max(pos2(rect.left() + name_w, rect.top()), pos2(rect.right() - 28.0, rect.bottom()));
-            let edit = |ui: &mut Ui, r: Rect, id: (&str, usize), v: &mut String, hint: &str| {
+            let edit = |ui: &mut Ui, r: Rect, id: (&str, usize), v: &mut String, hint: &str, secret: bool| {
                 ui.put(
                     r.shrink2(vec2(2.0, 3.0)),
-                    egui::TextEdit::singleline(v).id_salt(id).frame(egui::Frame::NONE).hint_text(hint).margin(egui::vec2(8.0, 4.0)).vertical_align(Align::Center),
+                    egui::TextEdit::singleline(v)
+                        .id_salt(id)
+                        .frame(egui::Frame::NONE)
+                        .hint_text(hint)
+                        .password(secret)
+                        .margin(egui::vec2(8.0, 4.0))
+                        .vertical_align(Align::Center),
                 )
             };
             let (nh, vh) = if placeholder { (tr("<user defined>"), tr("<value>")) } else { ("", "") };
-            let a = edit(ui, name_rect, ("prop_name", i), name, nh);
-            let b = edit(ui, value_rect, ("prop_value", i), value, vh);
+            // Secret values (kept in the keychain) are masked like the Password field.
+            let secret = is_secret_property(name);
+            let a = edit(ui, name_rect, ("prop_name", i), name, nh, false);
+            let b = edit(ui, value_rect, ("prop_value", i), value, vh, secret);
             ui.painter().vline(rect.left() + name_w, rect.y_range(), line);
             ui.painter().hline(rect.x_range(), rect.bottom(), line);
             let mut removed = false;
@@ -503,7 +550,7 @@ impl ConnectionDialog {
         }
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.add_space(16.0);
-        ui.label(RichText::new(tr("User defined driver property. Key pair: set private_key_file (and private_key_file_pwd for an encrypted key) with Authentication → Authenticator.")).size(12.0).color(p.muted));
+        ui.label(RichText::new(tr("User defined driver property. Key pair: set private_key_file (and private_key_file_pwd for an encrypted key) with Authentication → Authenticator. Secret values (passwords, passphrases, tokens) are kept in the system keychain, not in the connections file.")).size(12.0).color(p.muted));
     }
 
     /// "Test Connection" and its result, as in DataGrip's footer of the details pane.
@@ -546,6 +593,14 @@ impl ConnectionDialog {
         }
         result
     }
+}
+
+fn confirm_frame(ctx: &egui::Context, p: &Palette) -> egui::Frame {
+    egui::Frame::popup(&ctx.global_style())
+        .fill(p.popup_bg)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(20))
+        .stroke(Stroke::new(1.0, p.popup_border))
 }
 
 /// DataGrip's green check / red cross after Test Connection (painted: the UI font has neither).
@@ -653,13 +708,20 @@ fn url_row(ui: &mut Ui, cfg: &mut ConnectionConfig, url: &mut String, p: &Palett
     ui.label("URL:");
     ui.vertical(|ui| {
         let edit = text_field(ui, url, "");
+        // A URL that doesn't parse (another driver's, a port over 65535…) leaves the fields as
+        // they were; say so while it is being edited.
+        let valid = !edit.has_focus() || apply_jdbc_url(&mut cfg.clone(), url);
         if edit.changed() {
             apply_jdbc_url(cfg, url);
         }
         if !edit.has_focus() {
             *url = jdbc_url(cfg);
         }
-        ui.label(RichText::new(tr("Overrides settings above")).size(12.0).color(p.muted));
+        if valid {
+            ui.label(RichText::new(tr("Overrides settings above")).size(12.0).color(p.muted));
+        } else {
+            ui.label(RichText::new(trf("Not a valid {driver} URL: the fields keep their values", &[("driver", &cfg.driver.label())])).size(12.0).color(p.error));
+        }
     });
     ui.end_row();
 }
@@ -762,7 +824,7 @@ mod tests {
         render("snowflake_advanced", true, ConnectionDialog::edit(3, &list), |d| d.tab = Tab::Advanced);
         render("snowflake_light", false, ConnectionDialog::edit(3, &list), |_| {});
         render("postgres_general", true, ConnectionDialog::edit(1, &list), |_| {});
-        render("new_url_only", true, ConnectionDialog::new_connection(9, &list), |d| d.items.last_mut().unwrap().url_only = true);
+        render("new_url_only", true, ConnectionDialog::new_connection(9, &list), |d| d.items.last_mut().unwrap().cfg.url_only = true);
     }
 
     fn harness(dialog: ConnectionDialog) -> egui_kittest::Harness<'static, ConnectionDialog> {
@@ -846,5 +908,52 @@ mod tests {
         h.run_steps(3);
         assert_eq!(cfg(&h).properties[0].0, "private_key_file_pwd");
     }
-}
 
+    /// Cancel / Escape with unapplied edits asks before discarding them (found in review of the
+    /// Snowflake PR); with nothing changed it closes at once.
+    #[test]
+    fn cancel_asks_before_discarding_edits() {
+        struct State {
+            dialog: ConnectionDialog,
+            closed: bool,
+        }
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1100.0, 840.0)).build_ui_state(
+            move |ui, st: &mut State| {
+                let ctx = ui.ctx().clone();
+                if std::mem::take(&mut first) {
+                    theme::install_fonts(&ctx);
+                    theme::apply(&ctx, true);
+                } else if let Some(DialogResult::Cancel) = st.dialog.show(&ctx) {
+                    st.closed = true;
+                }
+            },
+            State { dialog: ConnectionDialog::edit(3, &[snowflake_source()]), closed: false },
+        );
+        h.run_steps(3);
+
+        // Untouched: Escape closes.
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().closed);
+        h.state_mut().closed = false;
+
+        // Edited: Escape asks; Escape again goes back to editing.
+        h.state_mut().dialog.items[0].cfg.warehouse = "WH".into();
+        h.run_steps(2);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed);
+        assert!(h.query_by_label("Unsaved changes").is_some());
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed && h.query_by_label("Unsaved changes").is_none());
+
+        // Cancel → Discard closes without saving.
+        h.get_by_label("Cancel").click();
+        h.run_steps(2);
+        h.get_by_label("Discard").click();
+        h.run_steps(2);
+        assert!(h.state().closed);
+    }
+}
