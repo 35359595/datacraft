@@ -11,6 +11,7 @@ mod es_console;
 mod es_core;
 mod es_mysql;
 mod es_oracle;
+mod es_snowflake;
 mod es_ui;
 
 use serde::{Deserialize, Serialize};
@@ -60,8 +61,8 @@ pub fn lang() -> Lang {
     }
 }
 
-const ALL_TABLES: [&[(&str, &str)]; 6] =
-    [es_app::ENTRIES, es_console::ENTRIES, es_ui::ENTRIES, es_core::ENTRIES, es_mysql::ENTRIES, es_oracle::ENTRIES];
+const ALL_TABLES: [&[(&str, &str)]; 7] =
+    [es_app::ENTRIES, es_console::ENTRIES, es_ui::ENTRIES, es_core::ENTRIES, es_mysql::ENTRIES, es_oracle::ENTRIES, es_snowflake::ENTRIES];
 
 fn spanish() -> &'static HashMap<&'static str, &'static str> {
     static TABLE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();

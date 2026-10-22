@@ -50,6 +50,7 @@ pub enum Ico {
     MoreVert,
     Close,
     Export,
+    Copy,
 }
 
 const W: f32 = 1.3;
@@ -70,6 +71,21 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
         Ico::ChevronLeft => line(&[(10.0, 3.5), (5.5, 8.0), (10.0, 12.5)], color),
         Ico::ChevronRight => line(&[(6.0, 3.5), (10.5, 8.0), (6.0, 12.5)], color),
         Ico::ChevronDown => line(&[(3.5, 6.0), (8.0, 10.5), (12.5, 6.0)], color),
+        Ico::Driver(Driver::Snowflake) => {
+            // Snowflake's logo: six spokes, each with a chevron near its tip.
+            let c = obj(driver_color(Driver::Snowflake, p));
+            let stroke = Stroke::new(1.6 * s, c);
+            let center = at(8.0, 8.0);
+            for k in 0..6 {
+                let a = std::f32::consts::FRAC_PI_3 * k as f32 + std::f32::consts::FRAC_PI_6;
+                let dir = egui::vec2(a.cos(), a.sin());
+                let normal = egui::vec2(-dir.y, dir.x);
+                painter.line_segment([center + dir * 1.8 * s, center + dir * 7.0 * s], stroke);
+                let tip = center + dir * 4.6 * s;
+                painter.line_segment([tip + dir * 1.7 * s + normal * 1.7 * s, tip], stroke);
+                painter.line_segment([tip + dir * 1.7 * s - normal * 1.7 * s, tip], stroke);
+            }
+        }
         Ico::Database | Ico::Driver(_) => {
             let c = match ico {
                 Ico::Driver(d) => obj(driver_color(d, p)),
@@ -188,6 +204,11 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
         Ico::Search => {
             painter.circle_stroke(at(7.0, 7.0), 4.5 * s, st(color));
             line(&[(10.3, 10.3), (14.0, 14.0)], color);
+        }
+        Ico::Copy => {
+            // Two sheets (Duplicate).
+            painter.rect_stroke(Rect::from_min_max(at(5.5, 5.5), at(13.5, 14.0)), 1.5 * s, st(color), StrokeKind::Middle);
+            line(&[(2.5, 10.5), (2.5, 3.5), (3.5, 2.5), (10.5, 2.5)], color);
         }
         Ico::Properties => {
             // Sliders (data source properties).
@@ -342,5 +363,6 @@ pub fn driver_color(driver: Driver, p: &Palette) -> Color32 {
         Driver::MySql => Color32::from_rgb(0x00, 0x75, 0x8F),
         Driver::MariaDb => Color32::from_rgb(0xC0, 0x76, 0x5A),
         Driver::Oracle => Color32::from_rgb(0xC7, 0x46, 0x34),
+        Driver::Snowflake => Color32::from_rgb(0x29, 0xB5, 0xE8),
     }
 }

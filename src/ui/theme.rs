@@ -541,6 +541,8 @@ pub fn tab(ui: &mut Ui, selected: bool, ico: Option<Ico>, text: &str, closable: 
     let close_w = if closable { 22.0 } else { 0.0 };
     let w = 10.0 + icon_w + galley.size().x + close_w + 10.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
+    // The text is painted, so screen readers (and UI tests) need it spelled out.
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, text));
     if selected {
         ui.painter().rect(rect, 6.0, p.tab_selected_bg, Stroke::new(1.0, p.tab_selected_border), egui::StrokeKind::Inside);
     } else if resp.hovered() {

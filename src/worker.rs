@@ -56,7 +56,8 @@ pub enum Response {
     /// `databases` in order; the default one has `current = true` and its schema loaded.
     Connected { conn: ConnId, databases: Vec<DatabaseInfo> },
     ConnectFailed { conn: ConnId, error: String },
-    TestResult { conn: ConnId, result: Result<(), String> },
+    /// `Ok` carries the server's product and version when it could be read.
+    TestResult { conn: ConnId, result: Result<Option<String>, String> },
     Disconnected(ConnId),
     /// Reply to `Refresh`: same shape as `Connected`.
     Refreshed { conn: ConnId, databases: Vec<DatabaseInfo> },
@@ -249,7 +250,10 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             }
         }
         Request::Test(cfg) => {
-            let result = Session::connect(&cfg).await.map(|_| ()).map_err(|e| format!("{e:#}"));
+            let result = match Session::connect(&cfg).await {
+                Ok(mut session) => Ok(session.server_version(cfg.driver).await),
+                Err(e) => Err(format!("{e:#}")),
+            };
             vec![Response::TestResult { conn: cfg.id, result }]
         }
         Request::Disconnect(conn) => {

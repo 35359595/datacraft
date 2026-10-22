@@ -267,10 +267,11 @@ pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<State
 /// Fragments to send to the server when running a whole script or a selection.
 /// SQL Server: batches separated only by `GO` (a `DECLARE` or a `BEGIN…END` with `;` stay together).
 /// SQLite: the whole script (the driver already walks it statement by statement, honoring triggers).
-/// PostgreSQL, MySQL and Oracle: statements by `;` (dollar-quoting protects PG function bodies).
+/// PostgreSQL, MySQL, Oracle and Snowflake: statements by `;` (dollar-quoting protects PG
+/// function bodies and Snowflake's `$$…$$` procedure bodies).
 pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
     match driver {
-        Driver::Postgres | Driver::MySql | Driver::MariaDb | Driver::Oracle => split_statements(script, driver),
+        Driver::Postgres | Driver::MySql | Driver::MariaDb | Driver::Oracle | Driver::Snowflake => split_statements(script, driver),
         Driver::MsSql | Driver::Sqlite => {
             let dialect = Dialect::for_driver(driver);
             let mut out = Vec::new();
@@ -664,6 +665,7 @@ pub fn explain_statements(stmt: &str, driver: Driver) -> Vec<String> {
     match driver {
         Driver::Postgres | Driver::MySql | Driver::MariaDb => vec![format!("EXPLAIN {s}")],
         Driver::Sqlite => vec![format!("EXPLAIN QUERY PLAN {s}")],
+        Driver::Snowflake => vec![format!("EXPLAIN USING TEXT {s}")],
         Driver::MsSql => vec!["SET SHOWPLAN_TEXT ON".into(), s.to_string(), "SET SHOWPLAN_TEXT OFF".into()],
         Driver::Oracle => vec![
             format!("EXPLAIN PLAN FOR {s}"),
@@ -1134,6 +1136,10 @@ struct Dialect {
     q_quotes: bool,
     /// A line with only `/` ends the statement or PL/SQL block (Oracle, SQL*Plus style).
     slash_separator: bool,
+    /// `\` escapes the next char in `'…'` strings only; `"…"` stays an identifier (Snowflake).
+    single_quote_backslash: bool,
+    /// `//` starts a line comment (Snowflake).
+    slash_comments: bool,
 }
 
 impl Dialect {
@@ -1149,6 +1155,8 @@ impl Dialect {
         backslash_escapes: false,
         q_quotes: false,
         slash_separator: false,
+        single_quote_backslash: false,
+        slash_comments: false,
     };
 
     fn for_driver(driver: Driver) -> Self {
@@ -1164,6 +1172,8 @@ impl Dialect {
                 backslash_escapes: false,
                 q_quotes: false,
                 slash_separator: false,
+                single_quote_backslash: false,
+                slash_comments: false,
             },
             Driver::Sqlite => Dialect {
                 brackets: true,
@@ -1176,6 +1186,8 @@ impl Dialect {
                 backslash_escapes: false,
                 q_quotes: false,
                 slash_separator: false,
+                single_quote_backslash: false,
+                slash_comments: false,
             },
             Driver::MsSql => Dialect {
                 brackets: true,
@@ -1188,6 +1200,8 @@ impl Dialect {
                 backslash_escapes: false,
                 q_quotes: false,
                 slash_separator: false,
+                single_quote_backslash: false,
+                slash_comments: false,
             },
             Driver::MySql | Driver::MariaDb => Dialect {
                 brackets: false,
@@ -1200,6 +1214,8 @@ impl Dialect {
                 backslash_escapes: true,
                 q_quotes: false,
                 slash_separator: false,
+                single_quote_backslash: false,
+                slash_comments: false,
             },
             Driver::Oracle => Dialect {
                 brackets: false,
@@ -1212,6 +1228,22 @@ impl Dialect {
                 backslash_escapes: false,
                 q_quotes: true,
                 slash_separator: true,
+                single_quote_backslash: false,
+                slash_comments: false,
+            },
+            Driver::Snowflake => Dialect {
+                brackets: false,
+                backticks: false,
+                dollar_quotes: true,
+                nested_comments: false,
+                tsql_names: false,
+                go_separator: false,
+                hash_comments: false,
+                backslash_escapes: false,
+                q_quotes: false,
+                slash_separator: false,
+                single_quote_backslash: true,
+                slash_comments: true,
             },
         }
     }
@@ -1345,6 +1377,10 @@ impl<'a> Lexer<'a> {
                 self.eat_while(|b| b != b'\n');
                 Kind::LineComment
             }
+            b'/' if self.dialect.slash_comments && next == Some(b'/') => {
+                self.eat_while(|b| b != b'\n');
+                Kind::LineComment
+            }
             b'#' if self.dialect.hash_comments => {
                 self.eat_while(|b| b != b'\n');
                 Kind::LineComment
@@ -1355,7 +1391,7 @@ impl<'a> Lexer<'a> {
             }
             b'\'' => {
                 self.pos += 1;
-                self.eat_quoted(b'\'', true, self.dialect.backslash_escapes);
+                self.eat_quoted(b'\'', true, self.dialect.backslash_escapes || self.dialect.single_quote_backslash);
                 Kind::Str
             }
             // Oracle `q'[…]'` / `nq'{…}'`: nothing inside is special.
@@ -2013,6 +2049,21 @@ mod tests {
             assert_eq!(&s[x.start..x.end], x.text);
             last = x.end;
         }
+    }
+
+    #[test]
+    fn snowflake_strings_and_comments() {
+        let d = Driver::Snowflake;
+        // Backslash escapes in '…', but "…" stays a (case-sensitive) identifier.
+        assert_eq!(texts("select 'a\\';b'; select 2", d), ["select 'a\\';b'", "select 2"]);
+        assert_eq!(texts("select \"a\\\"; select 2", d), ["select \"a\\\"", "select 2"]);
+        // $$…$$ procedure bodies keep their semicolons.
+        let proc = "create procedure p() returns int language sql as $$ begin return 1; end; $$; call p()";
+        assert_eq!(texts(proc, d).len(), 2);
+        // `//` comments.
+        assert_eq!(texts("// a; b\nselect 1; // c;\nselect 2", d), ["select 1", "select 2"]);
+        assert_eq!(texts("select 4 / 2; select 2", d).len(), 2);
+        assert_eq!(split_batches("use database x; select 1", d).len(), 2);
     }
 
     #[test]

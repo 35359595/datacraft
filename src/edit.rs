@@ -27,8 +27,8 @@ pub fn literal(driver: Driver, value: &Cell) -> String {
             let escaped = v.replace('\'', "''");
             match driver {
                 Driver::MsSql => format!("N'{escaped}'"),
-                // MySQL also treats a backslash as an escape inside strings.
-                Driver::MySql | Driver::MariaDb => format!("'{}'", escaped.replace('\\', "\\\\")),
+                // MySQL and Snowflake also treat a backslash as an escape inside strings.
+                Driver::MySql | Driver::MariaDb | Driver::Snowflake => format!("'{}'", escaped.replace('\\', "\\\\")),
                 Driver::Postgres | Driver::Sqlite | Driver::Oracle => format!("'{escaped}'"),
             }
         }
