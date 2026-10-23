@@ -1240,4 +1240,82 @@ mod tests {
         wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn first_rows(w: &Worker, conn: ConnId, console: ConsoleId, statements: &[&str]) -> Vec<ResultSet> {
+        w.send(Request::Execute { conn, db: None, console, statements: statements.iter().map(|s| s.to_string()).collect(), max_rows: 100 });
+        let r = wait_for(w, |r| matches!(r, Response::Executed { console: c, .. } if *c == console));
+        let Response::Executed { results, error, .. } = r else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+        results
+    }
+
+    /// Needs a Redis or Valkey server: `DATACRAFT_REDIS_PORT` (on 127.0.0.1, no password).
+    #[test]
+    #[ignore]
+    fn redis_commands_and_key_groups() {
+        let mut cfg = ConnectionConfig::new(41, Driver::Redis);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_REDIS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(6379);
+        cfg.database = "5".into();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 41, .. } | Response::ConnectFailed { conn: 41, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        let rs = first_rows(&w, 41, 1, &["FLUSHDB\nHSET dc:user:1 name \"Ana P\" age 3\nSET dc:greeting 'hola mundo' EX 60\nRPUSH dc:q a b"]);
+        assert_eq!(rs.len(), 4);
+        let rs = first_rows(&w, 41, 2, &["HGETALL dc:user:1", "SCAN 0 MATCH dc:* COUNT 1000", "GET missing", "INFO server"]);
+        assert_eq!(rs[0].columns, vec!["field", "value"]);
+        assert_eq!(rs[0].rows[0], vec![Some("name".into()), Some("Ana P".into())]);
+        let keys: Vec<_> = rs[1].rows.iter().map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap())).collect();
+        assert_eq!(keys, [("dc:greeting", "string"), ("dc:q", "list"), ("dc:user:1", "hash")].map(|(a, b)| (a.to_string(), b.to_string())));
+        assert!(rs[1].rows[0][2].as_deref().is_some_and(|t| t.parse::<i64>().unwrap() > 0));
+        assert_eq!(rs[1].rows[1][3].as_deref(), Some(r#"["a","b"]"#));
+        assert_eq!(rs[2].rows, vec![vec![None]]);
+        assert!(rs[3].rows.iter().any(|r| r[1].as_deref() == Some("tcp_port")));
+        w.send(Request::LoadDatabase { conn: 41, db: "db5".into() });
+        let r = wait_for(&w, |r| matches!(r, Response::DatabaseLoaded { conn: 41, .. }));
+        let Response::DatabaseLoaded { result: Ok(schemas), .. } = r else { panic!("introspection failed") };
+        let names: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["*", "dc:*"]);
+        first_rows(&w, 41, 3, &["FLUSHDB"]);
+    }
+
+    /// Needs a MongoDB server: `DATACRAFT_MONGO_PORT` (on 127.0.0.1, no authentication).
+    #[test]
+    #[ignore]
+    fn mongodb_commands_and_collections() {
+        let mut cfg = ConnectionConfig::new(42, Driver::MongoDb);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27017);
+        cfg.database = "dc_test".into();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 42, .. } | Response::ConnectFailed { conn: 42, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        let script = "db.users.drop()\ndb.users.insertMany([{_id: 1, name: 'Ana', tags: ['a'], at: ISODate('2026-01-02')}, {_id: 2, name: 'Luis', age: 41}])\ndb.users.updateOne({_id: 2}, {$inc: {age: 1}})";
+        let stmts: Vec<String> = crate::sql::split_statements(script, Driver::MongoDb).into_iter().map(|s| s.text).collect();
+        assert_eq!(stmts.len(), 3);
+        let rs = first_rows(&w, 42, 1, &stmts.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(rs[1].affected, Some(2));
+        assert_eq!(rs[2].affected, Some(1));
+        let rs = first_rows(&w, 42, 2, &[
+            "db.users.find({}, {name: 1, age: 1}).sort({_id: -1}).limit(1)",
+            "db.users.aggregate([{$group: {_id: null, n: {$sum: 1}}}])",
+            "db.users.countDocuments({name: /^a/i})",
+            "db.getCollection(\"users\").find({_id: 1})",
+        ]);
+        assert_eq!(rs[0].columns, vec!["_id", "name", "age"]);
+        assert_eq!(rs[0].rows, vec![vec![Some("2".into()), Some("Luis".into()), Some("42".into())]]);
+        assert_eq!(rs[1].rows[0][1].as_deref(), Some("2"));
+        assert_eq!(rs[2].rows[0][0].as_deref(), Some("1"));
+        assert_eq!(rs[3].rows[0][2].as_deref(), Some(r#"["a"]"#));
+        assert_eq!(rs[3].rows[0][3].as_deref(), Some("2026-01-02T00:00:00Z"));
+        w.send(Request::LoadDatabase { conn: 42, db: "dc_test".into() });
+        let r = wait_for(&w, |r| matches!(r, Response::DatabaseLoaded { conn: 42, .. }));
+        let Response::DatabaseLoaded { result: Ok(schemas), .. } = r else { panic!("introspection failed") };
+        let users = schemas[0].tables.iter().find(|t| t.name == "users").expect("users");
+        let cols: Vec<_> = users.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["_id", "name", "tags", "at", "age"]);
+        first_rows(&w, 42, 3, &["db.users.drop()"]);
+    }
 }

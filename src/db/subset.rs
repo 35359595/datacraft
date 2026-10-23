@@ -76,6 +76,8 @@ pub fn fk_sql(driver: Driver, db: &str, schema: &str) -> String {
              FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) p WHERE m.type = 'table'"
             .into(),
         Driver::Snowflake => format!("SHOW IMPORTED KEYS IN SCHEMA {}", Session::quote_table(driver, db, schema)),
+        // No foreign keys (copies are not offered for them).
+        Driver::Redis | Driver::MongoDb => String::new(),
     }
 }
 

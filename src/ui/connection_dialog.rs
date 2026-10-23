@@ -476,6 +476,14 @@ impl ConnectionDialog {
             ui.add_space(6.0);
             ui.checkbox(&mut cfg.trust_cert, tr("Trust server certificate"));
         }
+        // Redis / Valkey over TLS (`rediss://`); MongoDB takes `?tls=true` in its URL.
+        if cfg.driver == Driver::Redis {
+            ui.add_space(6.0);
+            let mut tls = cfg.property("tls").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            if ui.checkbox(&mut tls, tr("Use TLS")).changed() {
+                cfg.set_property("tls", if tls { "true" } else { "" });
+            }
+        }
     }
 
     /// Advanced tab: DataGrip's Name / Value table of user-defined driver properties. The last

@@ -29,7 +29,7 @@ pub fn literal(driver: Driver, value: &Cell) -> String {
                 Driver::MsSql => format!("N'{escaped}'"),
                 // MySQL and Snowflake also treat a backslash as an escape inside strings.
                 Driver::MySql | Driver::MariaDb | Driver::Snowflake => format!("'{}'", escaped.replace('\\', "\\\\")),
-                Driver::Postgres | Driver::Sqlite | Driver::Oracle => format!("'{escaped}'"),
+                Driver::Postgres | Driver::Sqlite | Driver::Oracle | Driver::Redis | Driver::MongoDb => format!("'{escaped}'"),
             }
         }
     }

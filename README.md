@@ -9,6 +9,11 @@ DataGrip-style database client for macOS and Windows (Islands theme), written in
   Snowflake speaks the JDBC driver's REST protocol natively (no Java): password, key-pair (the
   `private_key_file` driver property, as in DataGrip), OAuth or programmatic access token authentication,
   with role, database, schema and warehouse per data source.
+- **NoSQL:** Redis / Valkey and MongoDB. Their consoles take the engine's own commands: one Redis command per line
+  (`HGETALL user:1`, `SCAN 0 MATCH user:*`…) or `mongosh` commands (`db.users.find({age: {$gt: 30}}).sort({name: 1})`,
+  `aggregate`, `insertOne`, `updateMany`, `runCommand`, `show collections`…). The explorer shows Redis keys grouped by
+  prefix, with each key's type, TTL and value, and MongoDB collections with the fields of a sample of their documents.
+  Their grid is read-only, and read-only data sources only allow commands that read.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
 - **Object browser:** click a database, schema, tables or views folder to browse its objects in a [list or grid](docs/object-browser.md), with a selection information pane on the right.
 - **Navigation and organization:** [find loaded cells or search all tables](docs/navigation-search.md), organize objects with local groups/colors, and close tabs in bulk. Keyboard navigation keeps the active cell visible in wide tables.
@@ -71,7 +76,8 @@ scripts/test_mssql.sh <host>   # real SQL Server (non-destructive: only #temp ta
 
 The live tests run with `cargo test -- --ignored` and the `DATACRAFT_PG_*`, `DATACRAFT_MY_*`,
 `DATACRAFT_ORA_*` and `DATACRAFT_SF_*` variables (see `src/db/postgres.rs`, `src/db/mysql.rs`,
-`src/db/oracle.rs` and `src/db/snowflake.rs`).
+`src/db/oracle.rs` and `src/db/snowflake.rs`), and `DATACRAFT_REDIS_PORT` / `DATACRAFT_MONGO_PORT`
+for a local Redis or Valkey and MongoDB (see `src/worker.rs`).
 
 Demo mode for screenshots: `DATACRAFT_DEMO=path.db cargo run` (see the header of `src/app.rs`).
 
@@ -89,6 +95,11 @@ Cliente de bases de datos para macOS y Windows al estilo de DataGrip (tema Islan
   Snowflake usa directamente el protocolo REST del driver JDBC (sin Java): autenticación por contraseña, par de
   claves (la propiedad `private_key_file` del controlador, como en DataGrip), OAuth o token de acceso
   programático, con rol, base de datos, esquema y almacén por fuente de datos.
+- **NoSQL:** Redis / Valkey y MongoDB. Sus consolas aceptan los comandos propios de cada motor: un comando de Redis por línea
+  (`HGETALL user:1`, `SCAN 0 MATCH user:*`…) o comandos de `mongosh` (`db.users.find({age: {$gt: 30}}).sort({name: 1})`,
+  `aggregate`, `insertOne`, `updateMany`, `runCommand`, `show collections`…). El explorador muestra las claves de Redis
+  agrupadas por prefijo, con el tipo, el TTL y el valor de cada una, y las colecciones de MongoDB con los campos de una
+  muestra de sus documentos. Su cuadrícula es de solo lectura, y en las fuentes de datos de solo lectura solo se permiten comandos que leen.
 - **Database Explorer:** todas las bases del servidor (se cargan al expandirlas), esquemas, tablas, vistas, columnas y claves primarias.
 - **Explorador de objetos:** haz clic en una base, esquema o carpeta de tablas/vistas para ver sus objetos en [lista o cuadrícula](docs/object-browser.md), con información de la selección a la derecha.
 - **Navegación y organización:** [busca en las celdas cargadas o en todas las tablas](docs/navigation-search.md), organiza objetos con grupos y colores locales y cierra pestañas en bloque. La navegación por teclado mantiene visible la celda activa en tablas anchas.
@@ -148,7 +159,8 @@ scripts/test_mssql.sh <host>   # SQL Server real (no destructivo: solo tablas #t
 
 Los tests en vivo se ejecutan con `cargo test -- --ignored` y las variables `DATACRAFT_PG_*`,
 `DATACRAFT_MY_*`, `DATACRAFT_ORA_*` y `DATACRAFT_SF_*` (ver `src/db/postgres.rs`, `src/db/mysql.rs`,
-`src/db/oracle.rs` y `src/db/snowflake.rs`).
+`src/db/oracle.rs` y `src/db/snowflake.rs`), y `DATACRAFT_REDIS_PORT` / `DATACRAFT_MONGO_PORT`
+para un Redis o Valkey y un MongoDB locales (ver `src/worker.rs`).
 
 Modo demo para capturas: `DATACRAFT_DEMO=ruta.db cargo run` (ver la cabecera de `src/app.rs`).
 

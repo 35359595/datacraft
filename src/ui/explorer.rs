@@ -2,7 +2,7 @@
 //! (Islands style).
 
 use crate::app::{ConnState, ConnStatus};
-use crate::db::{DatabaseInfo, ObjectKind, SchemaInfo, TableInfo};
+use crate::db::{DatabaseInfo, Driver, ObjectKind, SchemaInfo, TableInfo};
 use crate::i18n::tr;
 use crate::ui::icons::{self, Ico};
 use crate::ui::object_browser::ObjectScope;
@@ -255,14 +255,15 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
                 actions.push(ExplorerAction::NewConnection);
                 ui.close();
             }
-            let can_db = connected && sel_driver.is_some_and(|d| d.has_databases());
+            let sql = !sel_driver.is_some_and(|d| d.is_nosql());
+            let can_db = connected && sql && sel_driver.is_some_and(|d| d.has_databases());
             if ui.add_enabled(can_db, egui::Button::new(tr("New Database…"))).clicked()
                 && let Some(id) = sel_conn
             {
                 actions.push(ExplorerAction::NewDatabase(id));
                 ui.close();
             }
-            if ui.add_enabled(connected && sel_db.is_some(), egui::Button::new(tr("New Table…"))).clicked()
+            if ui.add_enabled(connected && sql && sel_db.is_some(), egui::Button::new(tr("New Table…"))).clicked()
                 && let (Some(conn), Some(db)) = (sel_conn, sel_db.clone())
             {
                 let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
@@ -448,7 +449,7 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
             ui.close();
         }
         ui.separator();
-        if c.cfg.driver.has_databases() && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+        if c.cfg.driver.has_databases() && !c.cfg.driver.is_nosql() && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
             actions.push(ExplorerAction::NewDatabase(id));
             ui.close();
         }
@@ -563,11 +564,12 @@ fn database_rows(
             ui.close();
         }
         let connected = matches!(c.status, ConnStatus::Connected);
-        if ui.add_enabled(connected, egui::Button::new(tr("New Table…"))).clicked() {
+        let sql = !c.cfg.driver.is_nosql();
+        if sql && ui.add_enabled(connected, egui::Button::new(tr("New Table…"))).clicked() {
             actions.push(ExplorerAction::NewTable { conn: id, db: db_name.clone(), schema: None });
             ui.close();
         }
-        if multi_db && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
+        if multi_db && sql && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
             actions.push(ExplorerAction::NewDatabase(id));
             ui.close();
         }
@@ -610,7 +612,7 @@ fn database_rows(
     };
     if flat {
         if let Some(s) = schemas.first() {
-            object_groups(ui, state, actions, id, &d.name, s, filter, 2);
+            object_groups(ui, state, actions, id, &d.name, s, filter, 2, c.cfg.driver);
         }
         return;
     }
@@ -689,7 +691,7 @@ fn schema_rows(
         }
     }
     if s_open {
-        object_groups(ui, state, actions, conn, db, s, filter, 3);
+        object_groups(ui, state, actions, conn, db, s, filter, 3, Driver::Postgres);
     }
 }
 
@@ -704,10 +706,19 @@ fn object_groups(
     s: &SchemaInfo,
     filter: &str,
     depth: usize,
+    // Redis and MongoDB: their own folder names, and no DDL, import or copy. Schema-level
+    // callers (only SQL engines get there) pass any SQL driver.
+    driver: Driver,
 ) {
     let p = pal(ui);
     let filtering = !filter.is_empty();
-    for (kind, label, gk) in [(ObjectKind::Table, tr("tables"), "t"), (ObjectKind::View, tr("views"), "v")] {
+    let sql = !driver.is_nosql();
+    let groups: &[(ObjectKind, &str, &str)] = match driver {
+        Driver::Redis => &[(ObjectKind::Table, tr("key groups"), "t")],
+        Driver::MongoDb => &[(ObjectKind::Table, tr("collections"), "t"), (ObjectKind::View, tr("views"), "v")],
+        _ => &[(ObjectKind::Table, tr("tables"), "t"), (ObjectKind::View, tr("views"), "v")],
+    };
+    for &(kind, label, gk) in groups {
         let tables: Vec<&TableInfo> = s.tables.iter().filter(|t| t.kind == kind && table_matches(t, filter)).collect();
         if filtering && tables.is_empty() {
             continue;
@@ -740,7 +751,7 @@ fn object_groups(
                 kind: Some(kind),
             }));
         }
-        if kind == ObjectKind::Table {
+        if kind == ObjectKind::Table && sql {
             row.resp.context_menu(|ui| {
                 if ui.button(tr("New Table…")).clicked() {
                     actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
@@ -761,12 +772,12 @@ fn object_groups(
         }
         for t in tables {
             let tref = TableRef { conn, db: db.to_string(), schema: s.name.clone(), table: t.name.clone() };
-            table_rows(ui, state, actions, tref, t, depth + 1);
+            table_rows(ui, state, actions, tref, t, depth + 1, sql);
         }
     }
 }
 
-fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize) {
+fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize, sql: bool) {
     let p = pal(ui);
     let tkey = table_key(&tref);
     let open = state.expanded.contains(&tkey);
@@ -804,6 +815,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         if ui.button(tr("Copy Name")).clicked() {
             ui.ctx().copy_text(t.name.clone());
             ui.close();
+        }
+        // Redis and MongoDB: no SQL generation, DDL, import or copy.
+        if !sql {
+            return;
         }
         ui.separator();
         if ui.button(tr("Generate SELECT")).clicked() {

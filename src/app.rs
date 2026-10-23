@@ -435,8 +435,13 @@ impl DataCraftApp {
             Ok("preview") => Some(DemoEdit::Preview),
             _ => None,
         };
-        let mut text = String::from("SELECT o.id, u.name, o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\nORDER BY o.total DESC;\n");
-        if std::env::var("DATACRAFT_DEMO_MULTI").is_ok_and(|v| v == "1") {
+        let driver = self.conn(id).map(|c| c.cfg.driver);
+        let mut text = match driver {
+            Some(Driver::Redis) => String::from("HGETALL user:1\nINFO server\n"),
+            Some(Driver::MongoDb) => String::from("db.orders.find({total: {$gt: 10}}).sort({total: -1})\n"),
+            _ => String::from("SELECT o.id, u.name, o.total\nFROM orders o\nJOIN users u ON u.id = o.user_id\nWHERE o.total > 10\nORDER BY o.total DESC;\n"),
+        };
+        if std::env::var("DATACRAFT_DEMO_MULTI").is_ok_and(|v| v == "1") && !driver.is_some_and(|d| d.is_nosql()) {
             text.push_str("\nSELECT * FROM users;\n\nSELECT count(*) AS n FROM orders;\n");
         }
         let idx = self.new_console(Some(id), None, text);
@@ -794,8 +799,10 @@ impl DataCraftApp {
                 continue;
             }
             let read_only = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.read_only);
+            let nosql = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.driver.is_nosql());
             let target = match (c.conn, &c.table) {
                 (None, _) => Err(tr("No connection").to_string()),
+                _ if nosql => Err(tr("Editing is not available for this engine").to_string()),
                 _ if read_only => Err(tr("Read-only connection").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
@@ -1123,7 +1130,7 @@ impl DataCraftApp {
                 .iter()
                 .flat_map(|s| sql::split_statements(s, driver))
                 .map(|s| s.text)
-                .find(|s| !is_query(s))
+                .find(|s| !is_read_statement(driver, s))
         {
             let Some(console) = self.consoles.get_mut(idx) else { return };
             console.log.push(OutputEntry {
@@ -1234,6 +1241,24 @@ impl DataCraftApp {
 
     fn handle_explorer(&mut self, ctx: &egui::Context, actions: Vec<ExplorerAction>) {
         for a in actions {
+            // SQL-only actions never reach Redis or MongoDB (other menus may still offer them).
+            let sql_only = match &a {
+                ExplorerAction::NewDatabase(id) | ExplorerAction::DropDatabase(id, _) => Some(*id),
+                ExplorerAction::NewTable { conn, .. } => Some(*conn),
+                ExplorerAction::DropObject(t, _)
+                | ExplorerAction::TruncateTable(t)
+                | ExplorerAction::ImportData(t)
+                | ExplorerAction::CopyTable(t)
+                | ExplorerAction::RenameTable(t)
+                | ExplorerAction::GenerateSelect(t)
+                | ExplorerAction::GenerateInsert(t)
+                | ExplorerAction::GenerateDdl(t) => Some(t.conn),
+                _ => None,
+            };
+            if sql_only.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.driver.is_nosql()) {
+                self.error(tr("Not available for this engine").to_string());
+                continue;
+            }
             match a {
                 ExplorerAction::NewConnection => self.open_new_connection_dialog(),
                 ExplorerAction::Connect(id) => self.connect(id),
@@ -3036,6 +3061,8 @@ fn demo_server_config(id: u64, url: &str) -> Option<ConnectionConfig> {
         "mariadb" => Driver::MariaDb,
         "sqlserver" | "mssql" => Driver::MsSql,
         "oracle" => Driver::Oracle,
+        "redis" | "valkey" => Driver::Redis,
+        "mongodb" => Driver::MongoDb,
         _ => return None,
     };
     let mut cfg = ConnectionConfig::new(id, driver);
@@ -3054,6 +3081,15 @@ fn demo_server_config(id: u64, url: &str) -> Option<ConnectionConfig> {
     }
     cfg.name = format!("{}@{}", driver.label(), host);
     Some(cfg)
+}
+
+/// true if a statement only reads, in the engine's own language (SQL, Redis or `mongosh`).
+fn is_read_statement(driver: Driver, statement: &str) -> bool {
+    match driver {
+        Driver::Redis => crate::db::redis_db::is_read_command(statement),
+        Driver::MongoDb => crate::db::mongo::is_read_command(statement),
+        _ => is_query(statement),
+    }
 }
 
 /// true if the statement only reads (allowed on read-only connections). A `WITH` that
@@ -3093,6 +3129,20 @@ fn is_query(statement: &str) -> bool {
 
 /// Data editor query with filters and the row limit in the SQL itself.
 pub fn table_query(driver: Driver, schema: &str, table: &str, where_clause: &str, order_by: &str, max_rows: usize) -> String {
+    let w = where_clause.trim().trim_end_matches(';').trim();
+    let o = order_by.trim().trim_end_matches(';').trim();
+    // Braces are optional in the filter row: `age: {$gt: 30}` or `{age: {$gt: 30}}`.
+    let braces = |s: &str| if s.is_empty() { "{}".to_string() } else if s.starts_with('{') { s.to_string() } else { format!("{{{s}}}") };
+    match driver {
+        // A key group is its pattern; the filter row can narrow it (`user:1*`).
+        Driver::Redis => return format!("SCAN 0 MATCH {} COUNT 1000", if w.is_empty() { table } else { w }),
+        Driver::MongoDb => {
+            let name = serde_json::to_string(table).unwrap_or_default();
+            let sort = if o.is_empty() { String::new() } else { format!(".sort({})", braces(o)) };
+            return format!("db.getCollection({name}).find({}){sort}.limit({max_rows})", braces(w));
+        }
+        _ => {}
+    }
     let t = Session::quote_table(driver, schema, table);
     let mut sql = match driver {
         Driver::MsSql => format!("SELECT TOP ({max_rows}) * FROM {t}"),

@@ -20,6 +20,8 @@ pub fn jdbc_url(cfg: &ConnectionConfig) -> String {
         Driver::Oracle => format!("jdbc:oracle:thin:@//{authority}{slash_db}{extra}"),
         Driver::Sqlite => format!("jdbc:sqlite:{}", cfg.file_path.trim()),
         Driver::Snowflake => snowflake::jdbc_url(cfg),
+        Driver::Redis => format!("redis://{authority}{slash_db}{extra}"),
+        Driver::MongoDb => format!("mongodb://{authority}{slash_db}{extra}"),
     }
 }
 
@@ -40,6 +42,8 @@ pub fn apply_jdbc_url(cfg: &mut ConnectionConfig, url: &str) -> bool {
             return true;
         }
         Driver::Snowflake => return snowflake::apply_jdbc_url(cfg, url),
+        Driver::Redis => "redis://",
+        Driver::MongoDb => "mongodb://",
     };
     let Some(rest) = url.strip_prefix(prefix) else { return false };
     let default_port = cfg.driver.default_port();
