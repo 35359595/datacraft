@@ -977,6 +977,12 @@ impl ObjectBrowser {
                     }
                     ui.close();
                 }
+                if ui.add_enabled(tables.len() == 1, egui::Button::new(tr("Copy Table To…"))).clicked() {
+                    if let Some(table) = tables.first() {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::CopyTable(table.clone())));
+                    }
+                    ui.close();
+                }
                 let truncate = writable
                     && self.selection.len() == 1
                     && item.table.is_some_and(|t| t.kind == ObjectKind::Table);

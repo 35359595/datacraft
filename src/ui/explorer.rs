@@ -55,6 +55,8 @@ pub enum ExplorerAction {
     DropObject(TableRef, ObjectKind),
     TruncateTable(TableRef),
     ImportData(TableRef),
+    /// "Copy Table To…" another connection, database or schema.
+    CopyTable(TableRef),
     RenameTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
@@ -819,6 +821,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         ui.separator();
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
+            ui.close();
+        }
+        if ui.button(tr("Copy Table To…")).clicked() {
+            actions.push(ExplorerAction::CopyTable(tref.clone()));
             ui.close();
         }
         if t.kind == ObjectKind::Table {
