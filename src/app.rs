@@ -799,12 +799,17 @@ impl DataCraftApp {
                 continue;
             }
             let read_only = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.read_only);
-            let nosql = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.driver.is_nosql());
+            let driver = c.conn.and_then(|id| self.conn(id)).map(|cs| cs.cfg.driver);
+            let nosql = driver.is_some_and(|d| d.is_nosql());
             let target = match (c.conn, &c.table) {
                 (None, _) => Err(tr("No connection").to_string()),
-                _ if nosql => Err(tr("Editing is not available for this engine").to_string()),
                 _ if read_only => Err(tr("Read-only connection").to_string()),
+                // Redis and MongoDB: only a key group or a collection opened in the data editor.
+                (Some(_), None) if nosql => Err(tr("Only data opened from the explorer can be edited on this engine").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
+                    Some(info) if driver == Some(Driver::MongoDb) => {
+                        editing::document_target(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns)
+                    }
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
                     None => Err(tr("Table structure not loaded yet").to_string()),
                 },
@@ -900,13 +905,36 @@ impl DataCraftApp {
         let Some(c) = self.consoles.get_mut(idx) else { return false };
         let Some(v) = c.results.get_mut(view) else { return false };
         v.finish_inline_edit();
+        let c = &self.consoles[idx];
+        let v = &c.results[view];
         let Some(e) = v.edit.as_ref() else { return false };
         if !e.state.is_dirty() {
             return false;
         }
         let driver = c.conn.and_then(|id| self.conns.iter().find(|x| x.cfg.id == id)).map(|x| x.cfg.driver).unwrap_or(Driver::Postgres);
-        let (statements, error) = match e.state.build_changes(&v.rs, &e.target) {
-            Ok(changes) => (changes.iter().map(|ch| edit::change_sql(driver, &e.target.schema, &e.target.table, ch)).collect(), None),
+        // The NoSQL commands need types: each field's sampled type (MongoDB), each key's (Redis).
+        let types: HashMap<String, String> = match driver {
+            Driver::MongoDb => c
+                .conn
+                .and_then(|conn| self.table_columns(conn, c.db.as_deref(), &e.target.schema, &e.target.table))
+                .unwrap_or_default()
+                .iter()
+                .map(|col| (col.name.clone(), col.data_type.clone()))
+                .collect(),
+            Driver::Redis => {
+                let col = |name: &str| v.rs.columns.iter().position(|c| c == name);
+                match (col("key"), col("type")) {
+                    (Some(k), Some(t)) => v.rs.rows.iter().filter_map(|r| Some((r.get(k)?.clone()?, r.get(t)?.clone()?))).collect(),
+                    _ => HashMap::new(),
+                }
+            }
+            _ => HashMap::new(),
+        };
+        let built = e.state.build_changes(&v.rs, &e.target).and_then(|changes| {
+            edit::change_statements(driver, &e.target.schema, &e.target.table, &changes, &types)
+        });
+        let (statements, error) = match built {
+            Ok(statements) => (statements, None),
             Err(err) => (Vec::new(), Some(err)),
         };
         self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false, visible });
@@ -2975,7 +3003,13 @@ impl DataCraftApp {
             .and_then(|v| v.edit.as_ref())
             .map(|e| format!("{}.{}", e.target.schema, e.target.table))
             .unwrap_or_default();
-        let sql_text = pv.statements.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
+        let driver = self
+            .consoles
+            .iter()
+            .find(|c| c.id == pv.console)
+            .and_then(|c| self.conn(c.conn?))
+            .map_or(Driver::Postgres, |c| c.cfg.driver);
+        let sql_text = preview_text(driver, &pv.statements);
         let dark = self.dark;
         let mut submit = false;
         let mut cancel = false;
@@ -2999,7 +3033,7 @@ impl DataCraftApp {
                     let max_h = (screen.height() * 0.5).clamp(120.0, 520.0);
                     egui::ScrollArea::both().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
-                            let mut job = sql::highlight(buf.as_str(), dark, FontId::monospace(12.5));
+                            let mut job = sql::highlight_for(buf.as_str(), driver, dark, FontId::monospace(12.5));
                             job.wrap.max_width = f32::INFINITY;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
@@ -3053,6 +3087,13 @@ impl DataCraftApp {
             self.submit_preview();
         }
     }
+}
+
+/// The preview window's text: one statement per line, ending in `;` except for Redis, whose
+/// command lines have no terminator.
+fn preview_text(driver: Driver, statements: &[String]) -> String {
+    let end = if driver == Driver::Redis { "" } else { ";" };
+    statements.iter().map(|s| format!("{s}{end}")).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3577,5 +3618,38 @@ mod tests {
             "SELECT * FROM (SELECT * FROM \"HR\".\"T\" ORDER BY ID) WHERE ROWNUM <= 5"
         );
         assert_eq!(table_query(Driver::MySql, "shop", "t", "", "", 5), "SELECT * FROM `shop`.`t` LIMIT 5");
+    }
+
+    #[test]
+    fn nosql_changes_preview_as_their_commands() {
+        use crate::edit::Change;
+        let kv = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+        let changes = vec![
+            Change::Update { key: vec![kv("_id", Some("1"))], set: vec![kv("name", Some("O'Brien \"x\""))] },
+            Change::Insert { values: vec![kv("name", Some("Ana")), kv("tags", Some("[1]"))] },
+            Change::Delete { key: vec![kv("_id", Some("2"))] },
+        ];
+        let types: HashMap<String, String> = [("_id", "int"), ("tags", "array")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let mongo = edit::change_statements(Driver::MongoDb, "shop", "users", &changes, &types).unwrap();
+        assert_eq!(mongo.len(), 3);
+        assert!(mongo[0].starts_with("db.getCollection(\"users\").updateOne({\"_id\": 1}"));
+        let text = preview_text(Driver::MongoDb, &mongo);
+        assert!(text.ends_with(';'));
+        let job = sql::highlight_for(&text, Driver::MongoDb, true, FontId::monospace(12.5));
+        assert_eq!(job.text, text);
+
+        let changes = vec![
+            Change::Update { key: vec![kv("key", Some("s"))], set: vec![kv("ttl", None), kv("value", Some("it's \"v\""))] },
+            Change::Delete { key: vec![kv("key", Some("h"))] },
+        ];
+        let types: HashMap<String, String> = [("s", "string"), ("h", "hash")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let redis = edit::change_statements(Driver::Redis, "db0", "*", &changes, &types).unwrap();
+        assert_eq!(redis, vec!["PERSIST s", r#"SET s "it's \"v\"" XX KEEPTTL"#, "DEL h"]);
+        let text = preview_text(Driver::Redis, &redis);
+        assert_eq!(text.lines().count(), 3);
+        assert!(!text.contains(';'));
+        let job = sql::highlight_for(&text, Driver::Redis, false, FontId::monospace(12.5));
+        assert_eq!(job.text, text);
+        assert_eq!(preview_text(Driver::Sqlite, &["DELETE FROM t".to_string()]), "DELETE FROM t;");
     }
 }

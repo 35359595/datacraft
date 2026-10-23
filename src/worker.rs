@@ -1277,7 +1277,47 @@ mod tests {
         let Response::DatabaseLoaded { result: Ok(schemas), .. } = r else { panic!("introspection failed") };
         let names: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["*", "dc:*"]);
+
+        // Grid edits on the `dc:*` group, as the data editor builds them.
+        let group = &schemas[0].tables[1];
+        let rs = first_rows(&w, 41, 4, &["SCAN 0 MATCH dc:* COUNT 1000"]).remove(0);
+        let target = crate::ui::editing::target_for(&rs.columns, "db5", group.kind, &group.name, &group.columns).unwrap();
+        let types: std::collections::HashMap<String, String> =
+            rs.rows.iter().map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap())).collect();
+        let row = |k: &str| crate::ui::editing::RowRef::Existing(rs.rows.iter().position(|r| r[0].as_deref() == Some(k)).unwrap());
+        let mut st = crate::ui::editing::EditState::default();
+        st.set_value(&rs, row("dc:greeting"), 3, Some("adiós \"mundo\"".into()));
+        st.set_value(&rs, row("dc:greeting"), 2, None);
+        let n = st.add_row(4);
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 0, Some("dc:new key".into()));
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 2, Some("100".into()));
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 3, Some("x y".into()));
+        st.delete_rows(&rs, &target, &[row("dc:q")]);
+        let changes = st.build_changes(&rs, &target).unwrap();
+        let statements = crate::edit::change_statements(Driver::Redis, "db5", "dc:*", &changes, &types).unwrap();
+        assert_eq!(apply(&w, 41, 5, statements), Ok(4));
+        let rs = first_rows(&w, 41, 6, &["GET dc:greeting", "TTL dc:greeting", "GET \"dc:new key\"", "TTL \"dc:new key\"", "EXISTS dc:q"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("adiós \"mundo\""));
+        assert_eq!(rs[1].rows[0][0].as_deref(), Some("-1"));
+        assert_eq!(rs[2].rows[0][0].as_deref(), Some("x y"));
+        assert!(rs[3].rows[0][0].as_deref().is_some_and(|t| t.parse::<i64>().unwrap() > 0));
+        assert_eq!(rs[4].rows[0][0].as_deref(), Some("0"));
+        // A failed precondition (missing key, existing key) saves nothing.
+        let err = apply(&w, 41, 7, vec!["DEL dc:greeting".into(), "EXPIRE dc:missing 10".into()]).unwrap_err();
+        assert!(err.contains("EXPIRE dc:missing 10"), "{err}");
+        assert!(apply(&w, 41, 8, vec!["SET dc:greeting x NX".into()]).unwrap_err().contains("dc:greeting"));
+        assert!(apply(&w, 41, 9, vec!["SET dc:user:1 x XX KEEPTTL".into()]).unwrap_err().contains("hash"));
+        let rs = first_rows(&w, 41, 10, &["GET dc:greeting"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("adiós \"mundo\""));
         first_rows(&w, 41, 3, &["FLUSHDB"]);
+    }
+
+    /// Saves data editor statements through the worker.
+    fn apply(w: &Worker, conn: ConnId, console: ConsoleId, statements: Vec<String>) -> Result<u64, String> {
+        w.send(Request::ApplyChanges { conn, db: None, console, statements });
+        let r = wait_for(w, |r| matches!(r, Response::ChangesApplied { console: c, .. } if *c == console));
+        let Response::ChangesApplied { result, .. } = r else { unreachable!() };
+        result
     }
 
     /// Needs a MongoDB server: `DATACRAFT_MONGO_PORT` (on 127.0.0.1, no authentication).
@@ -1316,6 +1356,34 @@ mod tests {
         let users = schemas[0].tables.iter().find(|t| t.name == "users").expect("users");
         let cols: Vec<_> = users.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(cols, vec!["_id", "name", "tags", "at", "age"]);
+
+        // Grid edits on the collection, as the data editor builds them.
+        let rs = first_rows(&w, 42, 4, &[&crate::app::table_query(Driver::MongoDb, "dc_test", "users", "", "{_id: 1}", 100)]).remove(0);
+        let target = crate::ui::editing::document_target(&rs.columns, "dc_test", users.kind, &users.name, &users.columns).unwrap();
+        let types: std::collections::HashMap<String, String> = users.columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
+        let col = |n: &str| rs.columns.iter().position(|c| c == n).unwrap();
+        use crate::ui::editing::RowRef;
+        let mut st = crate::ui::editing::EditState::default();
+        st.set_value(&rs, RowRef::Existing(1), col("name"), Some("Luis \"M\"".into()));
+        st.set_value(&rs, RowRef::Existing(1), col("age"), Some("50".into()));
+        st.set_value(&rs, RowRef::Existing(0), col("tags"), Some(r#"["a",{"k":1}]"#.into()));
+        let n = st.add_row(rs.columns.len());
+        st.set_value(&rs, RowRef::New(n), col("_id"), Some("3".into()));
+        st.set_value(&rs, RowRef::New(n), col("name"), Some("Eva".into()));
+        st.set_value(&rs, RowRef::New(n), col("at"), Some("2026-03-04T05:06:07Z".into()));
+        st.delete_rows(&rs, &target, &[RowRef::Existing(0)]);
+        let changes = st.build_changes(&rs, &target).unwrap();
+        let statements = crate::edit::change_statements(Driver::MongoDb, "dc_test", "users", &changes, &types).unwrap();
+        assert_eq!(apply(&w, 42, 5, statements), Ok(3));
+        let rs = first_rows(&w, 42, 6, &["db.users.find({}).sort({_id: 1})", "db.users.find({at: {$type: 'date'}, _id: 3})", "db.users.find({age: {$type: 'int'}})"]);
+        let ids: Vec<_> = rs[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(ids, vec!["2", "3"]);
+        assert_eq!(rs[1].rows.len(), 1);
+        assert_eq!(rs[2].rows.len(), 1);
+        // A change that matches no document fails (and, on a replica set, rolls the rest back).
+        let err = apply(&w, 42, 7, vec![r#"db.getCollection("users").deleteOne({"_id": 99})"#.into()]).unwrap_err();
+        assert!(err.contains("deleteOne"), "{err}");
+        assert!(apply(&w, 42, 8, vec!["db.users.drop()".into()]).is_err());
         first_rows(&w, 42, 3, &["db.users.drop()"]);
     }
 
