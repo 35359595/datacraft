@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "datacraft"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
