@@ -2,6 +2,11 @@
 //! (exactly as written in the code) to its Spanish translation.
 
 pub const ENTRIES: &[(&str, &str)] = &[
+    ("Save on row change", "Guardar al cambiar de fila"),
+    (
+        "Automatically submit all pending grid changes when leaving the edited rows. Off by default.",
+        "Guardar automáticamente todos los cambios pendientes de la cuadrícula al salir de las filas editadas. Desactivado por defecto.",
+    ),
     // connection_dialog.rs
     ("Name is required", "El nombre es obligatorio"),
     ("Specify the database file", "Indica el fichero de la base de datos"),

@@ -27,6 +27,8 @@ pub enum CloseResults {
     One(usize),
     /// All but this one.
     Others(usize),
+    Left(usize),
+    Right(usize),
     All,
 }
 
@@ -36,6 +38,8 @@ impl CloseResults {
         match self {
             CloseResults::One(i) => (i < n).then_some(i).into_iter().collect(),
             CloseResults::Others(i) => (0..n).filter(|&j| j != i).collect(),
+            CloseResults::Left(i) => (0..i.min(n)).collect(),
+            CloseResults::Right(i) => (i.saturating_add(1)..n).collect(),
             CloseResults::All => (0..n).collect(),
         }
     }
@@ -167,6 +171,8 @@ pub struct TableTab {
     pub order_by: String,
     /// false until the first load (restored tabs load when activated).
     pub loaded: bool,
+    /// Opt-in: submit pending grid changes when leaving the edited rows.
+    pub save_on_row_change: bool,
 }
 
 /// Actions the console asks the app to perform.
@@ -242,7 +248,14 @@ impl Console {
     pub fn new_table(id: u64, conn: ConnId, db: Option<String>, schema: String, table: String) -> Self {
         let mut c = Self::new(id, table.clone(), String::new(), Some(conn));
         c.db = db;
-        c.table = Some(TableTab { schema, table, where_clause: String::new(), order_by: String::new(), loaded: false });
+        c.table = Some(TableTab {
+            schema,
+            table,
+            where_clause: String::new(),
+            order_by: String::new(),
+            loaded: false,
+            save_on_row_change: false,
+        });
         c
     }
 
@@ -374,6 +387,10 @@ impl Console {
     /// Opens the find bar (with the selection as the search text if it is a single line).
     /// `replace` also shows the replace row. For the app's Find / Replace menu commands.
     pub fn open_find(&mut self, replace: bool) {
+        if self.table.is_some() {
+            if let Some(i) = self.edit_view_index() { self.results[i].open_find(); }
+            return;
+        }
         let selected = self.selection().filter(|s| !s.contains('\n')).map(str::to_string);
         let prev = self.find.take();
         let (query, repl, case_sensitive, shown) = match prev {
@@ -849,9 +866,22 @@ impl Console {
         }
         let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Copy)))
             && ui.memory(|m| m.focused().is_none());
+        let busy = self.is_busy();
+        let save_on_row_change = self.table.as_ref().is_some_and(|t| t.save_on_row_change);
+        let view_index = self.results.len().checked_sub(1);
         if let Some(view) = self.results.last_mut() {
-            if let Some(err) = results::show_result(ui, view, copy_requested, cx.columns) {
+            let response = ui
+                .add_enabled_ui(!busy, |ui| {
+                    results::show_result(ui, view, copy_requested, cx.columns, save_on_row_change)
+                })
+                .inner;
+            if let Some(err) = response.error {
                 actions.push(ConsoleAction::Error(err));
+            }
+            if response.submit
+                && let Some(i) = view_index
+            {
+                actions.push(ConsoleAction::Submit(i));
             }
         } else if self.is_busy() {
             ui.centered_and_justified(|ui| ui.label(RichText::new(tr("Loading…")).color(p.muted)));
@@ -987,31 +1017,59 @@ impl Console {
         toolbar_row(ui, |ui| {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
-            if theme::icon_button(ui, Ico::Refresh, !busy, tr("Reload page (⌘R)")).clicked() {
-                actions.push(ConsoleAction::Reload);
-            }
-            if theme::icon_button(ui, Ico::History, !self.log.is_empty(), tr("Copy the query log")).clicked() {
-                let text = self.log.iter().map(|e| format!("[{}] {} {}", e.time, e.statement, e.message)).collect::<Vec<_>>().join("\n");
-                ui.ctx().copy_text(text);
-            }
-            if theme::icon_button(ui, Ico::Stop, self.running, tr("Cancel the running query")).clicked() {
-                actions.push(ConsoleAction::Cancel);
-            }
-            theme::toolbar_separator(ui);
-            let idx = self.results.len().checked_sub(1);
-            if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)
-                && let Some(i) = idx
-            {
-                actions.push(edit_action(a, i));
-            }
-            if let Some(v) = self.results.last() {
-                edit_status_icon(ui, v);
-            }
-            theme::toolbar_separator(ui);
-            self.tx_dropdown(ui);
-            theme::toolbar_separator(ui);
-            if theme::icon_button(ui, Ico::Ddl, cx.columns.is_some(), tr("Show table DDL")).clicked() {
-                actions.push(ConsoleAction::Ddl);
+                    if theme::icon_button(ui, Ico::Refresh, !busy, tr("Reload page (⌘R)")).clicked()
+                    {
+                        actions.push(ConsoleAction::Reload);
+                    }
+                    if theme::icon_button(
+                        ui,
+                        Ico::History,
+                        !self.log.is_empty(),
+                        tr("Copy the query log"),
+                    )
+                    .clicked()
+                    {
+                        let text = self
+                            .log
+                            .iter()
+                            .map(|e| format!("[{}] {} {}", e.time, e.statement, e.message))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.ctx().copy_text(text);
+                    }
+                    if theme::icon_button(
+                        ui,
+                        Ico::Stop,
+                        self.running,
+                        tr("Cancel the running query"),
+                    )
+                    .clicked()
+                    {
+                        actions.push(ConsoleAction::Cancel);
+                    }
+                    theme::toolbar_separator(ui);
+                    let idx = self.results.len().checked_sub(1);
+                    if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)
+                        && let Some(i) = idx
+                    {
+                        actions.push(edit_action(a, i));
+                    }
+                    if let Some(v) = self.results.last() {
+                        edit_status_icon(ui, v);
+                    }
+                    theme::toolbar_separator(ui);
+                    self.tx_dropdown(ui);
+                    theme::toolbar_separator(ui);
+                    if theme::icon_button(ui, Ico::Ddl, cx.columns.is_some(), tr("Show table DDL"))
+                        .clicked()
+                    {
+                        actions.push(ConsoleAction::Ddl);
+                    }
+                    if let Some(t) = self.table.as_mut() {
+                        let editable =
+                            !busy && self.results.last().is_some_and(|v| v.edit.is_some());
+                        ui.add_enabled(editable, egui::Checkbox::new(&mut t.save_on_row_change, tr("Save on row change")))
+                    .on_hover_text(tr("Automatically submit all pending grid changes when leaving the edited rows. Off by default."));
             }
             self.busy_label(ui);
                 }
@@ -1167,6 +1225,12 @@ impl Console {
                                         close = Some(CloseResults::Others(i));
                                         ui.close();
                                     }
+                                    for (label, which, enabled) in [
+                                        (tr("Close to the left"), CloseResults::Left(i), i > 0),
+                                        (tr("Close to the right"), CloseResults::Right(i), i + 1 < n),
+                                    ] {
+                                        if ui.add_enabled(!busy && enabled, egui::Button::new(label)).clicked() { close = Some(which); ui.close(); }
+                                    }
                                     if ui.add_enabled(!busy, egui::Button::new(tr("Close all"))).clicked() {
                                         close = Some(CloseResults::All);
                                         ui.close();
@@ -1210,7 +1274,18 @@ impl Console {
         }
         match self.result_tab {
             ResultTab::Result(i) if i < self.results.len() => {
-                if let Some(err) = results::show_result(ui, &mut self.results[i], copy_requested, cx.columns) {
+                let response = ui
+                    .add_enabled_ui(!busy, |ui| {
+                        results::show_result(
+                            ui,
+                            &mut self.results[i],
+                            copy_requested,
+                            cx.columns,
+                            false,
+                        )
+                    })
+                    .inner;
+                if let Some(err) = response.error {
                     actions.push(ConsoleAction::Error(err));
                 }
             }
@@ -1992,6 +2067,100 @@ mod tests {
     use super::*;
     use crate::db::{ColumnInfo, TableInfo};
 
+    struct TableState {
+        console: Console,
+        submits: usize,
+    }
+
+    fn table_harness() -> egui_kittest::Harness<'static, TableState> {
+        let mut console = Console::new_table(1, 1, None, "main".into(), "notes".into());
+        let mut view = ResultView::new(
+            crate::db::ResultSet {
+                columns: vec!["id".into(), "note".into()],
+                rows: vec![
+                    vec![Some("1".into()), Some("First note".into())],
+                    vec![Some("2".into()), Some("Second note".into())],
+                ],
+                ..Default::default()
+            },
+            1,
+        );
+        view.set_edit_target(Ok(crate::ui::editing::EditTarget {
+            schema: "main".into(),
+            table: "notes".into(),
+            col_names: view.rs.columns.clone(),
+            key_cols: vec![0],
+            binary_cols: vec![false, false],
+            has_pk: true,
+        }));
+        view.begin_edit(0, 1);
+        console.results.push(view);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 500.0))
+            .build_ui_state(
+                move |ui, state: &mut TableState| {
+                    if std::mem::take(&mut first) {
+                        theme::install_fonts(ui.ctx());
+                        theme::apply(ui.ctx(), false);
+                        return;
+                    }
+                    let cx = ConsoleCtx {
+                        connections: &[],
+                        schemas: None,
+                        driver: Driver::Sqlite,
+                        dark: false,
+                        font_size: 14.0,
+                        columns: None,
+                    };
+                    for action in state.console.show_table(ui, &cx) {
+                        if let ConsoleAction::Submit(0) = action {
+                            state.submits += 1;
+                        }
+                    }
+                },
+                TableState {
+                    console,
+                    submits: 0,
+                },
+            );
+        h.run_steps(3);
+        h
+    }
+
+    #[test]
+    fn table_save_on_row_change_is_an_explicit_opt_in() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = table_harness();
+        assert!(!h.state().console.table.as_ref().unwrap().save_on_row_change);
+        h.get_by_label("Save on row change").click();
+        h.run_steps(3);
+        assert!(h.state().console.table.as_ref().unwrap().save_on_row_change);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+        h.run_steps(3);
+        h.input_mut()
+            .events
+            .push(Event::Text("Changed note".into()));
+        h.run_steps(2);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().submits, 1);
+        assert!(h.state().console.results[0].is_dirty());
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; writes a table editor preview to target/table-editor-snapshots"]
+    fn render_table_keyboard_navigation() {
+        let mut h = table_harness();
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/table-editor-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render()
+            .expect("render")
+            .save(dir.join("improve-ux.png"))
+            .unwrap();
+    }
+
     fn schemas() -> Vec<SchemaInfo> {
         vec![SchemaInfo {
             name: "main".into(),
@@ -2132,6 +2301,9 @@ mod tests {
         assert_eq!(CloseResults::One(1).indices(3), vec![1]);
         assert!(CloseResults::One(5).indices(3).is_empty());
         assert_eq!(CloseResults::Others(1).indices(3), vec![0, 2]);
+        assert_eq!(CloseResults::Left(2).indices(4), vec![0, 1]);
+        assert_eq!(CloseResults::Right(1).indices(4), vec![2, 3]);
+        assert!(CloseResults::Right(usize::MAX).indices(4).is_empty());
         assert_eq!(CloseResults::All.indices(2), vec![0, 1]);
     }
 

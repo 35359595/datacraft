@@ -456,7 +456,7 @@ fn run_in_transaction(conn: &Connection, statements: &[String], single_row: bool
 
 /// Schemas Oracle installs and maintains itself, for servers older than 12c
 /// (no `ALL_USERS.ORACLE_MAINTAINED`).
-const SYSTEM_SCHEMAS: &[&str] = &[
+pub(super) const SYSTEM_SCHEMAS: &[&str] = &[
     "ANONYMOUS", "APPQOSSYS", "AUDSYS", "CTXSYS", "DBSFWUSER", "DBSNMP", "DIP", "DVF", "DVSYS", "EXFSYS",
     "GGSYS", "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "LBACSYS", "MDDATA", "MDSYS", "MGMT_VIEW", "OJVMSYS",
     "OLAPSYS", "ORACLE_OCM", "ORDDATA", "ORDPLUGINS", "ORDSYS", "OUTLN", "OWBSYS", "OWBSYS_AUDIT",

@@ -8,7 +8,10 @@ pub mod import_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;
+pub mod object_browser;
+pub mod object_organization;
 pub mod results;
+pub mod schema_search;
 pub mod theme;
 
 use crate::db::Driver;

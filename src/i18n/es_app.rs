@@ -2,6 +2,10 @@
 //! (exactly as written in the code) to its Spanish translation.
 
 pub const ENTRIES: &[(&str, &str)] = &[
+    (
+        "Another save is in progress; try again when it finishes",
+        "Hay otro guardado en curso; inténtalo de nuevo cuando termine",
+    ),
     // Common buttons, shared by every area.
     ("Cancel", "Cancelar"),
     ("Close", "Cerrar"),

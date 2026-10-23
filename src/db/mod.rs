@@ -4,6 +4,8 @@
 //! know each engine's native types.
 
 pub mod mssql;
+pub mod object_info;
+pub mod schema_search;
 pub mod mysql;
 pub mod oracle;
 pub mod postgres;

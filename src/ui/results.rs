@@ -98,7 +98,11 @@ struct InlineEdit {
     buffer: String,
     /// Request focus (and select all) on the next frame.
     focus: bool,
+    select_all: bool,
+    changed: bool,
 }
+
+type FindKey = (String, usize, Option<(usize, SortDir)>, usize);
 
 /// Edit state of an editable result.
 pub struct EditSession {
@@ -119,10 +123,21 @@ pub struct ResultView {
     filter_popup: Option<FilterPopup>,
     /// Selected cell (visual row, column).
     selected: Option<(usize, usize)>,
+    selected_cells: BTreeSet<(usize, usize)>,
+    cell_anchor: Option<(usize, usize)>,
+    drag_anchor: Option<(usize, usize, bool)>,
+    /// Rows belonging to the pending edit batch, independent of cursor selection.
+    edit_rows: BTreeSet<RowRef>,
     /// Selected visual rows (to delete several).
     selected_rows: BTreeSet<usize>,
     anchor: Option<usize>,
     scroll_to: Option<usize>,
+    find_open: bool,
+    find_query: String,
+    find_focus: bool,
+    /// Match count shown in the find bar, with what it was counted for: counting scans every
+    /// loaded cell, so it is redone when the query or the view changes, and at most once a second.
+    find_count: Option<(FindKey, std::time::Instant, usize)>,
     /// Salt for the table id (changes on every run to reset widths).
     salt: u64,
     /// Some if the result is editable.
@@ -136,6 +151,51 @@ pub struct ResultView {
 }
 
 impl ResultView {
+    pub fn open_find(&mut self) {
+        self.find_open = true;
+        self.find_focus = true;
+    }
+
+    fn find_matches(&self) -> Vec<(usize, usize)> {
+        if self.find_query.is_empty() { return Vec::new(); }
+        let query = self.find_query.to_lowercase();
+        (0..self.n_view_rows()).flat_map(|r| {
+            let query = &query;
+            (0..self.rs.columns.len()).filter_map(move |c| {
+                let row = self.row_ref(r)?;
+                self.display_value(row, c).flatten()
+                    .filter(|v| v.to_lowercase().contains(query)).map(|_| (r, c))
+            })
+        }).collect()
+    }
+
+    fn find_count(&mut self) -> usize {
+        let key: FindKey = (self.find_query.clone(), self.n_view_rows(), self.sort, self.filters.len());
+        if let Some((k, at, n)) = &self.find_count
+            && *k == key
+            && at.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return *n;
+        }
+        let n = self.find_matches().len();
+        self.find_count = Some((key, std::time::Instant::now(), n));
+        n
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        let matches = self.find_matches();
+        let next = if forward {
+            matches.iter().find(|&&cell| self.selected.is_none_or(|s| cell > s)).or(matches.first())
+        } else {
+            matches.iter().rev().find(|&&cell| self.selected.is_none_or(|s| cell < s)).or(matches.last())
+        }.copied();
+        if let Some((r, c)) = next {
+            self.commit_edit();
+            self.select_cell(r, c, Modifiers::NONE);
+            self.scroll_to = Some(r);
+        }
+    }
+
     pub fn new(rs: ResultSet, salt: u64) -> Self {
         let title = statement_title(&rs.statement);
         let order = (0..rs.rows.len()).collect();
@@ -147,9 +207,17 @@ impl ResultView {
             filters: BTreeMap::new(),
             filter_popup: None,
             selected: None,
+            selected_cells: BTreeSet::new(),
+            cell_anchor: None,
+            drag_anchor: None,
+            edit_rows: BTreeSet::new(),
             selected_rows: BTreeSet::new(),
             anchor: None,
             scroll_to: None,
+            find_open: false,
+            find_query: String::new(),
+            find_focus: false,
+            find_count: None,
             salt,
             edit: None,
             record_view: None,
@@ -173,7 +241,9 @@ impl ResultView {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.edit.as_ref().is_some_and(|e| e.state.is_dirty())
+        self.edit
+            .as_ref()
+            .is_some_and(|e| e.state.is_dirty() || e.editing.as_ref().is_some_and(|ed| ed.changed))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -182,6 +252,7 @@ impl ResultView {
 
     /// Discards pending changes and any edit in progress.
     pub fn discard_edits(&mut self) {
+        self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.state.clear();
             e.editing = None;
@@ -189,15 +260,29 @@ impl ResultView {
         self.clamp_selection();
     }
 
+    /// Keep saved key changes in the cache so refresh can follow the same record.
+    pub fn mark_saved(&mut self) {
+        if let Some(edit) = &self.edit {
+            for (&(r, c), value) in &edit.state.changes {
+                if let Some(cell) = self.rs.rows.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    *cell = value.clone();
+                }
+            }
+        }
+        self.discard_edits();
+    }
+
     pub fn undo(&mut self) {
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             e.state.undo();
+            if !e.state.is_dirty() { self.edit_rows.clear(); }
         }
         self.clamp_selection();
     }
 
     pub fn revert_all(&mut self) {
+        self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             e.state.revert_all();
@@ -223,6 +308,8 @@ impl ResultView {
     fn clamp_selection(&mut self) {
         let n = self.n_view_rows();
         self.selected_rows.retain(|&r| r < n);
+        self.selected_cells
+            .retain(|&(r, c)| r < n && c < self.rs.columns.len());
         if self.selected.is_some_and(|(r, _)| r >= n) {
             self.selected = None;
         }
@@ -230,14 +317,29 @@ impl ResultView {
 
     /// Appends a new row and opens the editor on its first editable column.
     pub fn add_row(&mut self) {
+        self.commit_edit();
         let n_cols = self.rs.columns.len();
         let base = self.order.len();
         let Some(e) = self.edit.as_mut() else { return };
         let i = e.state.add_row(n_cols);
         let vr = base + i;
-        let col = (0..n_cols).find(|&c| e.state.cell_editable(&self.rs, &e.target, RowRef::New(i), c)).unwrap_or(0);
-        e.editing = Some(InlineEdit { row: RowRef::New(i), col, buffer: String::new(), focus: true });
+        let col = (0..n_cols)
+            .find(|&c| {
+                e.state
+                    .cell_editable(&self.rs, &e.target, RowRef::New(i), c)
+            })
+            .unwrap_or(0);
+        e.editing = Some(InlineEdit {
+            row: RowRef::New(i),
+            col,
+            buffer: String::new(),
+            focus: true,
+            select_all: true,
+            changed: false,
+        });
         self.selected = Some((vr, col));
+        self.selected_cells = BTreeSet::from([(vr, col)]);
+        self.cell_anchor = self.selected;
         self.selected_rows = BTreeSet::from([vr]);
         self.anchor = Some(vr);
         self.scroll_to = Some(vr);
@@ -246,6 +348,7 @@ impl ResultView {
     /// Appends a copy of the selected row (DataGrip's "Clone Row"). The primary key and
     /// binary columns are left to their defaults so the copy can be inserted.
     pub fn clone_selected_row(&mut self) {
+        self.commit_edit();
         let Some(vr) = self.selected.map(|(r, _)| r).or_else(|| self.selected_rows.iter().next().copied()) else { return };
         let Some(row) = self.row_ref(vr) else { return };
         let n_cols = self.rs.columns.len();
@@ -265,6 +368,8 @@ impl ResultView {
         let vr = base + i;
         let col = self.selected.map_or(0, |(_, c)| c);
         self.selected = Some((vr, col));
+        self.selected_cells = BTreeSet::from([(vr, col)]);
+        self.cell_anchor = self.selected;
         self.selected_rows = BTreeSet::from([vr]);
         self.anchor = Some(vr);
         self.scroll_to = Some(vr);
@@ -273,6 +378,7 @@ impl ResultView {
     /// Selected rows as references to original/new rows.
     fn selected_refs(&self) -> Vec<RowRef> {
         let mut rows: BTreeSet<usize> = self.selected_rows.clone();
+        rows.extend(self.selected_cells.iter().map(|(r, _)| *r));
         if let Some((r, _)) = self.selected {
             rows.insert(r);
         }
@@ -291,6 +397,7 @@ impl ResultView {
         if e.state.delete_rows(&self.rs, &e.target, &refs) && refs.iter().any(|r| matches!(r, RowRef::New(_))) {
             self.selected = None;
             self.selected_rows.clear();
+            self.selected_cells.clear();
         }
         self.clamp_selection();
     }
@@ -302,42 +409,38 @@ impl ResultView {
         if !e.state.cell_editable(&self.rs, &e.target, row, col) {
             return false;
         }
-        let buffer = e.state.current(&self.rs, row, col).flatten().unwrap_or_default();
-        e.editing = Some(InlineEdit { row, col, buffer, focus: true });
+        let buffer = e
+            .state
+            .current(&self.rs, row, col)
+            .flatten()
+            .unwrap_or_default();
+        e.editing = Some(InlineEdit {
+            row,
+            col,
+            buffer,
+            focus: true,
+            select_all: true,
+            changed: false,
+        });
         self.selected = Some((vr, col));
         true
     }
 
-    /// Commits the inline editor. `step` moves to the next/previous editable cell.
-    fn commit_edit(&mut self, step: i32) {
-        let Some(e) = self.edit.as_mut() else { return };
-        let Some(ed) = e.editing.take() else { return };
-        let current = e.state.current(&self.rs, ed.row, ed.col);
-        let unchanged_empty = ed.buffer.is_empty() && matches!(current, None | Some(None));
-        if !unchanged_empty {
-            e.state.set_value(&self.rs, ed.row, ed.col, Some(ed.buffer));
+    /// Commits the inline editor without changing the selected cell.
+    fn commit_edit(&mut self) {
+        let Some(ed) = self.edit.as_mut().and_then(|e| e.editing.take()) else {
+            return;
+        };
+        if !ed.changed {
+            return;
         }
-        if step != 0 {
-            let n = self.rs.columns.len() as i32;
-            let mut c = ed.col as i32 + step;
-            while (0..n).contains(&c) {
-                if e.state.cell_editable(&self.rs, &e.target, ed.row, c as usize) {
-                    let vr = self.view_row_of(ed.row);
-                    if let Some(vr) = vr {
-                        self.start_edit(vr, c as usize);
-                    }
-                    return;
-                }
-                c += step;
-            }
+        // The selection only gets the value when the editor is one of its cells; otherwise
+        // (cursor moved by the record view, a reverted new row…) only the edited cell does.
+        let mut cells = self.selected_cell_refs();
+        if !cells.contains(&(ed.row, ed.col)) {
+            cells = vec![(ed.row, ed.col)];
         }
-    }
-
-    fn view_row_of(&self, row: RowRef) -> Option<usize> {
-        match row {
-            RowRef::Existing(r) => self.order.iter().position(|&x| x == r),
-            RowRef::New(i) => Some(self.order.len() + i),
-        }
+        self.apply_cell_values(cells.into_iter().map(|(row, col)| (row, col, Some(ed.buffer.clone()))).collect());
     }
 
     fn toggle_sort(&mut self, col: usize) {
@@ -359,6 +462,7 @@ impl ResultView {
     }
 
     fn set_filter(&mut self, col: usize, filter: Option<ColumnFilter>) {
+        self.commit_edit();
         match filter {
             Some(f) => self.filters.insert(col, f),
             None => self.filters.remove(&col),
@@ -366,6 +470,8 @@ impl ResultView {
         self.rebuild_order();
         self.selected = None;
         self.selected_rows.clear();
+        self.selected_cells.clear();
+        self.cell_anchor = None;
         self.anchor = None;
     }
 
@@ -397,7 +503,319 @@ impl ResultView {
 
     /// Commits the inline editor if one is open (before previewing or saving).
     pub fn finish_inline_edit(&mut self) {
-        self.commit_edit(0);
+        self.commit_edit();
+    }
+
+    fn selected_cell_refs(&self) -> Vec<(RowRef, usize)> {
+        if self.selected_cells.is_empty() {
+            return self
+                .selected
+                .and_then(|(r, c)| self.row_ref(r).map(|row| vec![(row, c)]))
+                .unwrap_or_default();
+        }
+        self.selected_cells
+            .iter()
+            .filter_map(|&(r, c)| self.row_ref(r).map(|row| (row, c)))
+            .collect()
+    }
+
+    fn cell_selected(&self, r: usize, c: usize) -> bool {
+        self.selected_cells.contains(&(r, c))
+            || (self.selected_cells.is_empty() && self.selected == Some((r, c)))
+    }
+
+    fn select_cell(&mut self, r: usize, c: usize, mods: Modifiers) {
+        if self.row_ref(r).is_none() || c >= self.rs.columns.len() {
+            return;
+        }
+        if mods.shift {
+            let (ar, ac) = self.cell_anchor.or(self.selected).unwrap_or((r, c));
+            self.cell_anchor = Some((ar, ac));
+            if !mods.command {
+                self.selected_cells.clear();
+            }
+            for vr in ar.min(r)..=ar.max(r) {
+                self.selected_cells
+                    .extend((ac.min(c)..=ac.max(c)).map(|col| (vr, col)));
+            }
+        } else if mods.command {
+            if self.selected_cells.is_empty()
+                && let Some(cell) = self.selected
+            {
+                self.selected_cells.insert(cell);
+            }
+            if !self.selected_cells.remove(&(r, c)) {
+                self.selected_cells.insert((r, c));
+            }
+            self.cell_anchor = Some((r, c));
+        } else {
+            self.selected_cells = BTreeSet::from([(r, c)]);
+            self.cell_anchor = Some((r, c));
+        }
+        self.selected = if self.selected_cells.contains(&(r, c)) {
+            Some((r, c))
+        } else {
+            self.selected_cells.iter().next().copied()
+        };
+        self.selected_rows.clear();
+        self.anchor = Some(r);
+    }
+
+    fn select_column(&mut self, col: usize, additive: bool) {
+        self.commit_edit();
+        let remove = additive
+            && self.n_view_rows() > 0
+            && (0..self.n_view_rows()).all(|r| self.selected_cells.contains(&(r, col)));
+        if !additive {
+            self.selected_cells.clear();
+        }
+        for r in 0..self.n_view_rows() {
+            if remove {
+                self.selected_cells.remove(&(r, col));
+            } else {
+                self.selected_cells.insert((r, col));
+            }
+        }
+        self.selected = if remove {
+            self.selected_cells.iter().next().copied()
+        } else {
+            (self.n_view_rows() > 0).then_some((0, col))
+        };
+        self.cell_anchor = self.selected;
+        self.anchor = self.selected.map(|(r, _)| r);
+        self.selected_rows.clear();
+        self.scroll_to = self.selected.map(|(r, _)| r);
+    }
+
+    fn selection_tsv(&self) -> String {
+        if self.selected_cells.is_empty() {
+            if self.selected.is_none() {
+                return self
+                    .selected_rows
+                    .iter()
+                    .map(|&r| self.row_tsv(r))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            return self
+                .selected
+                .and_then(|(r, c)| {
+                    self.row_ref(r)
+                        .and_then(|row| self.display_value(row, c).flatten())
+                })
+                .unwrap_or_default();
+        }
+        let rows: BTreeSet<_> = self.selected_cells.iter().map(|(r, _)| *r).collect();
+        let cols: BTreeSet<_> = self.selected_cells.iter().map(|(_, c)| *c).collect();
+        rows.into_iter()
+            .map(|r| {
+                cols.iter()
+                    .map(|&c| {
+                        if !self.selected_cells.contains(&(r, c)) {
+                            return String::new();
+                        }
+                        self.row_ref(r)
+                            .and_then(|row| self.display_value(row, c).flatten())
+                            .unwrap_or_default()
+                            .replace(['\t', '\r', '\n'], " ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn apply_cell_values(&mut self, values: Vec<(RowRef, usize, Cell)>) {
+        if let Some(edit) = self.edit.as_mut() {
+            if !edit.state.is_dirty() { self.edit_rows.clear(); }
+            let rows: BTreeSet<_> = values.iter().filter(|(row, col, _)| edit.state.cell_editable(&self.rs, &edit.target, *row, *col)).map(|(row, _, _)| *row).collect();
+            if edit.state.set_values(&self.rs, &edit.target, values) { self.edit_rows.extend(rows); }
+        }
+    }
+
+    fn fill_selection(&mut self, value: Cell) {
+        self.apply_cell_values(self.selected_cell_refs().into_iter().map(|(r, c)| (r, c, value.clone())).collect());
+    }
+
+    fn paste_selection(&mut self, text: &str) -> Result<(), String> {
+        let text = text.trim_end_matches(['\r', '\n']);
+        if !text.contains(['\t', '\n']) {
+            self.fill_selection(Some(text.into()));
+            return Ok(());
+        }
+        let Some((r, c)) = self.selected_cells.iter().next().copied().or(self.selected) else {
+            return Ok(());
+        };
+        let mut values = Vec::new();
+        for (dr, row) in text.lines().enumerate() {
+            let row_ref = self
+                .row_ref(r + dr)
+                .ok_or_else(|| tr("Clipboard data does not fit in the loaded grid").to_string())?;
+            for (dc, value) in row.trim_end_matches('\r').split('\t').enumerate() {
+                if c + dc >= self.rs.columns.len() {
+                    return Err(tr("Clipboard data does not fit in the loaded grid").into());
+                }
+                values.push((row_ref, c + dc, Some(value.to_owned())));
+            }
+        }
+        self.apply_cell_values(values);
+        Ok(())
+    }
+
+    /// Move in visual order, including filtered/sorted results and new rows.
+    fn navigate(&mut self, key: Key, mods: Modifiers, page_rows: usize) {
+        let Some((r, c)) = self.selected else { return };
+        let rows = self.n_view_rows();
+        let cols = self.rs.columns.len();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        self.commit_edit();
+        let last_row = rows - 1;
+        let last_col = cols - 1;
+        let (nr, nc) = match key {
+            Key::ArrowUp if mods.command => (0, c),
+            Key::ArrowDown if mods.command => (last_row, c),
+            Key::ArrowLeft if mods.command => (r, 0),
+            Key::ArrowRight if mods.command => (r, last_col),
+            Key::Home if mods.command => (0, c),
+            Key::End if mods.command => (last_row, c),
+            Key::Home => (r, 0),
+            Key::End => (r, last_col),
+            Key::ArrowUp => (r.saturating_sub(1), c),
+            Key::ArrowDown => ((r + 1).min(last_row), c),
+            Key::ArrowLeft => (r, c.saturating_sub(1)),
+            Key::ArrowRight => (r, (c + 1).min(last_col)),
+            Key::PageUp if mods.command => (0, c),
+            Key::PageDown if mods.command => (last_row, c),
+            Key::PageUp => (r.saturating_sub(page_rows.max(1)), c),
+            Key::PageDown => (r.saturating_add(page_rows.max(1)).min(last_row), c),
+            Key::Enter if mods.shift => (r.saturating_sub(1), c),
+            Key::Enter => ((r + 1).min(last_row), c),
+            Key::Tab => {
+                let cell = r * cols + c;
+                let next = if mods.shift {
+                    cell.saturating_sub(1)
+                } else {
+                    (cell + 1).min(rows * cols - 1)
+                };
+                (next / cols, next % cols)
+            }
+            _ => return,
+        };
+        let extend = mods.shift && key != Key::Tab && key != Key::Enter;
+        self.select_cell(
+            nr,
+            nc,
+            if extend {
+                Modifiers::SHIFT
+            } else {
+                Modifiers::NONE
+            },
+        );
+        self.scroll_to = Some(nr);
+    }
+
+    fn selected_row(&self) -> Option<RowRef> {
+        self.selected
+            .map(|(r, _)| r)
+            .or_else(|| self.selected_rows.iter().next().copied())
+            .and_then(|r| self.row_ref(r))
+    }
+
+    fn cancel_row(&mut self) {
+        let row = self.selected_row();
+        if let Some(row) = row { self.edit_rows.remove(&row); }
+        if let Some(e) = self.edit.as_mut() {
+            e.editing = None;
+            if let Some(row) = row {
+                e.state.revert_row(row);
+            }
+        }
+        // Reverting a new row shifts the ones after it: `New(j)` becomes `New(j - 1)`, and so do
+        // their view rows.
+        if let Some(RowRef::New(i)) = row {
+            self.edit_rows = std::mem::take(&mut self.edit_rows)
+                .into_iter()
+                .map(|r| match r {
+                    RowRef::New(j) if j > i => RowRef::New(j - 1),
+                    other => other,
+                })
+                .collect();
+            let removed = self.order.len() + i;
+            let shift = |r: usize| if r > removed { r - 1 } else { r };
+            self.selected_cells = std::mem::take(&mut self.selected_cells)
+                .into_iter()
+                .filter(|&(r, _)| r != removed)
+                .map(|(r, c)| (shift(r), c))
+                .collect();
+            self.selected_rows = std::mem::take(&mut self.selected_rows).into_iter().map(shift).collect();
+        }
+        self.clamp_selection();
+    }
+
+    fn row_in_edit_batch(&self, row: RowRef) -> bool {
+        self.edit_rows.contains(&row) || self.edit.as_ref().is_some_and(|edit| match row {
+            RowRef::Existing(r) => edit.state.deleted.contains(&r) || edit.state.changes.keys().any(|(changed, _)| *changed == r),
+            RowRef::New(i) => i < edit.state.inserted.len(),
+        })
+    }
+
+    fn row_change_needs_save(&self, previous: Option<RowRef>) -> bool {
+        // A newly added row must be filled before it is submitted.
+        previous.is_none_or(|row| self.row_in_edit_batch(row))
+            && self
+                .selected_row()
+                .is_some_and(|r| matches!(r, RowRef::Existing(_)) && Some(r) != previous && !self.row_in_edit_batch(r))
+            && self.is_dirty()
+    }
+
+    /// Refresh data without resetting the grid's column widths, filters or cursor.
+    pub fn refresh(&mut self, rs: ResultSet) {
+        let selection = self.selected.map(|(r, c)| {
+            let keys = self
+                .edit
+                .as_ref()
+                .filter(|e| e.target.has_pk)
+                .and_then(|e| {
+                    let row = self.row_ref(r)?;
+                    Some(
+                        e.target
+                            .key_cols
+                            .iter()
+                            .map(|&k| (k, self.display_value(row, k).flatten()))
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            (r, c, keys)
+        });
+        self.rs = rs;
+        self.edit_rows.clear();
+        self.edit = None;
+        self.edit_checked = false;
+        self.readonly_reason = None;
+        self.rebuild_order();
+        self.selected_rows.clear();
+        self.selected = selection.and_then(|(r, c, keys)| {
+            if c >= self.rs.columns.len() || self.order.is_empty() {
+                return None;
+            }
+            let row = keys
+                .and_then(|keys| {
+                    self.order
+                        .iter()
+                        .position(|&i| keys.iter().all(|(k, v)| self.rs.rows[i].get(*k) == Some(v)))
+                })
+                .unwrap_or_else(|| r.min(self.order.len() - 1));
+            self.selected_rows.insert(row);
+            self.anchor = Some(row);
+            self.scroll_to = Some(row);
+            Some((row, c))
+        });
+        self.selected_cells = self.selected.into_iter().collect();
+        self.cell_anchor = self.selected;
+        self.drag_anchor = None;
     }
 }
 
@@ -631,8 +1049,16 @@ enum GridAction {
     Sort(usize),
     OpenFilter(usize, egui::Pos2),
     Select { vr: usize, col: Option<usize>, mods: Modifiers },
+    SelectColumn(usize, bool),
+    DragStart(usize, usize, bool),
+    DragTo(usize, usize),
+    Type(String),
+    Paste(String),
+    ClearSelection,
     StartEdit(usize, usize),
-    Commit(i32),
+    Commit,
+    Navigate(Key, Modifiers),
+    AddRow,
     Cancel,
     SetNull(RowRef, usize),
     Revert(RowRef, usize),
@@ -640,6 +1066,12 @@ enum GridAction {
     CloneRow,
     RecordView(usize),
     Copy(String),
+}
+
+#[derive(Default)]
+pub struct GridResponse {
+    pub error: Option<String>,
+    pub submit: bool,
 }
 
 /// Draws a result set as a DataGrip-style data grid. `columns_info` marks primary keys in
@@ -650,7 +1082,8 @@ pub fn show_result(
     view: &mut ResultView,
     copy_requested: bool,
     columns_info: Option<&[ColumnInfo]>,
-) -> Option<String> {
+    save_on_row_change: bool,
+) -> GridResponse {
     let p = pal(ui);
     let mut error = None;
     let area_rect = ui.max_rect();
@@ -661,23 +1094,98 @@ pub fn show_result(
                 RichText::new(format!("{} · {}", affected_message(&view.rs), format_duration(view.rs.elapsed))).color(p.muted),
             )
         });
-        return error;
+        return GridResponse::default();
     }
 
     let mut actions: Vec<GridAction> = Vec::new();
+    let previous_row = view.selected_row();
+    if ui.is_enabled() && !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+        view.open_find();
+    }
+    if view.find_open {
+        let mut step = None;
+        let mut restart = false;
+        ui.horizontal(|ui| {
+            let response = ui.add(egui::TextEdit::singleline(&mut view.find_query)
+                .id_salt(("grid_find", view.salt)).hint_text(tr("Find in loaded rows…")).desired_width(240.0));
+            if std::mem::take(&mut view.find_focus) { response.request_focus(); }
+            if response.changed() {
+                restart = true;
+                step = Some(true);
+            }
+            let enter = (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
+            if enter { response.request_focus(); }
+            if ui.button(tr("Previous")).clicked() { step = Some(false); }
+            if ui.button(tr("Next")).clicked() || enter { step = Some(!ui.input(|i| i.modifiers.shift)); }
+            let matches = view.find_count();
+            ui.label(if matches == 1 { tr("1 match").into() } else { trf("{n} matches", &[("n", &matches)]) });
+            let escape = (response.has_focus() || response.lost_focus())
+                && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            if theme::icon_button(ui, Ico::Close, true, tr("Close (Esc)")).clicked()
+                || escape {
+                view.find_open = false;
+                response.surrender_focus();
+            }
+        });
+        if let Some(forward) = step {
+            let previous = view.selected;
+            if restart { view.selected = None; }
+            view.find_step(forward);
+            if view.selected.is_none() { view.selected = previous; }
+        }
+    }
     let editable = view.edit.is_some();
     demo_filter(view, area_rect);
     demo_grid(view);
     let filters_active: Vec<usize> = view.filters.keys().copied().collect();
     let editing_now = view.edit.as_ref().is_some_and(|e| e.editing.is_some());
+    let edit_id = egui::Id::new(("cell_edit", view.salt));
+    let page_rows = (area_rect.height() / ROW_H).floor().max(1.0) as usize;
+    let owns_focus = ui.memory(|m| m.focused().is_none() || m.has_focus(edit_id));
+    let editor_pending_focus = view.edit.as_ref().and_then(|e| e.editing.as_ref()).is_some_and(|ed| ed.focus);
+    let keyboard_enabled = ui.is_enabled() && !egui::Popup::is_any_open(ui.ctx());
 
-    // Grid keyboard (only if no widget has focus).
-    if ui.memory(|m| m.focused().is_none()) && !editing_now {
-        if copy_requested
-            && let Some((r, c)) = view.selected
-            && let Some(row) = view.row_ref(r)
-        {
-            ui.ctx().copy_text(view.display_value(row, c).flatten().unwrap_or_default());
+    if keyboard_enabled && editable && editing_now && (owns_focus || editor_pending_focus) {
+        let action = ui.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::Escape) { Some(GridAction::Cancel) }
+            else if i.consume_key(Modifiers::SHIFT, Key::Tab) { Some(GridAction::Navigate(Key::Tab, Modifiers::SHIFT)) }
+            else if i.consume_key(Modifiers::NONE, Key::Tab) { Some(GridAction::Navigate(Key::Tab, Modifiers::NONE)) }
+            else if i.consume_key(Modifiers::COMMAND, Key::Enter) || i.consume_key(Modifiers::SHIFT, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Enter) { Some(GridAction::Commit) }
+            else if i.consume_key(Modifiers::NONE, Key::ArrowUp) { Some(GridAction::Navigate(Key::ArrowUp, Modifiers::NONE)) }
+            else if i.consume_key(Modifiers::NONE, Key::ArrowDown) { Some(GridAction::Navigate(Key::ArrowDown, Modifiers::NONE)) }
+            else { None }
+        });
+        if let Some(action) = action { actions.push(action); }
+        let (add, delete) = ui.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND, Key::N)
+                    || i.consume_key(Modifiers::NONE, Key::Insert),
+                i.consume_key(Modifiers::COMMAND, Key::Delete),
+            )
+        });
+        if add {
+            actions.push(GridAction::AddRow);
+        }
+        if delete {
+            actions.push(GridAction::DeleteRows);
+        }
+    }
+
+    // Retain grid ownership when an inline editor was removed before this frame.
+    if keyboard_enabled && owns_focus && !editing_now
+    {
+        if (copy_requested || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))) && view.has_selection() {
+            ui.ctx().copy_text(view.selection_tsv());
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
+            view.selected_cells = (0..view.n_view_rows())
+                .flat_map(|r| (0..view.rs.columns.len()).map(move |c| (r, c)))
+                .collect();
+            view.selected = view.selected_cells.iter().next().copied();
+            view.cell_anchor = view.selected;
+            view.selected_rows.clear();
+            view.scroll_to = view.selected.map(|(r, _)| r);
         }
         if let Some((r, _)) = view.selected
             && ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter))
@@ -685,9 +1193,50 @@ pub fn show_result(
             actions.push(GridAction::RecordView(r));
         }
         if editable && let Some((r, c)) = view.selected {
+            let pasted = ui.input_mut(|i| {
+                let text = i.events.iter().find_map(|e| {
+                    if let egui::Event::Paste(s) = e {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                });
+                if text.is_some() {
+                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+                }
+                text
+            });
+            if let Some(text) = pasted {
+                actions.push(GridAction::Paste(text));
+            }
+            let typed = ui.input_mut(|i| {
+                if i.modifiers.command || i.modifiers.alt {
+                    return String::new();
+                }
+                let text = i
+                    .events
+                    .iter()
+                    .filter_map(|e| {
+                        if let egui::Event::Text(s) = e {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<String>();
+                if !text.is_empty() {
+                    i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+                }
+                text
+            });
+            if !typed.is_empty() {
+                actions.push(GridAction::Type(typed));
+            }
             let (edit_key, undo, clone) = ui.input_mut(|i| {
                 (
-                    i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2),
+                    i.consume_key(Modifiers::COMMAND, Key::Enter)
+                        || i.consume_key(Modifiers::NONE, Key::Enter)
+                        || i.consume_key(Modifiers::NONE, Key::F2),
                     i.consume_key(Modifiers::COMMAND, Key::Z),
                     i.consume_key(Modifiers::COMMAND, Key::D),
                 )
@@ -700,6 +1249,52 @@ pub fn show_result(
             }
             if clone {
                 actions.push(GridAction::CloneRow);
+            }
+        }
+        if editable {
+            let (add, delete, cancel, clear) = ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::COMMAND, Key::N)
+                        || i.consume_key(Modifiers::NONE, Key::Insert),
+                    i.consume_key(Modifiers::COMMAND, Key::Delete),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                    i.consume_key(Modifiers::NONE, Key::Delete),
+                )
+            });
+            if add {
+                actions.push(GridAction::AddRow);
+            }
+            if delete {
+                actions.push(GridAction::DeleteRows);
+            }
+            if cancel {
+                actions.push(GridAction::Cancel);
+            }
+            if clear {
+                actions.push(GridAction::ClearSelection);
+            }
+        }
+        if view.selected.is_some() {
+            let navigation = ui.input_mut(|i| {
+                [
+                    Key::ArrowUp,
+                    Key::ArrowDown,
+                    Key::ArrowLeft,
+                    Key::ArrowRight,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                    Key::Tab,
+                ]
+                .into_iter()
+                .find_map(|key| {
+                    let mods = i.modifiers;
+                    (!mods.alt && i.consume_key(mods, key)).then_some((key, mods))
+                })
+            });
+            if let Some((key, mods)) = navigation {
+                actions.push(GridAction::Navigate(key, mods));
             }
         }
     }
@@ -724,12 +1319,10 @@ pub fn show_result(
         .collect();
 
     let sort = view.sort;
-    let selected = view.selected;
     let selected_rows = view.selected_rows.clone();
     let scroll_to = view.scroll_to.take();
     // The inline editor is taken out of the view so it can be edited while `view` is read.
     let mut inline = view.edit.as_mut().and_then(|e| e.editing.take());
-    let edit_id = egui::Id::new(("cell_edit", view.salt));
 
     let pk_of = |i: usize, name: &str| -> bool {
         if let Some(e) = &view.edit
@@ -741,6 +1334,7 @@ pub fn show_result(
     };
 
     egui::ScrollArea::horizontal().id_salt(("result_h", view.salt)).auto_shrink([false, false]).show(ui, |ui| {
+        let mut scroll_cell = None;
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         {
             let v = ui.visuals_mut();
@@ -753,7 +1347,7 @@ pub fn show_result(
             .id_salt(("result_table", view.salt, n_cols))
             .striped(false)
             .resizable(true)
-            .sense(Sense::click())
+            .sense(Sense::click_and_drag())
             .auto_shrink([false, false])
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(index_width).resizable(false));
@@ -772,8 +1366,10 @@ pub fn show_result(
                 });
                 for (i, name) in view.rs.columns.iter().enumerate() {
                     let mut funnel_hit = Rect::NOTHING;
+                    let mut sort_hit = Rect::NOTHING;
                     let (_, resp) = header.col(|ui| {
                         let r = ui.max_rect();
+                        if scroll_to.is_some() && view.selected.is_some_and(|(_, c)| c == i) { scroll_cell = Some(r); }
                         ui.painter().rect_filled(r, 0.0, p.header_bg);
                         ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.grid));
                         let painter = ui.painter_at(r);
@@ -795,16 +1391,20 @@ pub fn show_result(
                         };
                         let sort_color = if matches!(sort, Some((c, _)) if c == i) { p.accent } else { p.disabled };
                         let sr = Rect::from_min_size(pos2(r.right() - 20.0, cy - 6.5), egui::Vec2::splat(13.0));
+                        sort_hit = sr.expand(2.0);
                         icons::paint(&painter, sr, sort_ico, sort_color, &p, true);
                     });
                     let on_funnel = resp.hover_pos().is_some_and(|pos| funnel_hit.contains(pos));
-                    let hint = if on_funnel { tr("Filter by values").to_string() } else { trf("{name}\nClick to sort", &[("name", name)]) };
+                    let on_sort = resp.hover_pos().is_some_and(|pos| sort_hit.contains(pos));
+                    let hint = if on_funnel { tr("Filter by values").to_string() } else if on_sort { trf("{name}\nClick to sort", &[("name", name)]) } else { tr("Select column").to_string() };
                     let resp = resp.on_hover_text(hint);
                     if resp.clicked() {
                         if resp.interact_pointer_pos().is_some_and(|pos| funnel_hit.contains(pos)) {
                             actions.push(GridAction::OpenFilter(i, funnel_hit.left_bottom()));
-                        } else {
+                        } else if resp.interact_pointer_pos().is_some_and(|pos| sort_hit.contains(pos)) {
                             actions.push(GridAction::Sort(i));
+                        } else {
+                            actions.push(GridAction::SelectColumn(i, ui_mods(&resp).command));
                         }
                     }
                 }
@@ -844,17 +1444,18 @@ pub fn show_result(
                         actions.push(GridAction::Select { vr, col: None, mods });
                     }
                     for c in 0..n_cols {
-                        let is_sel = selected == Some((vr, c));
+                        let is_sel = view.cell_selected(vr, c);
                         let value = view.display_value(rref, c);
-                        let modified = edit.is_some_and(|e| e.state.is_modified(rref, c)) && !is_new;
                         let can_edit = edit.is_some_and(|e| e.state.cell_editable(&view.rs, &e.target, rref, c));
                         let editing_here = inline.as_ref().is_some_and(|ed| ed.row == rref && ed.col == c);
+                        let modified = (edit.is_some_and(|e| e.state.is_modified(rref, c)) && !is_new)
+                            || inline.as_ref().is_some_and(|ed| editing_here && ed.changed);
                         let (_, resp) = row.col(|ui| {
                             let r = ui.max_rect();
-                            let bg = if is_sel && !editing_here {
-                                Some(p.selection)
-                            } else if modified && !deleted {
+                            let bg = if modified && !deleted {
                                 Some(p.cell_modified)
+                            } else if is_sel && !editing_here {
+                                Some(p.selection)
                             } else if row_sel {
                                 Some(p.selection_inactive)
                             } else {
@@ -863,24 +1464,19 @@ pub fn show_result(
                             if let Some(bg) = bg {
                                 ui.painter().rect_filled(r, 0.0, bg);
                             }
+                            if modified && is_sel && !editing_here {
+                                let width = if view.selected == Some((vr, c)) { 2.0 } else { 1.0 };
+                                ui.painter().rect_stroke(r.shrink(0.5), 0.0, Stroke::new(width, p.accent), egui::StrokeKind::Inside);
+                            }
                             ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.grid));
                             if editing_here && let Some(ed) = inline.as_mut() {
-                                let focused = ui.memory(|m| m.has_focus(edit_id));
-                                if focused {
-                                    let keys = ui.input_mut(|i| {
-                                        let back = i.consume_key(Modifiers::SHIFT, Key::Tab);
-                                        let fwd = !back && i.consume_key(Modifiers::NONE, Key::Tab);
-                                        let enter = i.consume_key(Modifiers::NONE, Key::Enter);
-                                        let esc = i.consume_key(Modifiers::NONE, Key::Escape);
-                                        (back, fwd, enter, esc)
-                                    });
-                                    match keys {
-                                        (_, _, _, true) => actions.push(GridAction::Cancel),
-                                        (true, _, _, _) => actions.push(GridAction::Commit(-1)),
-                                        (_, true, _, _) => actions.push(GridAction::Commit(1)),
-                                        (_, _, true, _) => actions.push(GridAction::Commit(0)),
-                                        _ => {}
-                                    }
+                                if ed.focus && ui.is_enabled() {
+                                    ed.focus = false;
+                                    ui.memory_mut(|m| m.request_focus(edit_id));
+                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
+                                    let n = ed.buffer.chars().count();
+                                    st.cursor.set_char_range(Some(if ed.select_all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) }));
+                                    st.store(ui.ctx(), edit_id);
                                 }
                                 ui.painter().rect_stroke(r.shrink(0.5), 2.0, Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
                                 let edit_rect = r.shrink2(egui::vec2(5.0, 2.0));
@@ -895,15 +1491,9 @@ pub fn show_result(
                                         .vertical_align(egui::Align::Center)
                                         .desired_width(edit_rect.width()),
                                 );
-                                if ed.focus {
-                                    ed.focus = false;
-                                    te.request_focus();
-                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
-                                    let n = ed.buffer.chars().count();
-                                    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
-                                    st.store(ui.ctx(), edit_id);
-                                } else if te.lost_focus() && !actions.iter().any(|a| matches!(a, GridAction::Commit(_) | GridAction::Cancel)) {
-                                    actions.push(GridAction::Commit(0));
+                                ed.changed |= te.changed();
+                                if te.lost_focus() && !actions.iter().any(|a| matches!(a, GridAction::Commit | GridAction::Navigate(..) | GridAction::Cancel)) {
+                                    actions.push(GridAction::Commit);
                                 }
                                 return;
                             }
@@ -941,7 +1531,9 @@ pub fn show_result(
                         if editing_here {
                             continue;
                         }
-                        if resp.clicked() || resp.secondary_clicked() {
+                        if resp.drag_started() { actions.push(GridAction::DragStart(vr, c, ui_mods(&resp).command)); }
+                        if view.drag_anchor.is_some() && resp.contains_pointer() && resp.ctx.input(|i| i.pointer.primary_down()) { actions.push(GridAction::DragTo(vr, c)); }
+                        if resp.clicked() || (resp.secondary_clicked() && !is_sel) {
                             let mods = ui_mods(&resp);
                             actions.push(GridAction::Select { vr, col: Some(c), mods });
                         }
@@ -1000,6 +1592,9 @@ pub fn show_result(
                     }
                 });
             });
+        // The inner vertical scroll area consumes scroll targets on both axes.
+        // Request horizontal visibility after it has finished.
+        if let Some(rect) = scroll_cell { ui.scroll_to_rect(rect, None); }
     });
 
     if let Some(e) = view.edit.as_mut() {
@@ -1018,13 +1613,19 @@ pub fn show_result(
                 view.filter_popup = Some(FilterPopup { col: c, anchor, search, values: distinct_values(&view.rs.rows, c), just_opened: true });
             }
             GridAction::Sort(c) => {
+                view.commit_edit();
                 view.toggle_sort(c);
                 view.selected = None;
                 view.selected_rows.clear();
+                view.selected_cells.clear();
+                view.cell_anchor = None;
                 view.anchor = None;
             }
             GridAction::Select { vr, col, mods } => {
-                if mods.shift
+                view.commit_edit();
+                if let Some(col) = col {
+                    view.select_cell(vr, col, mods);
+                } else if mods.shift
                     && let Some(a) = view.anchor
                 {
                     view.selected_rows = (a.min(vr)..=a.max(vr)).collect();
@@ -1037,30 +1638,103 @@ pub fn show_result(
                     view.selected_rows = BTreeSet::from([vr]);
                     view.anchor = Some(vr);
                 }
-                view.selected = col.map(|c| (vr, c));
+                if col.is_none() {
+                    view.selected = None;
+                    view.selected_cells.clear();
+                    view.cell_anchor = None;
+                }
                 ui.ctx().memory_mut(|m| {
                     if let Some(id) = m.focused() {
                         m.surrender_focus(id);
                     }
                 });
             }
+            GridAction::SelectColumn(c, additive) => {
+                view.select_column(c, additive);
+                ui.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            GridAction::DragStart(r, c, additive) => {
+                view.commit_edit();
+                view.select_cell(
+                    r,
+                    c,
+                    if additive {
+                        Modifiers::COMMAND
+                    } else {
+                        Modifiers::NONE
+                    },
+                );
+                view.drag_anchor = Some((r, c, additive));
+                view.cell_anchor = Some((r, c));
+            }
+            GridAction::DragTo(r, c) => {
+                if let Some((ar, ac, additive)) = view.drag_anchor {
+                    view.cell_anchor = Some((ar, ac));
+                    view.select_cell(
+                        r,
+                        c,
+                        if additive {
+                            Modifiers::SHIFT | Modifiers::COMMAND
+                        } else {
+                            Modifiers::SHIFT
+                        },
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+            GridAction::Type(text) => {
+                if let Some((r, c)) = view.selected
+                    && view.start_edit(r, c)
+                {
+                    if let Some(ed) = view.edit.as_mut().and_then(|e| e.editing.as_mut()) {
+                        ed.buffer = text;
+                        ed.select_all = false;
+                        ed.changed = true;
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+            GridAction::Paste(text) => {
+                if let Err(e) = view.paste_selection(&text) {
+                    error = Some(e);
+                }
+            }
+            GridAction::ClearSelection => view.fill_selection(None),
             GridAction::StartEdit(vr, c) => {
-                view.commit_edit(0);
+                view.commit_edit();
                 view.start_edit(vr, c);
             }
-            GridAction::Commit(step) => {
+            GridAction::Commit => {
                 ui.memory_mut(|m| m.surrender_focus(edit_id));
-                view.commit_edit(step);
+                view.commit_edit();
+            }
+            GridAction::Navigate(key, mods) => {
+                ui.memory_mut(|m| m.surrender_focus(edit_id));
+                view.navigate(key, mods, page_rows);
+                if editing_now
+                    && key == Key::Tab
+                    && let Some((r, c)) = view.selected
+                {
+                    view.start_edit(r, c);
+                }
+                ui.ctx().request_repaint();
+            }
+            GridAction::AddRow => {
+                view.add_row();
             }
             GridAction::Cancel => {
                 ui.memory_mut(|m| m.surrender_focus(edit_id));
-                if let Some(e) = view.edit.as_mut() {
-                    e.editing = None;
-                }
+                view.cancel_row();
             }
             GridAction::SetNull(row, c) => {
-                if let Some(e) = view.edit.as_mut() {
-                    e.state.set_value(&view.rs, row, c, None);
+                if !view.selected_cells.is_empty() {
+                    view.fill_selection(None);
+                } else {
+                    view.apply_cell_values(vec![(row, c, None)]);
                 }
             }
             GridAction::Revert(row, c) => {
@@ -1074,8 +1748,42 @@ pub fn show_result(
             GridAction::Copy(t) => ui.ctx().copy_text(t),
         }
     }
+    if ui.input(|i| !i.pointer.primary_down()) {
+        view.drag_anchor = None;
+    } else if view.drag_anchor.is_some()
+        && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+    {
+        let direction = if pos.y > area_rect.bottom() - ROW_H {
+            Some(Key::ArrowDown)
+        } else if pos.y < area_rect.top() + HEADER_H + ROW_H {
+            Some(Key::ArrowUp)
+        } else if pos.x > area_rect.right() - 12.0 {
+            Some(Key::ArrowRight)
+        } else if pos.x < area_rect.left() + index_width + 12.0 {
+            Some(Key::ArrowLeft)
+        } else {
+            None
+        };
+        if let Some(key) = direction {
+            view.navigate(key, Modifiers::SHIFT, page_rows);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
+    }
     record_view_ui(ui, view, columns_info);
-    error
+    if view.selected_cells.len() > 1 {
+        ui.painter().text(
+            pos2(area_rect.left() + 8.0, area_rect.bottom() - 10.0),
+            egui::Align2::LEFT_BOTTOM,
+            trf("{n} cells selected", &[("n", &view.selected_cells.len())]),
+            FontId::proportional(11.0),
+            p.muted,
+        );
+    }
+    GridResponse {
+        error,
+        submit: save_on_row_change && view.row_change_needs_save(previous_row),
+    }
 }
 
 /// Record view: the row as a vertical list of column / value, with previous / next.
@@ -1146,8 +1854,10 @@ fn record_view_ui(ui: &Ui, view: &mut ResultView, columns_info: Option<&[ColumnI
         });
     if let Some(r) = go {
         view.record_view = Some(r);
-        view.selected = Some((r, view.selected.map_or(0, |(_, c)| c)));
+        let col = view.selected.map_or(0, |(_, c)| c);
+        view.selected = Some((r, col));
         view.selected_rows = BTreeSet::from([r]);
+        view.selected_cells = BTreeSet::from([(r, col)]);
         view.scroll_to = Some(r);
     }
     if !open || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1515,6 +2225,831 @@ mod filter_tests {
         filters.insert(0, ColumnFilter { allowed: Some(HashSet::from([Some("2".to_string())])), text: String::new() });
         filters.insert(1, ColumnFilter { allowed: None, text: "b".into() });
         assert_eq!(compute_order(&rows(), None, &filters), vec![3]);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    fn wide_table_scenario(render: bool) {
+        let mut view = ResultView::new(ResultSet {
+            columns: (0..30).map(|c| format!("column_{c:02}")).collect(),
+            rows: (0..200).map(|r| (0..30).map(|c| Some(format!("value_{r}_{c}"))).collect()).collect(),
+            ..Default::default()
+        }, 991);
+        view.select_cell(0, 0, Modifiers::NONE);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 460.0)).build_ui_state(
+            move |ui, state: &mut (ResultView, f32)| {
+                if std::mem::take(&mut first) {
+                    theme::install_fonts(ui.ctx());
+                    theme::apply(ui.ctx(), true);
+                    return;
+                }
+                let id = ui.make_persistent_id(egui::IdSalt::new(("result_h", state.0.salt)));
+                show_result(ui, &mut state.0, false, None, false);
+                state.1 = egui::scroll_area::State::load(ui.ctx(), id).expect("horizontal scroll state").offset.x;
+            }, (view, 0.0));
+        h.run_steps(3);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::ArrowRight);
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((0, 29)));
+        assert!(h.state().1 > 1000.0, "cursor must reveal the last column: {}", h.state().1);
+        if render {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
+            std::fs::create_dir_all(&dir).unwrap();
+            h.render().unwrap().save(dir.join("wide-table.png")).unwrap();
+        }
+        h.key_press_modifiers(Modifiers::COMMAND, Key::ArrowLeft);
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((0, 0)));
+        assert!(h.state().1 < 60.0, "cursor must reveal the first column, offset {}", h.state().1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text("value_199_29".into()));
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((199, 29)));
+        assert!(h.state().1 > 1000.0, "find must also reveal the matched column");
+        if render {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
+            h.render().unwrap().save(dir.join("table-find.png")).unwrap();
+        }
+    }
+
+    #[test]
+    fn horizontal_keyboard_navigation_reveals_the_selected_column() { wide_table_scenario(false); }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders horizontal navigation on test data"]
+    fn render_wide_table() { wide_table_scenario(true); }
+
+    #[test]
+    fn ctrl_f_finds_loaded_values_and_wraps_without_changing_data() {
+        let mut h = harness(false, false);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        assert!(h.state().view.find_open);
+        h.input_mut().events.push(egui::Event::Text("C".into()));
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        assert!(!h.state().view.is_dirty());
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().view.find_open);
+    }
+
+    #[test]
+    fn finding_outside_an_edited_batch_respects_opt_in_auto_save() {
+        let mut h = harness(true, true);
+        h.input_mut().events.push(egui::Event::Text("edited".into()));
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().view.is_dirty());
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().view.is_dirty(), "closing find must not discard pending row changes");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text("c".into()));
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        assert_eq!(h.state().submits, 1);
+    }
+
+    fn view() -> ResultView {
+        let mut view = ResultView::new(
+            ResultSet {
+                columns: vec!["id".into(), "note".into()],
+                rows: vec![
+                    vec![Some("1".into()), Some("a".into())],
+                    vec![Some("2".into()), None],
+                    vec![Some("3".into()), Some("c".into())],
+                ],
+                ..Default::default()
+            },
+            42,
+        );
+        view.set_edit_target(Ok(EditTarget {
+            schema: "main".into(),
+            table: "notes".into(),
+            col_names: view.rs.columns.clone(),
+            key_cols: vec![0],
+            binary_cols: vec![false, false],
+            has_pk: true,
+        }));
+        view.selected = Some((0, 1));
+        view.selected_rows = BTreeSet::from([0]);
+        view
+    }
+
+    struct State {
+        view: ResultView,
+        auto_save: bool,
+        submits: usize,
+        enabled: bool,
+    }
+
+    fn harness(auto_save: bool, editing: bool) -> egui_kittest::Harness<'static, State> {
+        let mut view = view();
+        if editing {
+            view.begin_edit(0, 1);
+        }
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(900.0, 500.0))
+            .build_ui_state(
+                move |ui, state: &mut State| {
+                    if std::mem::take(&mut first) {
+                        theme::install_fonts(ui.ctx());
+                        theme::apply(ui.ctx(), false);
+                        return;
+                    }
+                    let response = ui
+                        .add_enabled_ui(state.enabled, |ui| {
+                            show_result(ui, &mut state.view, false, None, state.auto_save)
+                        })
+                        .inner;
+                    assert!(response.error.is_none());
+                    state.submits += usize::from(response.submit);
+                },
+                State {
+                    view,
+                    auto_save,
+                    submits: 0,
+                    enabled: true,
+                },
+            );
+        h.run_steps(3);
+        h
+    }
+
+    #[test]
+    fn down_from_inline_editor_commits_and_requests_opt_in_save_once() {
+        for auto_save in [false, true] {
+            let mut h = harness(auto_save, true);
+            h.input_mut()
+                .events
+                .push(egui::Event::Text("edited".into()));
+            h.run_steps(2);
+            h.key_press(Key::ArrowDown);
+            h.run_steps(3);
+            let state = h.state();
+            assert_eq!(state.view.selected, Some((1, 1)));
+            assert_eq!(
+                state.view.edit.as_ref().unwrap().state.changes.get(&(0, 1)),
+                Some(&Some("edited".into()))
+            );
+            assert!(state.view.edit.as_ref().unwrap().editing.is_none());
+            assert_eq!(state.submits, usize::from(auto_save));
+        }
+    }
+
+    fn batch_view() -> ResultView {
+        let mut v = ResultView::new(
+            ResultSet {
+                columns: (0..7).map(|c| format!("field_{c}")).collect(),
+                rows: (0..20)
+                    .map(|r| (0..7).map(|c| Some(format!("value_{r}_{c}"))).collect())
+                    .collect(),
+                ..Default::default()
+            },
+            43,
+        );
+        v.rs.rows[4][2] = Some("0".into());
+        v.set_edit_target(Ok(EditTarget {
+            schema: "main".into(),
+            table: "sample".into(),
+            col_names: v.rs.columns.clone(),
+            key_cols: vec![0],
+            binary_cols: vec![false; 7],
+            has_pk: true,
+        }));
+        v.select_cell(0, 2, Modifiers::NONE);
+        v.select_cell(9, 2, Modifiers::SHIFT);
+        v
+    }
+
+    #[test]
+    fn bulk_edit_stays_put_and_saves_only_after_leaving_its_rows() {
+        let mut h = harness(true, false);
+        h.state_mut().view = batch_view();
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(
+            h.state().view.selected,
+            Some((9, 2)),
+            "Enter must not advance out of the edited block"
+        );
+        assert_eq!(h.state().submits, 0);
+        assert_eq!(h.state().view.edit.as_ref().unwrap().state.changes.len(), 9);
+        for key in [
+            Key::ArrowRight,
+            Key::ArrowLeft,
+            Key::ArrowUp,
+            Key::ArrowDown,
+        ] {
+            h.key_press(key);
+            h.run_steps(2);
+            assert_eq!(
+                h.state().submits,
+                0,
+                "navigation inside the edited rows must not submit"
+            );
+        }
+        for _ in 0..5 {
+            h.key_press(Key::ArrowUp);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().view.selected, Some((4, 2)));
+        assert_eq!(
+            h.state().submits,
+            0,
+            "an unchanged value inside the selected block is still part of that block"
+        );
+        for _ in 0..6 {
+            h.key_press(Key::ArrowDown);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().view.selected, Some((10, 2)));
+        assert_eq!(h.state().submits, 1);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(
+            h.state().submits,
+            1,
+            "a failed submission must not retry on every outside row"
+        );
+        for _ in 0..2 {
+            h.key_press(Key::ArrowUp);
+            h.run_steps(2);
+        }
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(
+            h.state().submits,
+            2,
+            "returning to the batch and leaving it allows retry"
+        );
+    }
+
+    #[test]
+    fn editor_outside_the_selection_only_edits_its_own_cell() {
+        // The record view moved the cursor to row 5 while row 3 was still the selected cell.
+        let mut v = batch_view();
+        v.selected_cells = BTreeSet::from([(3, 2)]);
+        assert!(v.start_edit(5, 2));
+        let ed = v.edit.as_mut().unwrap().editing.as_mut().unwrap();
+        ed.buffer = "typed".into();
+        ed.changed = true;
+        v.commit_edit();
+        let changes = &v.edit.as_ref().unwrap().state.changes;
+        assert_eq!(changes.get(&(5, 2)), Some(&Some("typed".into())));
+        assert!(!changes.contains_key(&(3, 2)), "the stale selection must not get the value");
+    }
+
+    #[test]
+    fn reverting_a_new_row_shifts_the_later_ones() {
+        let mut v = batch_view();
+        for _ in 0..3 {
+            v.add_row();
+            v.commit_edit();
+        }
+        let first_new = v.order.len();
+        v.edit_rows.extend((0..3).map(RowRef::New));
+        v.selected = Some((first_new, 1));
+        v.selected_cells = BTreeSet::from([(first_new, 1), (first_new + 2, 1)]);
+        v.cancel_row();
+        assert_eq!(v.edit.as_ref().unwrap().state.inserted.len(), 2);
+        assert!(v.edit_rows.iter().all(|r| !matches!(r, RowRef::New(i) if *i >= 2)));
+        assert!(v.edit_rows.contains(&RowRef::New(1)), "the old third new row is now the second");
+        assert_eq!(v.selected_cells, BTreeSet::from([(first_new + 1, 1)]));
+    }
+
+    #[test]
+    fn undo_preserves_the_remaining_batch_until_save() {
+        let mut v = batch_view();
+        v.fill_selection(Some("0".into()));
+        v.select_cell(9, 3, Modifiers::NONE);
+        v.fill_selection(Some("another".into()));
+        v.undo();
+        assert!(v.row_in_edit_batch(RowRef::Existing(4)));
+        assert_eq!(v.edit.as_ref().unwrap().state.changes.len(), 9);
+        v.mark_saved();
+        assert!(v.edit_rows.is_empty());
+        assert!(!v.is_dirty());
+    }
+
+    #[test]
+    fn clicking_outside_after_sort_clears_selection_still_saves_the_batch() {
+        let mut v = batch_view();
+        v.fill_selection(Some("0".into()));
+        v.toggle_sort(0);
+        v.selected = None;
+        v.selected_cells.clear();
+        v.selected_rows.clear();
+        let outside = v.order.iter().position(|&r| r == 10).unwrap();
+        v.select_cell(outside, 2, Modifiers::NONE);
+        assert!(v.row_change_needs_save(None));
+    }
+
+    fn batch_console_scenario(render: bool) {
+        use crate::ui::console::{Console, ConsoleAction, ConsoleCtx};
+        struct ConsoleState {
+            console: Console,
+            db: rusqlite::Connection,
+            submits: usize,
+        }
+        let v = batch_view();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE sample(field_0 TEXT PRIMARY KEY, field_1 TEXT, field_2 TEXT, field_3 TEXT, field_4 TEXT, field_5 TEXT, field_6 TEXT)").unwrap();
+        for row in &v.rs.rows {
+            db.execute(
+                "INSERT INTO sample VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params_from_iter(row.iter()),
+            )
+            .unwrap();
+        }
+        let mut console = Console::new_table(1, 1, None, "main".into(), "sample".into());
+        console.table.as_mut().unwrap().save_on_row_change = true;
+        console.results.push(v);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1280.0, 760.0))
+            .build_ui_state(
+                move |ui, state: &mut ConsoleState| {
+                    if std::mem::take(&mut first) {
+                        theme::install_fonts(ui.ctx());
+                        theme::apply(ui.ctx(), true);
+                        return;
+                    }
+                    let cx = ConsoleCtx {
+                        connections: &[],
+                        schemas: None,
+                        driver: crate::db::Driver::Sqlite,
+                        dark: true,
+                        font_size: 14.0,
+                        columns: None,
+                    };
+                    for action in state.console.show_table(ui, &cx) {
+                        if let ConsoleAction::Submit(i) = action {
+                            state.submits += 1;
+                            let view = &mut state.console.results[i];
+                            view.finish_inline_edit();
+                            let edit = view.edit.as_ref().unwrap();
+                            let target = edit.target.clone();
+                            let changes = edit.state.build_changes(&view.rs, &target).unwrap();
+                            let transaction = state.db.transaction().unwrap();
+                            for change in changes {
+                                let sql = crate::edit::change_sql(
+                                    crate::db::Driver::Sqlite,
+                                    &target.schema,
+                                    &target.table,
+                                    &change,
+                                );
+                                assert_eq!(transaction.execute(&sql, []).unwrap(), 1);
+                            }
+                            transaction.commit().unwrap();
+                            let mut statement = state
+                                .db
+                                .prepare("SELECT * FROM sample ORDER BY rowid")
+                                .unwrap();
+                            let rows = statement
+                                .query_map([], |row| {
+                                    (0..7)
+                                        .map(|c| row.get::<_, Option<String>>(c))
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                })
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let mut fresh = view.rs.clone();
+                            fresh.rows = rows;
+                            view.mark_saved();
+                            view.refresh(fresh);
+                            view.set_edit_target(Ok(target));
+                        } else if let ConsoleAction::Error(error) = action {
+                            panic!("{error}");
+                        }
+                    }
+                },
+                ConsoleState {
+                    console,
+                    db,
+                    submits: 0,
+                },
+            );
+        h.run_steps(3);
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().submits, 0);
+        assert_eq!(h.state().console.results[0].selected, Some((9, 2)));
+        assert_eq!(
+            h.state().console.results[0]
+                .edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .len(),
+            9
+        );
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/edit-range-snapshots");
+        if render {
+            std::fs::create_dir_all(&directory).unwrap();
+            h.render()
+                .unwrap()
+                .save(directory.join("pending.png"))
+                .unwrap();
+        }
+        for key in [Key::ArrowRight, Key::ArrowLeft] {
+            h.key_press(key);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().submits, 0);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().submits, 1);
+        assert_eq!(h.state().console.results[0].selected, Some((10, 2)));
+        assert!(!h.state().console.results[0].is_dirty());
+        let count: i64 = h
+            .state()
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sample WHERE field_2 = '0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 10);
+        if render {
+            h.render()
+                .unwrap()
+                .save(directory.join("saved.png"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn leaving_the_batch_submits_the_sqlite_transaction() {
+        batch_console_scenario(false);
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders the pending batch and its saved result on test data"]
+    fn render_edit_batch() {
+        batch_console_scenario(true);
+    }
+
+    #[test]
+    fn navigation_accepts_a_stale_inline_focus_id() {
+        let mut h = harness(false, false);
+        let id = egui::Id::new(("cell_edit", h.state().view.salt));
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.key_press(Key::ArrowDown);
+        h.run_steps(1);
+        assert_eq!(h.state().view.selected, Some((1, 1)));
+    }
+
+    #[test]
+    fn text_and_down_are_handled_before_the_editor_has_its_first_focus_frame() {
+        let mut h = harness(true, false);
+        h.state_mut().view.begin_edit(0, 1);
+        h.input_mut().events.push(egui::Event::Text("quick".into()));
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((1, 1)));
+        assert_eq!(
+            h.state()
+                .view
+                .edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .get(&(0, 1)),
+            Some(&Some("quick".into()))
+        );
+        assert_eq!(h.state().submits, 1);
+    }
+
+    #[test]
+    fn tab_wraps_and_shift_tab_returns_without_changing_null() {
+        let mut h = harness(true, true);
+        h.key_press(Key::Tab);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((1, 0)));
+        assert!(!h.state().view.is_dirty());
+        h.key_press_modifiers(Modifiers::SHIFT, Key::Tab);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((0, 1)));
+        assert_eq!(h.state().submits, 0);
+        assert_eq!(h.state().view.rs.rows[1][1], None);
+    }
+
+    #[test]
+    fn navigation_obeys_visual_order_bounds_and_page_size() {
+        let mut v = view();
+        v.toggle_sort(0);
+        v.toggle_sort(0);
+        assert_eq!(v.selected_row(), Some(RowRef::Existing(2)));
+        v.navigate(Key::ArrowDown, Modifiers::NONE, 1);
+        assert_eq!(v.selected_row(), Some(RowRef::Existing(1)));
+        v.navigate(Key::PageDown, Modifiers::NONE, 1);
+        assert_eq!(v.selected, Some((2, 1)));
+        v.navigate(Key::ArrowDown, Modifiers::NONE, 1);
+        assert_eq!(v.selected, Some((2, 1)));
+        v.navigate(Key::Home, Modifiers::COMMAND, 1);
+        assert_eq!(v.selected, Some((0, 1)));
+        v.navigate(Key::ArrowLeft, Modifiers::COMMAND, 1);
+        assert_eq!(v.selected, Some((0, 0)));
+        v.navigate(Key::Tab, Modifiers::SHIFT, 1);
+        assert_eq!(v.selected, Some((0, 0)));
+        v.set_filter(
+            0,
+            Some(ColumnFilter {
+                allowed: None,
+                text: "2".into(),
+            }),
+        );
+        v.selected = Some((0, 0));
+        v.navigate(Key::End, Modifiers::COMMAND, 1);
+        assert_eq!(v.selected_row(), Some(RowRef::Existing(1)));
+    }
+
+    #[test]
+    fn same_row_clean_rows_and_incomplete_new_rows_do_not_auto_save() {
+        let mut v = view();
+        let previous = v.selected_row();
+        v.navigate(Key::ArrowDown, Modifiers::NONE, 10);
+        assert!(!v.row_change_needs_save(previous));
+        v.edit.as_mut().unwrap().state.set_value(
+            &v.rs,
+            RowRef::Existing(1),
+            1,
+            Some("changed".into()),
+        );
+        let previous = v.selected_row();
+        v.navigate(Key::ArrowLeft, Modifiers::NONE, 10);
+        assert!(!v.row_change_needs_save(previous));
+        v.add_row();
+        assert!(!v.row_change_needs_save(previous));
+        v.navigate(Key::ArrowUp, Modifiers::NONE, 10);
+        assert!(v.row_change_needs_save(Some(RowRef::New(0))));
+    }
+
+    #[test]
+    fn escape_discards_only_the_current_record() {
+        let mut v = view();
+        let e = v.edit.as_mut().unwrap();
+        e.state
+            .set_value(&v.rs, RowRef::Existing(0), 1, Some("first".into()));
+        e.state
+            .set_value(&v.rs, RowRef::Existing(1), 1, Some("second".into()));
+        v.begin_edit(0, 1);
+        v.cancel_row();
+        let changes = &v.edit.as_ref().unwrap().state.changes;
+        assert!(!changes.contains_key(&(0, 1)));
+        assert_eq!(changes.get(&(1, 1)), Some(&Some("second".into())));
+        v.add_row();
+        v.cancel_row();
+        assert!(v.edit.as_ref().unwrap().state.inserted.is_empty());
+    }
+
+    #[test]
+    fn refresh_preserves_sort_filter_column_width_id_and_selected_primary_key() {
+        let mut v = view();
+        v.toggle_sort(0);
+        v.toggle_sort(0);
+        v.set_filter(
+            0,
+            Some(ColumnFilter {
+                allowed: None,
+                text: "2".into(),
+            }),
+        );
+        v.selected = Some((0, 1));
+        let mut fresh = v.rs.clone();
+        fresh.rows.rotate_left(1);
+        v.refresh(fresh);
+        assert_eq!(v.salt, 42);
+        assert!(v.sort == Some((0, SortDir::Desc)));
+        assert_eq!(v.filters.len(), 1);
+        assert_eq!(v.selected_row(), Some(RowRef::Existing(0)));
+        assert_eq!(v.selected, Some((0, 1)));
+        assert!(!v.is_dirty());
+        assert!(!v.edit_checked);
+    }
+
+    #[test]
+    fn refresh_follows_a_saved_primary_key_change() {
+        let mut v = view();
+        v.select_cell(1, 1, Modifiers::NONE);
+        v.edit
+            .as_mut()
+            .unwrap()
+            .state
+            .set_value(&v.rs, RowRef::Existing(1), 0, Some("20".into()));
+        v.mark_saved();
+        let mut fresh = v.rs.clone();
+        fresh.rows.rotate_left(1);
+        v.refresh(fresh);
+        assert_eq!(v.selected_row(), Some(RowRef::Existing(0)));
+        assert_eq!(v.rs.rows[0][0].as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn busy_grid_ignores_navigation_and_editing_shortcuts() {
+        let mut h = harness(true, false);
+        h.state_mut().enabled = false;
+        h.key_press(Key::ArrowDown);
+        h.key_press(Key::Insert);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((0, 1)));
+        assert!(!h.state().view.is_dirty());
+        assert_eq!(h.state().submits, 0);
+    }
+
+    #[test]
+    fn shift_arrow_rectangle_fills_as_one_undoable_edit() {
+        let mut h = harness(false, false);
+        h.key_press_modifiers(Modifiers::SHIFT, Key::ArrowLeft);
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::SHIFT, Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(h.state().view.selected_cells.len(), 4);
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        let edits = &h.state().view.edit.as_ref().unwrap().state;
+        assert_eq!(edits.changes.len(), 4);
+        assert!(edits.changes.values().all(|v| v.as_deref() == Some("0")));
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.run_steps(2);
+        assert!(!h.state().view.is_dirty());
+    }
+
+    #[test]
+    fn whole_column_fill_respects_filter_and_does_not_sort() {
+        let mut v = view();
+        v.set_filter(
+            0,
+            Some(ColumnFilter {
+                allowed: None,
+                text: "2".into(),
+            }),
+        );
+        v.select_column(1, false);
+        assert!(v.sort.is_none());
+        assert_eq!(v.selected_cells.len(), 1);
+        v.start_edit(0, 1);
+        let ed = v.edit.as_mut().unwrap().editing.as_mut().unwrap();
+        ed.buffer = "0".into();
+        ed.changed = true;
+        v.finish_inline_edit();
+        assert_eq!(
+            v.edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(1, 1)]
+        );
+    }
+
+    #[test]
+    fn ctrl_click_and_shift_click_produce_disjoint_and_rectangular_selections() {
+        let mut v = view();
+        v.select_cell(0, 1, Modifiers::NONE);
+        v.select_cell(2, 1, Modifiers::COMMAND);
+        assert_eq!(v.selected_cells.len(), 2);
+        assert_eq!(v.selection_tsv(), "a\nc");
+        v.select_cell(0, 0, Modifiers::NONE);
+        v.select_cell(2, 1, Modifiers::SHIFT);
+        assert_eq!(v.selected_cells.len(), 6);
+        assert_eq!(v.selection_tsv(), "1\ta\n2\t\n3\tc");
+    }
+
+    #[test]
+    fn drag_selects_a_cell_rectangle() {
+        let mut h = harness(false, false);
+        h.hover_at(pos2(60.0, 50.0));
+        h.drag_at(pos2(60.0, 50.0));
+        h.run_steps(2);
+        h.hover_at(pos2(75.0, 50.0));
+        h.run_steps(2);
+        h.hover_at(pos2(160.0, 98.0));
+        h.run_steps(2);
+        h.drop_at(pos2(160.0, 98.0));
+        h.run_steps(2);
+        assert_eq!(h.state().view.selected_cells.len(), 6);
+        assert!(h.state().view.drag_anchor.is_none());
+    }
+
+    #[test]
+    fn header_name_selects_column_and_only_sort_icon_sorts() {
+        let mut h = harness(false, false);
+        h.hover_at(pos2(160.0, 20.0));
+        h.drag_at(pos2(160.0, 20.0));
+        h.drop_at(pos2(160.0, 20.0));
+        h.run_steps(3);
+        assert!(h.state().view.sort.is_none());
+        assert_eq!(h.state().view.selected_cells.len(), 3);
+        assert!(h.state().view.selected_cells.iter().all(|(_, c)| *c == 1));
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().view.edit.as_ref().unwrap().state.changes.len(), 3);
+        h.hover_at(pos2(215.0, 20.0));
+        h.drag_at(pos2(215.0, 20.0));
+        h.drop_at(pos2(215.0, 20.0));
+        h.run_steps(3);
+        assert!(h.state().view.sort == Some((1, SortDir::Asc)));
+    }
+
+    #[test]
+    fn paste_fills_selection_or_matrix_atomically_and_rejects_overflow() {
+        let mut v = view();
+        v.select_column(1, false);
+        v.paste_selection("0").unwrap();
+        assert_eq!(v.edit.as_ref().unwrap().state.changes.len(), 3);
+        v.undo();
+        assert!(!v.is_dirty());
+        v.select_cell(0, 0, Modifiers::NONE);
+        v.paste_selection("10\tfirst\r\n20\tsecond").unwrap();
+        assert_eq!(v.edit.as_ref().unwrap().state.changes.len(), 4);
+        v.undo();
+        assert!(!v.is_dirty());
+        assert!(v.paste_selection("1\t2\t3").is_err());
+        assert!(!v.is_dirty());
+    }
+
+    #[test]
+    fn bulk_edit_skips_binary_deleted_and_lossy_cells() {
+        let mut v = view();
+        v.select_cell(0, 0, Modifiers::NONE);
+        v.select_cell(2, 1, Modifiers::SHIFT);
+        v.edit.as_mut().unwrap().target.binary_cols[0] = true;
+        v.edit.as_mut().unwrap().state.deleted.insert(1);
+        v.fill_selection(Some("same".into()));
+        assert_eq!(
+            v.edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (2, 1)]
+        );
+        v.undo();
+        assert!(v.edit.as_ref().unwrap().state.changes.is_empty());
+        assert!(v.edit.as_ref().unwrap().state.deleted.contains(&1));
+        v.rs.rows[2][1] = Some("0xAB…".into());
+        v.fill_selection(Some("safe".into()));
+        assert_eq!(
+            v.edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(0, 1)]
+        );
+    }
+
+    #[test]
+    fn read_only_grid_can_navigate_but_never_adds_deletes_or_submits() {
+        let mut h = harness(true, false);
+        h.state_mut()
+            .view
+            .set_edit_target(Err("Read-only connection".into()));
+        h.key_press(Key::Insert);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Delete);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((1, 1)));
+        assert!(h.state().view.edit.is_none());
+        assert_eq!(h.state().submits, 0);
     }
 }
 
