@@ -345,7 +345,7 @@ fn build() -> muda::Result<Built> {
     // Product names: the same in every language.
     let theme_light = check(MenuCommand::ThemeLight, "Islands Light");
     let theme_dark = check(MenuCommand::ThemeDark, "Islands Dark");
-    let explorer = check(MenuCommand::ToggleExplorer, "Database Explorer");
+    let explorer = check(MenuCommand::ToggleExplorer, tr("Database Explorer"));
     let results = check(MenuCommand::ToggleResults, tr("Results panel"));
     keep(Entry::Check(results.clone()), || tr("Results panel"));
     let theme_menu = submenu(|| tr("Theme"), &[&theme_light, &theme_dark])?;
@@ -382,7 +382,7 @@ fn build() -> muda::Result<Built> {
         || tr("Window"),
         &[
             &predefined(PredefinedMenuItem::minimize(Some(tr("Minimize"))), || tr("Minimize")),
-            &PredefinedMenuItem::maximize(Some("Zoom")),
+            &PredefinedMenuItem::maximize(Some(tr("Zoom"))),
             &sep(),
             &predefined(PredefinedMenuItem::bring_all_to_front(Some(tr("Bring All to Front"))), || {
                 tr("Bring All to Front")

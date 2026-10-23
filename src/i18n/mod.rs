@@ -210,6 +210,80 @@ mod tests {
         }
     }
 
+    /// Rust string literal starting right after its opening quote: (text, rest after the
+    /// closing quote). Only the escapes the UI texts use.
+    fn literal(s: &str) -> Option<(String, &str)> {
+        let mut out = String::new();
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => return Some((out, &s[i + 1..])),
+                '\\' => match chars.next()?.1 {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    // Line continuation: the newline and the next line's indentation are skipped.
+                    '\n' => {
+                        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+                    }
+                    other => out.push(other),
+                },
+                c => out.push(c),
+            }
+        }
+        None
+    }
+
+    /// Every `tr("…")`, `trf("…")` and `tr_ctx("…", "…")` in the code has an entry: a text
+    /// left out of the locale files would show in English in every language.
+    #[test]
+    fn every_text_in_the_code_has_a_translation() {
+        let keys: HashSet<String> = entries(Lang::Es).into_iter().map(|(k, _)| k).collect();
+        let mut missing = BTreeSet::new();
+        let mut dirs = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let code: String = source
+                    .split("#[cfg(test)]\nmod ")
+                    .next()
+                    .unwrap_or("")
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                for call in ["tr(", "trf(", "tr_ctx("] {
+                    for (at, _) in code.match_indices(call) {
+                        if code[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                            continue;
+                        }
+                        let Some(rest) = code[at + call.len()..].trim_start().strip_prefix('"') else { continue };
+                        let Some((first, rest)) = literal(rest) else { continue };
+                        let key = if call == "tr_ctx(" {
+                            let Some(rest) = rest.trim_start().strip_prefix(',').map(str::trim_start).and_then(|r| r.strip_prefix('"')) else { continue };
+                            let Some((en, _)) = literal(rest) else { continue };
+                            if keys.contains(&format!("{first}|{en}")) { continue }
+                            en
+                        } else {
+                            first
+                        };
+                        if !keys.contains(&key) {
+                            missing.insert(format!("{}: {key:?}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "texts without translation:\n{}", missing.into_iter().collect::<Vec<_>>().join("\n"));
+    }
+
     #[test]
     fn system_locales_map_to_languages() {
         for (locale, lang) in [

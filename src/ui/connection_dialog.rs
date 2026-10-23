@@ -421,7 +421,7 @@ impl ConnectionDialog {
                 if item.cfg.url_only {
                     url_row(ui, &mut item.cfg, &mut self.url, p);
                 } else {
-                    ui.label("Host:");
+                    ui.label(tr("Host:"));
                     ui.horizontal(|ui| {
                         let host_w = (ui.available_width() - 190.0).max(160.0);
                         let hint = if item.cfg.driver == Driver::Snowflake { "<account>.snowflakecomputing.com" } else { "localhost" };

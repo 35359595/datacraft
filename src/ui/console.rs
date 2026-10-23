@@ -1174,7 +1174,7 @@ impl Console {
         let mut close = None;
         theme::clipped_row(ui, 36.0, |ui| {
             ui.add_space(14.0);
-            ui.label(RichText::new("Services").font(theme::bold(13.5)).color(p.text));
+            ui.label(RichText::new(tr("Services")).font(theme::bold(13.5)).color(p.text));
             ui.add_space(10.0);
             let lock = match self.result_tab {
                 ResultTab::Result(i) => self
@@ -1196,7 +1196,7 @@ impl Console {
                             let out_err = self.log.last().is_some_and(|e| e.is_error);
                             let out_ico = if out_err { Ico::Problems } else { Ico::Console };
                             let has_results = !self.results.is_empty();
-                            let (out, _) = theme::tab(ui, self.result_tab == ResultTab::Output, Some(out_ico), "Output", false);
+                            let (out, _) = theme::tab(ui, self.result_tab == ResultTab::Output, Some(out_ico), tr("Output"), false);
                             if out.clicked() {
                                 self.result_tab = ResultTab::Output;
                             }

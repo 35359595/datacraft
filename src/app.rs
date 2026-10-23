@@ -1907,7 +1907,7 @@ impl DataCraftApp {
             ui.close();
         }
         ui.separator();
-        ui.checkbox(&mut self.show_explorer, "Database Explorer");
+        ui.checkbox(&mut self.show_explorer, tr("Database Explorer"));
         ui.checkbox(&mut self.show_results, tr("Services (results)"));
         ui.separator();
         ui.menu_button(trf("IDE zoom ({zoom})", &[("zoom", &zoom_label(self.zoom))]), |ui| self.zoom_menu(ui));
@@ -2095,13 +2095,13 @@ impl DataCraftApp {
         let mut top = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Center)));
         top.spacing_mut().item_spacing.y = 4.0;
         top.add_space(2.0);
-        if stripe_button(&mut top, Ico::Database, self.show_explorer, "Database Explorer").clicked() {
+        if stripe_button(&mut top, Ico::Database, self.show_explorer, tr("Database Explorer")).clicked() {
             self.show_explorer = !self.show_explorer;
         }
         let more = stripe_button(&mut top, Ico::More, false, tr("More tool windows"));
         egui::Popup::menu(&more).show(|ui| {
-            ui.checkbox(&mut self.show_explorer, "Database Explorer");
-            ui.checkbox(&mut self.show_results, "Services");
+            ui.checkbox(&mut self.show_explorer, tr("Database Explorer"));
+            ui.checkbox(&mut self.show_results, tr("Services"));
         });
 
         let mut bottom = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::bottom_up(egui::Align::Center)));
@@ -2183,7 +2183,7 @@ impl DataCraftApp {
             // Active tab's breadcrumbs.
             let console = self.consoles.get(self.active);
             let conn = console.and_then(|c| c.conn).and_then(|id| self.conn(id));
-            let mut crumbs: Vec<(Option<Ico>, String)> = vec![(None, "Database".into())];
+            let mut crumbs: Vec<(Option<Ico>, String)> = vec![(None, tr("Database").into())];
             if let Some(c) = conn {
                 crumbs.push((Some(Ico::Driver(c.cfg.driver)), c.cfg.name.clone()));
                 if let Some(db) = c.resolve_db(console.and_then(|x| x.db.as_deref())) {
@@ -2201,7 +2201,7 @@ impl DataCraftApp {
                             .conn
                             .and_then(|id| self.table_info(id, c.db.as_deref(), &t.schema, &t.table))
                             .is_some_and(|i| i.kind == crate::db::ObjectKind::View);
-                        crumbs.push((Some(Ico::Folder), if is_view { "views" } else { "tables" }.into()));
+                        crumbs.push((Some(Ico::Folder), if is_view { tr("views") } else { tr("tables") }.into()));
                         crumbs.push((Some(if is_view { Ico::View } else { Ico::Table }), t.table.clone()));
                     }
                     None => crumbs.push((Some(Ico::Console), c.title.clone())),
@@ -2247,7 +2247,7 @@ impl DataCraftApp {
                     egui::DragValue::new(&mut self.max_rows)
                         .range(1..=1_000_000)
                         .speed(10)
-                        .prefix("max rows: "),
+                        .prefix(tr("max rows: ")),
                 )
                 .on_hover_text(tr("Maximum rows per query (drag or double-click to edit)"));
                 if let Some(c) = self.consoles.get(self.active) {
@@ -2805,7 +2805,7 @@ impl DataCraftApp {
             let w = (screen.width() * 0.6).clamp(360.0, 860.0);
             ui.set_width(w);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Preview pending changes").font(theme::bold(15.0)));
+                ui.label(RichText::new(tr("Preview pending changes")).font(theme::bold(15.0)));
                 ui.add_space(8.0);
                 let count = if n == 1 { tr("1 change").to_string() } else { trf("{n} changes", &[("n", &n)]) };
                 ui.label(RichText::new(format!("{count} · {title}")).color(p.muted));
@@ -2853,7 +2853,7 @@ impl DataCraftApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.add_enabled_ui(!applying && n > 0, |ui| {
-                        if theme::primary_button(ui, "Submit").clicked() {
+                        if theme::primary_button(ui, tr("Submit")).clicked() {
                             submit = true;
                         }
                     });
