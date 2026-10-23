@@ -1785,4 +1785,37 @@ mod tests {
             ],
         );
     }
+
+    /// A grid save whose second change fails: on a replica set (`DATACRAFT_MONGO_RS=1`) nothing
+    /// is kept; on a standalone server the first change stays and the error says so.
+    #[test]
+    #[ignore]
+    fn mongodb_partial_save() {
+        let mut cfg = ConnectionConfig::new(46, Driver::MongoDb);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27017);
+        cfg.database = "dc_test".into();
+        let replica_set = std::env::var("DATACRAFT_MONGO_RS").is_ok_and(|v| v == "1");
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 46, .. } | Response::ConnectFailed { conn: 46, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        first_rows(&w, 46, 1, &["db.partial.drop()", "db.partial.insertOne({_id: 1, n: 1})"]);
+        let statements = vec![
+            "db.getCollection(\"partial\").updateOne({\"_id\": 1}, {\"$set\": {\"n\": 2}})".to_string(),
+            "db.getCollection(\"partial\").updateOne({\"_id\": 99}, {\"$set\": {\"n\": 3}})".to_string(),
+        ];
+        w.send(Request::ApplyChanges { conn: 46, db: None, console: 2, statements });
+        let r = wait_for(&w, |r| matches!(r, Response::ChangesApplied { console: 2, .. }));
+        let Response::ChangesApplied { result, .. } = r else { unreachable!() };
+        let error = result.expect_err("the second change matches no document");
+        let rs = first_rows(&w, 46, 3, &["db.partial.find({_id: 1})"]);
+        let n = rs[0].rows[0][1].clone();
+        if replica_set {
+            assert_eq!(n.as_deref(), Some("1"), "rolled back: {error}");
+        } else {
+            assert_eq!(n.as_deref(), Some("2"), "kept: {error}");
+        }
+        first_rows(&w, 46, 4, &["db.partial.drop()"]);
+    }
 }
