@@ -7,6 +7,10 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 pub const PREVIEW_ROWS: usize = 100;
+/// Per table: a slower table is cancelled and reported, and the search goes on.
+const TABLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Whole search: it stops (with what it found) once this is spent.
+const SEARCH_BUDGET: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct SearchRequest {
@@ -32,8 +36,12 @@ pub struct SearchReport {
     pub stopped: Option<String>,
 }
 
-fn searchable_type(data_type: &str) -> bool {
+fn searchable_type(driver: Driver, data_type: &str) -> bool {
     let t = data_type.to_ascii_lowercase();
+    // Oracle can't convert LONG / XMLTYPE to text in a predicate.
+    if driver == Driver::Oracle && (t.starts_with("long") || t.contains("xmltype")) {
+        return false;
+    }
     ![
         "binary",
         "blob",
@@ -76,7 +84,7 @@ fn search_sql(
         .columns
         .iter()
         .filter(|c| {
-            searchable_type(&c.data_type)
+            searchable_type(driver, &c.data_type)
                 && !(driver == Driver::MsSql
                     && matches!(
                         c.data_type.to_ascii_lowercase().as_str(),
@@ -88,6 +96,11 @@ fn search_sql(
             let text = match driver {
                 Driver::MsSql => format!("CONVERT(nvarchar(max), {column})"),
                 Driver::MySql | Driver::MariaDb => format!("CAST({column} AS CHAR)"),
+                // CLOBs over 4000 bytes don't CAST: their first 1000 characters are searched
+                // (at most 4000 bytes in AL32UTF8).
+                Driver::Oracle if c.data_type.to_ascii_lowercase().contains("clob") => {
+                    format!("DBMS_LOB.SUBSTR({column}, 1000, 1)")
+                }
                 Driver::Oracle => format!("CAST({column} AS VARCHAR2(4000))"),
                 Driver::Snowflake => format!("TO_VARCHAR({column})"),
                 Driver::Postgres | Driver::Sqlite => format!("CAST({column} AS TEXT)"),
@@ -132,10 +145,18 @@ pub async fn search(
     cancel: Arc<Notify>,
 ) -> anyhow::Result<SearchReport> {
     // A separate session keeps cancellation and database switching out of editor transactions.
-    cfg.database.clone_from(&request.db);
+    // On Oracle `database` is the service name, not the container name the explorer shows.
+    if cfg.driver != Driver::Oracle {
+        cfg.database.clone_from(&request.db);
+    }
     cfg.read_only = true;
-    let setup = async {
+    let connect = || async {
         let mut session = Session::connect(&cfg).await?;
+        session.use_database(&request.db).await?;
+        anyhow::Ok(session)
+    };
+    let setup = async {
+        let mut session = connect().await?;
         let schemas = session.introspect_database(&request.db).await?;
         anyhow::Ok((session, schemas))
     };
@@ -145,7 +166,7 @@ pub async fn search(
     };
     let tables: Vec<_> = schemas
         .into_iter()
-        .filter(|s| request.schema.as_ref().is_none_or(|name| *name == s.name))
+        .filter(|s| request.schema.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(&s.name)))
         .flat_map(|s| {
             s.tables
                 .into_iter()
@@ -157,29 +178,50 @@ pub async fn search(
         total: tables.len(),
         ..Default::default()
     };
+    let deadline = tokio::time::Instant::now() + SEARCH_BUDGET;
     for (schema, table) in tables {
+        if tokio::time::Instant::now() >= deadline {
+            report.stopped = Some(tr("Search time limit reached (5 minutes)").into());
+            break;
+        }
         let Some(sql) = search_sql(cfg.driver, &schema, &table, &request) else {
             report.scanned += 1;
             continue;
         };
         let native_cancel = session.cancel_handle();
         let outcome = tokio::select! {
-            _ = cancel.notified() => Err(tr("Search cancelled")),
-            result = tokio::time::timeout(Duration::from_secs(15), session.execute(&sql, PREVIEW_ROWS)) => {
-                result.map_err(|_| tr("Schema search timed out"))
-            }
+            _ = cancel.notified() => None,
+            result = tokio::time::timeout(TABLE_TIMEOUT, session.execute(&sql, PREVIEW_ROWS)) => Some(result),
         };
-        let results = match outcome {
-            Ok(results) => results,
-            Err(reason) => {
-                if let Some(handle) = native_cancel {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), handle.cancel()).await;
-                }
-                report.stopped = Some(reason.into());
-                break;
+        let cancelled = match &native_cancel {
+            Some(handle) if !matches!(outcome, Some(Ok(_))) => {
+                matches!(tokio::time::timeout(Duration::from_secs(2), handle.cancel()).await, Ok(Ok(())))
             }
+            _ => false,
         };
         report.scanned += 1;
+        let results = match outcome {
+            None => {
+                report.stopped = Some(tr("Search cancelled").into());
+                break;
+            }
+            // A slow table is skipped; without a native cancel the session's state is unknown,
+            // so the search goes on with a new one.
+            Some(Err(_)) => {
+                report.errors.push(format!("{schema}.{}: {}", table.name, tr("Schema search timed out")));
+                if !cancelled {
+                    match connect().await {
+                        Ok(s) => session = s,
+                        Err(e) => {
+                            report.stopped = Some(format!("{e:#}"));
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            Some(Ok(results)) => results,
+        };
         match results {
             Ok(results) => {
                 for result in results.into_iter().filter(|r| !r.rows.is_empty()) {
@@ -260,6 +302,20 @@ mod tests {
             assert!(!sql.contains("bytes"));
             assert!(sql.contains(&Session::quote_table(driver, "schema", &table.name)));
         }
+    }
+
+    #[test]
+    fn oracle_searches_clobs_by_prefix_and_skips_long_columns() {
+        let column = |name: &str, data_type: &str| ColumnInfo { name: name.into(), data_type: data_type.into(), nullable: true, primary_key: false };
+        let table = TableInfo {
+            name: "DOCS".into(),
+            kind: ObjectKind::Table,
+            columns: vec![column("BODY", "CLOB"), column("LEGACY", "LONG"), column("XML", "XMLTYPE"), column("TITLE", "VARCHAR2")],
+        };
+        let sql = search_sql(Driver::Oracle, "APP", &table, &request("x")).unwrap();
+        assert!(sql.contains("DBMS_LOB.SUBSTR(\"BODY\", 1000, 1)"), "{sql}");
+        assert!(sql.contains("CAST(\"TITLE\" AS VARCHAR2(4000))"), "{sql}");
+        assert!(!sql.contains("LEGACY") && !sql.contains("\"XML\""), "{sql}");
     }
 
     #[tokio::test]

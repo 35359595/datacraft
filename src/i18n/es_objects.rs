@@ -131,4 +131,19 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Object information request timed out",
         "Se agotó el tiempo de espera de la información del objeto",
     ),
+    (
+        "Object information request superseded",
+        "Petición de información del objeto sustituida por otra más reciente",
+    ),
+    ("Database", "Base de datos"),
+    ("Search", "Buscar"),
+    ("Search time limit reached (5 minutes)", "Se alcanzó el tiempo máximo de búsqueda (5 minutos)"),
+    (
+        "Each table is read in full on the server (15 s per table, 5 minutes in all): avoid busy production databases.",
+        "Cada tabla se lee entera en el servidor (15 s por tabla, 5 minutos en total): evita las bases de producción con mucha carga.",
+    ),
+    (
+        "Snowflake: the search runs on the warehouse and uses credits.",
+        "Snowflake: la búsqueda se ejecuta en el warehouse y consume créditos.",
+    ),
 ];

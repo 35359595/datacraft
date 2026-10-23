@@ -1260,15 +1260,22 @@ impl DataCraftApp {
                         self.connect(id);
                     }
                 }
+                // A single click in the explorer updates the Objects tab, but only brings it to
+                // the front if it already is (or there is no other tab): it doesn't hide the
+                // console or data editor being worked on.
                 ExplorerAction::BrowseObjects(scope) => {
                     self.explorer.selected_table = None;
+                    let focus = self.object_browser.active || self.consoles.is_empty();
                     if self.object_browser.open(scope) { self.load_object_catalog(); }
+                    self.object_browser.active = focus;
                 }
                 ExplorerAction::InspectObject(t, kind) => {
+                    let focus = self.object_browser.active || self.consoles.is_empty();
                     let changed = self.object_browser.open(crate::ui::object_browser::ObjectScope {
                         conn: t.conn, db: t.db.clone(), schema: Some(t.schema.clone()), kind: Some(kind),
                     });
                     if changed { self.load_object_catalog(); }
+                    self.object_browser.active = focus;
                     self.inspect_object(t, false);
                 }
                 ExplorerAction::OpenTable(t) => self.open_table(&t),
@@ -1517,6 +1524,10 @@ impl DataCraftApp {
                     c.loading.remove(&d.db);
                 }
                 self.load_database(conn, d.db.clone());
+                let new_name = (d.kind == DropKind::Rename).then(|| crate::ui::drop_dialog::effective_name(d.driver, &d.new_name));
+                for org in self.object_browser.organizations.iter_mut().filter(|o| o.conn == conn && o.db == d.db) {
+                    org.table_changed(&d.schema, &d.name, new_name.as_deref());
+                }
                 if d.kind == DropKind::Rename {
                     let new_name = crate::ui::drop_dialog::effective_name(d.driver, &d.new_name);
                     let renamed = TableRef { table: new_name.clone(), ..tref };
@@ -3174,7 +3185,7 @@ impl eframe::App for DataCraftApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let state = Persisted {
-            object_organizations: self.object_browser.organizations.clone(),
+            object_organizations: self.object_browser.organizations.iter().filter(|o| !o.is_empty()).cloned().collect(),
             object_layout: self.object_browser.layout,
             save_on_row_change: self.save_on_row_change,
             islands_dark: self.dark,

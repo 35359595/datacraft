@@ -15,6 +15,8 @@ pub struct SchemaSearch {
     pub open: bool,
     conn: u64,
     db: String,
+    /// Database of the shown results (the combo can change after the search).
+    searched_db: String,
     schema: String,
     value: String,
     exact: bool,
@@ -38,6 +40,9 @@ impl SchemaSearch {
         }
         self.conn = scope.conn;
         self.db.clone_from(&scope.db);
+        if self.report.is_none() {
+            self.searched_db.clone_from(&scope.db);
+        }
         self.schema = scope.schema.clone().unwrap_or_default();
     }
 
@@ -95,6 +100,7 @@ impl SchemaSearch {
                             cancel: cancel.clone(),
                         })));
                         self.cancel = Some(cancel);
+                        self.searched_db.clone_from(&self.db);
                         self.report = None;
                         self.preview = None;
                         self.selected = None;
@@ -102,6 +108,10 @@ impl SchemaSearch {
                 });
             });
             ui.label(tr("Searches all tables. Preview: up to 100 matching rows per table. Binary columns are skipped."));
+            ui.label(tr("Each table is read in full on the server (15 s per table, 5 minutes in all): avoid busy production databases."));
+            if connection.is_some_and(|c| c.cfg.driver == crate::db::Driver::Snowflake) {
+                ui.colored_label(ui.visuals().warn_fg_color, tr("Snowflake: the search runs on the warehouse and uses credits."));
+            }
             if running {
                 ui.horizontal(|ui| { ui.spinner(); ui.label(tr("Searching tables…"));
                     if ui.button(tr("Cancel")).clicked() { self.stop(); }
@@ -135,7 +145,7 @@ impl SchemaSearch {
                         if let Some(i) = self.selected && let Some(entry) = report.matches.get(i)
                             && ui.button(tr("Open table")).clicked() {
                             actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(TableRef {
-                                conn: self.conn, db: self.db.clone(), schema: entry.schema.clone(), table: entry.table.clone(),
+                                conn: self.conn, db: self.searched_db.clone(), schema: entry.schema.clone(), table: entry.table.clone(),
                             })));
                             close = true;
                         }

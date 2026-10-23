@@ -45,6 +45,25 @@ impl Organization {
         &mut self.objects[index]
     }
 
+    /// Nothing to remember (not persisted).
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.group_colors.is_empty() && self.objects.iter().all(|o| o.group.is_none() && o.color.is_none())
+    }
+
+    /// The table was dropped (`new_name` None) or renamed: its folder and color go with it, so a
+    /// new table with the old name doesn't inherit them.
+    pub fn table_changed(&mut self, schema: &str, table: &str, new_name: Option<&str>) {
+        match new_name {
+            Some(new_name) => {
+                self.objects.retain(|o| !(o.schema == schema && o.table == new_name));
+                if let Some(o) = self.objects.iter_mut().find(|o| o.schema == schema && o.table == table) {
+                    o.table = new_name.into();
+                }
+            }
+            None => self.objects.retain(|o| !(o.schema == schema && o.table == table)),
+        }
+    }
+
     pub fn color(&self, schema: &str, table: &str) -> Option<Color32> {
         self.style(schema, table)
             .and_then(|o| o.color)
@@ -236,5 +255,19 @@ mod tests {
         assert!(org.group_color("Orders").is_none());
         assert!(org.group("public", "orders").is_none());
         assert!(org.color("public", "orders").is_some());
+    }
+
+    #[test]
+    fn dropped_and_renamed_tables_take_their_style_with_them() {
+        let mut org = Organization::default();
+        org.style_mut("public", "orders").color = Some([1, 2, 3]);
+        org.style_mut("public", "items").group = Some("Sales".into());
+        org.table_changed("public", "orders", None);
+        assert_eq!(org.color("public", "orders"), None, "a new table with the old name starts clean");
+        org.table_changed("public", "items", Some("order_items"));
+        assert_eq!(org.group("public", "order_items"), Some("Sales"));
+        assert_eq!(org.group("public", "items"), None);
+        org.table_changed("public", "order_items", None);
+        assert!(org.is_empty());
     }
 }
