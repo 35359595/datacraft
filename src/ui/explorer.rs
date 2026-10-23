@@ -82,8 +82,8 @@ pub enum ExplorerAction {
     Hide,
 }
 
-const ROW_H: f32 = 26.0;
-const INDENT: f32 = 20.0;
+const ROW_H: f32 = 24.0;
+const INDENT: f32 = 18.0;
 
 struct RowOut {
     resp: egui::Response,

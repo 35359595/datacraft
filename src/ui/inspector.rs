@@ -9,9 +9,9 @@ use egui::{RichText, Ui, vec2};
 
 pub fn header(ui: &mut Ui, name: &str, kind: &str, connection: &str, database: &str) {
     let p = pal(ui);
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
         icons::paint(
             ui.painter(),
             rect.shrink(2.0),
@@ -25,12 +25,12 @@ pub fn header(ui: &mut Ui, name: &str, kind: &str, connection: &str, database: &
             ui.label(RichText::new(kind).small().color(p.muted));
         });
     });
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     if !connection.is_empty() {
         ui.label(RichText::new(connection).small().color(p.muted));
     }
     ui.label(RichText::new(database).small().color(p.muted));
-    ui.add_space(14.0);
+    ui.add_space(10.0);
 }
 
 pub fn property(ui: &mut Ui, label: &str, value: Option<&str>) {
@@ -42,7 +42,7 @@ pub fn property(ui: &mut Ui, label: &str, value: Option<&str>) {
         } else {
             ""
         });
-    ui.add_space(12.0);
+    ui.add_space(8.0);
 }
 
 pub fn table_fields(ui: &mut Ui, info: Option<&ObjectInfo>) {

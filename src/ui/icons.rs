@@ -30,6 +30,8 @@ pub enum Ico {
     Gear,
     Search,
     Properties,
+    Edit,
+    Info,
     Play,
     PlayAll,
     Undo,
@@ -219,6 +221,15 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
                 painter.circle_filled(at(k, y), 2.0 * s, p.island_bg);
                 painter.circle_stroke(at(k, y), 2.0 * s, st(color));
             }
+        }
+        Ico::Edit => {
+            line(&[(3.0, 10.5), (10.5, 3.0), (13.0, 5.5), (5.5, 13.0), (2.5, 13.5), (3.0, 10.5)], color);
+            line(&[(9.0, 4.5), (11.5, 7.0)], color);
+        }
+        Ico::Info => {
+            painter.circle_stroke(at(8.0, 8.0), 6.0 * s, st(color));
+            painter.circle_filled(at(8.0, 4.8), 0.8 * s, color);
+            line(&[(8.0, 7.0), (8.0, 11.3)], color);
         }
         Ico::Play | Ico::PlayAll => {
             let c = if enabled { p.run } else { color };

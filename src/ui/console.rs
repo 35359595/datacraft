@@ -874,13 +874,13 @@ impl Console {
     pub fn show_table(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
         let p = pal(ui);
-        if self.table.as_ref().is_some_and(|t| t.view.inspector) {
-            egui::Panel::right(egui::Id::new(("table_inspector", self.id))).default_size(280.0).size_range(220.0..=460.0).resizable(true).show(ui, |ui| self.table_inspector(ui, cx, &mut actions));
+        if !cx.driver.is_nosql() && self.table.as_ref().is_some_and(|t| t.view.inspector) {
+            egui::Panel::right(egui::Id::new(("table_inspector", self.id))).default_size(250.0).size_range(220.0..=460.0).resizable(true).show(ui, |ui| self.table_inspector(ui, cx, &mut actions));
         }
         egui::Panel::bottom(egui::Id::new(("table_footer", self.id))).resizable(false).show_separator_line(true).show(ui, |ui| self.table_footer(ui, cx, &mut actions));
         if self.table.as_ref().is_some_and(|t| t.view.cell_editor) {
             let busy = self.is_busy();
-            egui::Panel::bottom(egui::Id::new(("cell_editor", self.id))).default_size(180.0).size_range(100.0..=450.0).resizable(true).show(ui, |ui| {
+            egui::Panel::bottom(egui::Id::new(("cell_editor", self.id))).default_size(150.0).size_range(100.0..=450.0).resizable(true).show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| { if let Some(view) = self.results.last_mut() { view.show_cell_editor(ui); } });
             });
         }
@@ -1068,10 +1068,10 @@ impl Console {
                 theme::Side::Left => {
                     if let Some(t) = &mut self.table {
                         let was_open = t.view.cell_editor;
-                        ui.toggle_value(&mut t.view.cell_editor, tr("Cell Editor"));
+                        if theme::tool_button(ui, Ico::Edit, tr("Cell Editor"), t.view.cell_editor).clicked() { t.view.cell_editor = !t.view.cell_editor; }
                         if was_open && !t.view.cell_editor && let Some(view) = self.results.last_mut() { view.finish_inline_edit(); }
-                        if !cx.driver.is_nosql() { ui.toggle_value(&mut t.view.filter_sort, tr("Filter & Sort")); }
-                        ui.toggle_value(&mut t.view.inspector, tr("Information"));
+                        if !cx.driver.is_nosql() && theme::tool_button(ui, Ico::Filter, tr("Filter & Sort"), t.view.filter_sort).clicked() { t.view.filter_sort = !t.view.filter_sort; }
+                        if !cx.driver.is_nosql() && theme::tool_button(ui, Ico::Info, tr("Information"), t.view.inspector).clicked() { t.view.inspector = !t.view.inspector; }
                     }
                     theme::toolbar_separator(ui);
                     self.tx_dropdown(ui);
@@ -1204,8 +1204,8 @@ impl Console {
         let Some(t) = &mut self.table else { return };
         ui.set_min_width(210.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut t.inspector_column, false, tr("Table"));
-            ui.selectable_value(&mut t.inspector_column, true, tr("Column"));
+            if theme::tool_button(ui, Ico::Table, tr("Table"), !t.inspector_column).clicked() { t.inspector_column = false; }
+            if theme::tool_button(ui, Ico::Column, tr("Column"), t.inspector_column).clicked() { t.inspector_column = true; }
             if theme::icon_button(ui, Ico::Refresh, !t.info_loading && !cx.driver.is_nosql(), tr("Refresh information")).clicked() { actions.push(ConsoleAction::Inspect(false)); }
         });
         let connection = cx.connections.iter().find(|c| Some(c.id) == self.conn).map_or("", |c| c.name.as_str());
@@ -2162,11 +2162,11 @@ fn hline(ui: &mut Ui) {
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.island_border));
 }
 
-/// 36 px toolbar row.
+/// Compact toolbar row with room for 26 px icon buttons.
 fn toolbar_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let w = ui.available_width();
-    ui.allocate_ui_with_layout(vec2(w, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.set_min_size(vec2(w, 36.0));
+    ui.allocate_ui_with_layout(vec2(w, 32.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_size(vec2(w, 32.0));
         ui.add_space(8.0);
         ui.spacing_mut().item_spacing.x = 2.0;
         add(ui);

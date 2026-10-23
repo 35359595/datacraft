@@ -476,6 +476,24 @@ pub fn flat_button(ui: &mut Ui, leading: Option<Ico>, text: &str, font: FontId, 
     resp
 }
 
+/// Compact icon-and-label action, with a subtle selected state.
+pub fn tool_button(ui: &mut Ui, icon: Ico, text: &str, selected: bool) -> Response {
+    let p = pal(ui);
+    let text_color = if ui.is_enabled() { p.text } else { p.disabled };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.5), text_color);
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 32.0, 24.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, text));
+    if selected {
+        ui.painter().rect(rect, 4.0, p.tab_selected_bg, Stroke::new(1.0, p.tab_selected_border), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, p.hover);
+    }
+    let color = if !ui.is_enabled() { p.disabled } else if selected { p.accent } else { p.icon };
+    icons::paint(ui.painter(), Rect::from_min_size(rect.left_center() + vec2(6.0, -7.0), Vec2::splat(14.0)), icon, color, &p, ui.is_enabled());
+    ui.painter().galley(rect.left_center() + vec2(25.0, -galley.size().y / 2.0), galley, p.text);
+    response
+}
+
 /// Thin vertical toolbar separator.
 pub fn toolbar_separator(ui: &mut Ui) {
     let p = pal(ui);

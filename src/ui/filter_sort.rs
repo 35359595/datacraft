@@ -2,6 +2,7 @@
 use crate::db::{ColumnInfo, Driver};
 use crate::edit::literal;
 use crate::i18n::tr;
+use crate::ui::{icons::Ico, theme};
 use egui::Ui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,15 +218,27 @@ impl Group {
 
     fn show(&mut self, ui: &mut Ui, columns: &[ColumnInfo], depth: usize) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.any, false, tr("All (AND)"));
-            ui.selectable_value(&mut self.any, true, tr("Any (OR)"));
-            if ui.button(tr("Add condition")).clicked() {
+            egui::ComboBox::from_id_salt("condition_logic")
+                .width(110.0)
+                .selected_text(if self.any {
+                    tr("Any (OR)")
+                } else {
+                    tr("All (AND)")
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.any, false, tr("All (AND)"));
+                    ui.selectable_value(&mut self.any, true, tr("Any (OR)"));
+                });
+            if theme::tool_button(ui, Ico::Plus, tr("Add condition"), false).clicked() {
                 self.children.push(Node::Condition(Condition::new(
                     columns.first().map(|c| c.name.clone()).unwrap_or_default(),
                 )));
             }
             if ui
-                .add_enabled(depth < 8, egui::Button::new(tr("Add group")))
+                .add_enabled_ui(depth < 8, |ui| {
+                    theme::tool_button(ui, Ico::Folder, tr("Add group"), false)
+                })
+                .inner
                 .clicked()
             {
                 self.children.push(Node::Group(Group::default()));
@@ -359,117 +372,153 @@ impl FilterSort {
 
     pub fn show(&mut self, ui: &mut Ui, driver: Driver, columns: &[ColumnInfo]) -> bool {
         let mut apply = false;
-        egui::ScrollArea::vertical()
-            .id_salt("filter_sort_builder")
-            .max_height(250.0)
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong(tr("Filter"));
-                    if ui
-                        .selectable_label(!self.text_mode, tr("Builder"))
-                        .clicked()
-                    {
-                        if self.text_mode
-                            && self.builder_sql(driver, columns).is_ok_and(|sql| {
-                                sql != (self.where_text.clone(), self.order_text.clone())
-                            })
-                        {
-                            self.error =
-                                Some(tr("Clear custom SQL before switching to Builder").into());
-                        } else {
-                            self.text_mode = false;
-                        }
-                    }
-                    if ui.selectable_label(self.text_mode, tr("Text")).clicked() {
-                        if !self.text_mode
-                            && let Ok((w, o)) = self.sql(driver, columns)
-                        {
-                            self.where_text = w;
-                            self.order_text = o;
-                        }
-                        self.text_mode = true;
-                    }
-                });
-                if self.text_mode {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.where_text)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(2)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("WHERE"),
-                    );
-                } else {
-                    self.filter.show(ui, columns, 0);
-                }
-                ui.separator();
-                ui.strong(tr("Sort By"));
-                if self.text_mode {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.order_text)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("ORDER BY"),
-                    );
-                } else {
-                    let mut remove = None;
-                    let mut swap = None;
-                    let len = self.sort.len();
-                    for (index, rule) in self.sort.iter_mut().enumerate() {
-                        ui.push_id(("sort", index), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut rule.enabled, "");
-                                column_picker(ui, "sort_column", &mut rule.column, columns);
-                                ui.selectable_value(&mut rule.descending, false, tr("Ascending"));
-                                ui.selectable_value(&mut rule.descending, true, tr("Descending"));
-                                if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
-                                    swap = Some((index, index - 1));
-                                }
-                                if ui
-                                    .add_enabled(index + 1 < len, egui::Button::new("↓"))
-                                    .clicked()
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
+                ui.spacing_mut().interact_size.y = 22.0;
+                ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("filter_sort_builder")
+                    .max_height(230.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(tr("Filter"));
+                            if ui
+                                .selectable_label(!self.text_mode, tr("Builder"))
+                                .clicked()
+                            {
+                                if self.text_mode
+                                    && self.builder_sql(driver, columns).is_ok_and(|sql| {
+                                        sql != (self.where_text.clone(), self.order_text.clone())
+                                    })
                                 {
-                                    swap = Some((index, index + 1));
+                                    self.error = Some(
+                                        tr("Clear custom SQL before switching to Builder").into(),
+                                    );
+                                } else {
+                                    self.text_mode = false;
                                 }
-                                if ui.small_button("×").clicked() {
-                                    remove = Some(index);
-                                }
-                            });
-                        });
-                    }
-                    if let Some(index) = remove {
-                        self.sort.remove(index);
-                    } else if let Some((a, b)) = swap {
-                        self.sort.swap(a, b);
-                    }
-                    if ui.button(tr("Add sort column")).clicked() {
-                        self.sort.push(SortRule {
-                            enabled: true,
-                            column: columns.first().map(|c| c.name.clone()).unwrap_or_default(),
-                            descending: false,
-                        });
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(tr("Apply")).clicked() {
-                        match self.sql(driver, columns) {
-                            Ok(sql) => {
-                                self.pending = Some(sql);
-                                self.error = None;
-                                apply = true;
                             }
-                            Err(error) => self.error = Some(error.into()),
+                            if ui.selectable_label(self.text_mode, tr("Text")).clicked() {
+                                if !self.text_mode
+                                    && let Ok((w, o)) = self.sql(driver, columns)
+                                {
+                                    self.where_text = w;
+                                    self.order_text = o;
+                                }
+                                self.text_mode = true;
+                            }
+                        });
+                        if self.text_mode {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.where_text)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(2)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("WHERE"),
+                            );
+                        } else {
+                            self.filter.show(ui, columns, 0);
                         }
-                    }
-                    if ui.button(tr("Clear")).clicked() {
-                        self.filter = Group::default();
-                        self.sort.clear();
-                        self.where_text.clear();
-                        self.order_text.clear();
-                        self.error = None;
-                    }
-                    if let Some(error) = &self.error {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
-                    }
-                });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.strong(tr("Sort By"));
+                            if !self.text_mode
+                                && theme::tool_button(ui, Ico::Plus, tr("Add sort column"), false)
+                                    .clicked()
+                            {
+                                self.sort.push(SortRule {
+                                    enabled: true,
+                                    column: columns
+                                        .first()
+                                        .map(|c| c.name.clone())
+                                        .unwrap_or_default(),
+                                    descending: false,
+                                });
+                            }
+                        });
+                        if self.text_mode {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.order_text)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("ORDER BY"),
+                            );
+                        } else {
+                            let mut remove = None;
+                            let mut swap = None;
+                            let len = self.sort.len();
+                            for (index, rule) in self.sort.iter_mut().enumerate() {
+                                ui.push_id(("sort", index), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut rule.enabled, "");
+                                        column_picker(ui, "sort_column", &mut rule.column, columns);
+                                        egui::ComboBox::from_id_salt("sort_direction")
+                                            .width(110.0)
+                                            .selected_text(if rule.descending {
+                                                tr("Descending")
+                                            } else {
+                                                tr("Ascending")
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut rule.descending,
+                                                    false,
+                                                    tr("Ascending"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut rule.descending,
+                                                    true,
+                                                    tr("Descending"),
+                                                );
+                                            });
+                                        if ui
+                                            .add_enabled(index > 0, egui::Button::new("↑"))
+                                            .clicked()
+                                        {
+                                            swap = Some((index, index - 1));
+                                        }
+                                        if ui
+                                            .add_enabled(index + 1 < len, egui::Button::new("↓"))
+                                            .clicked()
+                                        {
+                                            swap = Some((index, index + 1));
+                                        }
+                                        if ui.small_button("×").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    });
+                                });
+                            }
+                            if let Some(index) = remove {
+                                self.sort.remove(index);
+                            } else if let Some((a, b)) = swap {
+                                self.sort.swap(a, b);
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if theme::tool_button(ui, Ico::Submit, tr("Apply"), false).clicked() {
+                                match self.sql(driver, columns) {
+                                    Ok(sql) => {
+                                        self.pending = Some(sql);
+                                        self.error = None;
+                                        apply = true;
+                                    }
+                                    Err(error) => self.error = Some(error.into()),
+                                }
+                            }
+                            if theme::tool_button(ui, Ico::Revert, tr("Clear"), false).clicked() {
+                                self.filter = Group::default();
+                                self.sort.clear();
+                                self.where_text.clear();
+                                self.order_text.clear();
+                                self.error = None;
+                            }
+                            if let Some(error) = &self.error {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                        });
+                    });
             });
         apply
     }
