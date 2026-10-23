@@ -637,5 +637,21 @@
     "Search time limit reached (5 minutes)": "Limite de tempo da pesquisa atingido (5 minutos)",
     "Each table is read in full on the server (15 s per table, 5 minutes in all): avoid busy production databases.": "Cada tabela é lida por inteiro no servidor (15 s por tabela, 5 minutos no total): evite bancos de produção com muita carga.",
     "Snowflake: the search runs on the warehouse and uses credits.": "Snowflake: a pesquisa é executada no warehouse e consome créditos."
+  },
+  "views": {
+    "New View…": "Nova view…",
+    "Edit View…": "Editar view…",
+    "New View": "Nova view",
+    "Edit View": "Editar view",
+    "Query:": "Consulta:",
+    "Loading the view definition…": "Carregando a definição da view…",
+    "Columns:": "Colunas:",
+    "Optional, e.g. id, name": "Opcional, ex.: id, name",
+    "Options:": "Opções:",
+    "The SELECT query is required": "A consulta SELECT é obrigatória",
+    "View “{name}” saved": "View “{name}” salva",
+    "View “{name}” created": "View “{name}” criada",
+    "The definition of view “{name}” is not available": "A definição da view “{name}” não está disponível",
+    "The view definition request timed out": "A solicitação da definição da view expirou"
   }
 }

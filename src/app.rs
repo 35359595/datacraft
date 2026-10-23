@@ -30,6 +30,7 @@
 //! `table-submit` also creates that table in the demo database.
 //! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
 //! rename (to `<name>_renamed`) the first table; with `-submit` (e.g. `rename-submit`) it also runs it.
+//! `DATACRAFT_DEMO_VIEW=new|edit` opens "New View" over the first table or "Edit View" on the first view.
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -54,6 +55,8 @@ use egui::{FontId, Key, Margin, Modifiers, Rect, RichText, Sense, Ui, pos2, vec2
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+
+mod views;
 
 const STORAGE_KEY: &str = "datacraft_ui_state";
 const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -264,6 +267,8 @@ pub struct DataCraftApp {
     create: Option<CreateDialog>,
     /// Confirmation to drop a database, table or view.
     drop: Option<DropDialog>,
+    /// "New View" / "Edit View" dialog and pending view definitions.
+    views: views::ViewState,
     import: Option<ImportDialog>,
     /// "Copy Table To…".
     copy: Option<CopyDialog>,
@@ -343,6 +348,7 @@ impl DataCraftApp {
             confirm_delete: None,
             create: None,
             drop: None,
+            views: Default::default(),
             import: None,
             copy: None,
             mask_export: None,
@@ -649,6 +655,7 @@ impl DataCraftApp {
                                 }
                             }
                         }
+                        self.demo_view(conn);
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
@@ -740,6 +747,7 @@ impl DataCraftApp {
                 Response::SchemaSearch { request_id, result } => self.object_browser.schema_search.receive(request_id, result),
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
+                Response::ViewDefinition { conn, request_id, result } => self.view_definition_received(conn, request_id, result),
                 Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
             }
         }
@@ -1233,6 +1241,10 @@ impl DataCraftApp {
     }
 
     fn generate(&mut self, ctx: &egui::Context, t: &TableRef, kind: Generate) {
+        // Views: their real definition, read from the server.
+        if kind == Generate::Ddl && self.request_view_ddl(t) {
+            return;
+        }
         let Some(c) = self.conn(t.conn) else { return };
         let driver = c.cfg.driver;
         let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table) else {
@@ -1272,14 +1284,15 @@ impl DataCraftApp {
             // SQL-only actions never reach Redis or MongoDB (other menus may still offer them).
             let sql_only = match &a {
                 ExplorerAction::NewDatabase(id) | ExplorerAction::DropDatabase(id, _) => Some(*id),
-                ExplorerAction::NewTable { conn, .. } => Some(*conn),
+                ExplorerAction::NewTable { conn, .. } | ExplorerAction::NewView { conn, .. } => Some(*conn),
                 ExplorerAction::DropObject(t, _)
                 | ExplorerAction::TruncateTable(t)
                 | ExplorerAction::ImportData(t)
                 | ExplorerAction::RenameTable(t)
                 | ExplorerAction::GenerateSelect(t)
                 | ExplorerAction::GenerateInsert(t)
-                | ExplorerAction::GenerateDdl(t) => Some(t.conn),
+                | ExplorerAction::GenerateDdl(t)
+                | ExplorerAction::EditView(t) => Some(t.conn),
                 _ => None,
             };
             // Copying works with MongoDB collections too, but not with Redis keys.
@@ -1326,6 +1339,8 @@ impl DataCraftApp {
                         self.open_new_table(conn, db, schema);
                     }
                 }
+                ExplorerAction::NewView { conn, db, schema } => self.open_new_view(conn, db, schema),
+                ExplorerAction::EditView(t) => self.open_edit_view(t),
                 ExplorerAction::DropDatabase(id, db) => {
                     if self.refuse_read_only(id) {
                         continue;
@@ -1609,6 +1624,9 @@ impl DataCraftApp {
 
     /// Reply to the "New Database" / "New Table" dialog's statements.
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
+        if self.view_ddl_done(conn, &result) {
+            return;
+        }
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
             self.drop_done(result);
             return;
@@ -1958,6 +1976,7 @@ impl DataCraftApp {
         self.object_browser.schema_search.open || self.object_browser.has_dialog() || self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.create.is_some()
+            || self.views.dialog.is_some()
             || self.drop.is_some()
             || self.import.is_some()
             || self.copy.is_some()
@@ -2820,6 +2839,8 @@ impl DataCraftApp {
             }
         }
 
+        self.view_dialog(ctx);
+
         if let Some(d) = self.import.as_mut() {
             match d.show(ctx) {
                 Some(ImportResult::Import(statements)) => {
@@ -3471,7 +3492,7 @@ mod tests {
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             save_on_row_change: false,
-            dialog: None, confirm_delete: None, create: None, drop: None, import: None, copy: None, mask_export: None, renaming: None,
+            dialog: None, confirm_delete: None, create: None, drop: None, views: Default::default(), import: None, copy: None, mask_export: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,

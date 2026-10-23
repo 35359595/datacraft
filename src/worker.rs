@@ -57,6 +57,8 @@ pub enum Request {
         schema: Option<String>,
         request_id: u64,
     },
+    /// The real definition of a view (for "Edit View…" and "Generate DDL").
+    ViewDefinition { conn: ConnId, db: String, schema: String, view: String, request_id: u64 },
     /// Runs statements in order; stops at the first error.
     /// `db`: database to run them in (`None` = the connection's default database).
     Execute {
@@ -113,6 +115,7 @@ pub enum Response {
         request_id: u64,
         result: Result<Vec<crate::db::object_info::ObjectInfoRow>, String>,
     },
+    ViewDefinition { conn: ConnId, request_id: u64, result: Result<crate::db::views::ViewDefinition, String> },
     /// `results` holds what ran before the error (if there was one).
     Executed {
         console: ConsoleId,
@@ -388,6 +391,35 @@ async fn fetch_object_info(
     result
 }
 
+/// A view's definition, on the metadata session for `db` (15 s at most, like `fetch_object_info`).
+async fn fetch_view_definition(state: &State, conn: ConnId, db: &str, schema: &str, view: &str) -> Result<crate::db::views::ViewDefinition, String> {
+    let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
+        return Err(tr("Connection lost").into());
+    };
+    let (session, target) = state.meta_session_for(conn, db).await.map_err(|e| format!("{e:#}"))?;
+    let mut s = session.lock().await;
+    let cancel = s.cancel_handle();
+    let query = async {
+        s.use_database(&target).await?;
+        s.view_definition(driver, &target, schema, view).await
+    };
+    let (result, broken) = match tokio::time::timeout(std::time::Duration::from_secs(15), query).await {
+        Ok(result) => (result.map_err(|e| format!("{e:#}")), s.is_closed()),
+        Err(_) => {
+            let cancelled = match cancel {
+                Some(h) => h.cancel().await.is_ok(),
+                None => false,
+            };
+            (Err(tr("The view definition request timed out").into()), !cancelled)
+        }
+    };
+    drop(s);
+    if broken {
+        state.forget_meta(conn, &session).await;
+    }
+    result
+}
+
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
         Request::SchemaSearch { conn, request_id, request, cancel } => {
@@ -496,6 +528,10 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
         } => {
             let result = fetch_object_info(state, conn, &db, schema.as_deref(), None, false, request_id).await;
             vec![Response::ObjectCatalog { conn, request_id, result }]
+        }
+        Request::ViewDefinition { conn, db, schema, view, request_id } => {
+            let result = fetch_view_definition(state, conn, &db, &schema, &view).await;
+            vec![Response::ViewDefinition { conn, request_id, result }]
         }
         Request::ApplyChanges { conn, db, console, statements } => {
             let (session, target) = match state.session_for(conn, db.as_deref()).await {

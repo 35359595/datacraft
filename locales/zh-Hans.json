@@ -637,5 +637,21 @@
     "Search time limit reached (5 minutes)": "已达到搜索时间上限（5 分钟）",
     "Each table is read in full on the server (15 s per table, 5 minutes in all): avoid busy production databases.": "每个表都会在服务器上完整读取（每表 15 秒，总计 5 分钟）：请避免在繁忙的生产数据库上使用。",
     "Snowflake: the search runs on the warehouse and uses credits.": "Snowflake：搜索在仓库上运行，会消耗积分。"
+  },
+  "views": {
+    "New View…": "新建视图…",
+    "Edit View…": "编辑视图…",
+    "New View": "新建视图",
+    "Edit View": "编辑视图",
+    "Query:": "查询：",
+    "Loading the view definition…": "正在加载视图定义…",
+    "Columns:": "列：",
+    "Optional, e.g. id, name": "可选，例如 id, name",
+    "Options:": "选项：",
+    "The SELECT query is required": "SELECT 查询为必填项",
+    "View “{name}” saved": "视图“{name}”已保存",
+    "View “{name}” created": "视图“{name}”已创建",
+    "The definition of view “{name}” is not available": "视图“{name}”的定义不可用",
+    "The view definition request timed out": "视图定义请求超时"
   }
 }

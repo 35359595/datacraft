@@ -49,6 +49,10 @@ pub enum ExplorerAction {
     NewDatabase(ConnId),
     /// "New Table" dialog in a database (and schema, if one was chosen).
     NewTable { conn: ConnId, db: String, schema: Option<String> },
+    /// "New View" dialog in a database (and schema, if one was chosen).
+    NewView { conn: ConnId, db: String, schema: Option<String> },
+    /// "Edit View" dialog, with the view's definition read from the server.
+    EditView(TableRef),
     /// Confirm and drop a database.
     DropDatabase(ConnId, String),
     /// Confirm and drop a table or view.
@@ -268,6 +272,13 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
             {
                 let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
                 actions.push(ExplorerAction::NewTable { conn, db, schema });
+                ui.close();
+            }
+            if ui.add_enabled(connected && sql && sel_db.is_some(), egui::Button::new(tr("New View…"))).clicked()
+                && let (Some(conn), Some(db)) = (sel_conn, sel_db.clone())
+            {
+                let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
+                actions.push(ExplorerAction::NewView { conn, db, schema });
                 ui.close();
             }
         });
@@ -569,6 +580,10 @@ fn database_rows(
             actions.push(ExplorerAction::NewTable { conn: id, db: db_name.clone(), schema: None });
             ui.close();
         }
+        if sql && ui.add_enabled(connected, egui::Button::new(tr("New View…"))).clicked() {
+            actions.push(ExplorerAction::NewView { conn: id, db: db_name.clone(), schema: None });
+            ui.close();
+        }
         if multi_db && sql && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
             actions.push(ExplorerAction::NewDatabase(id));
             ui.close();
@@ -672,6 +687,10 @@ fn schema_rows(
             actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
             ui.close();
         }
+        if ui.button(tr("New View…")).clicked() {
+            actions.push(ExplorerAction::NewView { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+            ui.close();
+        }
         if ui.button(tr("Copy Name")).clicked() {
             ui.ctx().copy_text(s.name.clone());
             ui.close();
@@ -755,6 +774,13 @@ fn object_groups(
             row.resp.context_menu(|ui| {
                 if ui.button(tr("New Table…")).clicked() {
                     actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+                    ui.close();
+                }
+            });
+        } else if sql {
+            row.resp.context_menu(|ui| {
+                if ui.button(tr("New View…")).clicked() {
+                    actions.push(ExplorerAction::NewView { conn, db: db.to_string(), schema: Some(s.name.clone()) });
                     ui.close();
                 }
             });
@@ -842,8 +868,16 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             ui.close();
         }
         ui.separator();
+        if t.kind == ObjectKind::View && ui.button(tr("Edit View…")).clicked() {
+            actions.push(ExplorerAction::EditView(tref.clone()));
+            ui.close();
+        }
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
+            ui.close();
+        }
+        if ui.button(tr("New View…")).clicked() {
+            actions.push(ExplorerAction::NewView { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
             ui.close();
         }
         if ui.button(tr("Copy Table To…")).clicked() {

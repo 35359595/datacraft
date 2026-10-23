@@ -458,6 +458,8 @@ impl ObjectBrowser {
         let connected = connection.is_some_and(|c| c.status == ConnStatus::Connected);
         let writable = connected && connection.is_some_and(|c| !c.cfg.read_only);
         let copyable = connection.is_some_and(|c| c.cfg.driver != crate::db::Driver::Redis);
+        // New / Edit View: SQL engines only.
+        let views = writable && connection.is_some_and(|c| !c.cfg.driver.is_nosql());
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
         }
@@ -859,13 +861,13 @@ impl ObjectBrowser {
             .map(|(item, r)| (item.key.clone(), r.rect.intersect(background)))
             .collect();
         for (item, response) in responses {
-            self.item_response(response, item, &keys, org_index, writable, copyable, &mut actions);
+            self.item_response(response, item, &keys, org_index, (writable, views, copyable), &mut actions);
         }
         if items.is_empty() {
             ui.label(RichText::new(tr("No matching objects")).color(p.muted));
         }
         if !over_object || self.marquee.is_some() {
-            self.background_menu(ui, background, &scope, &rects, &mut actions);
+            self.background_menu(ui, background, &scope, &rects, views, &mut actions);
         }
         if let Some(payload) = egui::DragAndDrop::payload::<ObjectDrag>(ui.ctx())
             && let Some(position) = pointer
@@ -893,8 +895,7 @@ impl ObjectBrowser {
         item: &Item<'_>,
         keys: &[ItemKey],
         org_index: usize,
-        writable: bool,
-        copyable: bool,
+        (writable, views, copyable): (bool, bool, bool),
         actions: &mut Vec<BrowserAction>,
     ) {
         let mods = response.ctx.input(|i| i.modifiers);
@@ -981,6 +982,13 @@ impl ObjectBrowser {
                     }
                     ui.close();
                 }
+                let view = self.selection.len() == 1 && item.table.is_some_and(|t| t.kind == ObjectKind::View);
+                if views && view && ui.button(tr("Edit View…")).clicked() {
+                    if let Some(table) = tables.first() {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::EditView(table.clone())));
+                    }
+                    ui.close();
+                }
                 if copyable && ui.add_enabled(tables.len() == 1, egui::Button::new(tr("Copy Table To…"))).clicked() {
                     if let Some(table) = tables.first() {
                         actions.push(BrowserAction::Explorer(ExplorerAction::CopyTable(table.clone())));
@@ -1011,6 +1019,7 @@ impl ObjectBrowser {
         rect: Rect,
         scope: &ObjectScope,
         rects: &[(ItemKey, Rect)],
+        views: bool,
         actions: &mut Vec<BrowserAction>,
     ) {
         let response = ui.interact(
@@ -1063,6 +1072,14 @@ impl ObjectBrowser {
             }
             if ui.button(tr("New group…")).clicked() {
                 self.new_group_dialog(None, Vec::new());
+                ui.close();
+            }
+            if views && ui.button(tr("New View…")).clicked() {
+                actions.push(BrowserAction::Explorer(ExplorerAction::NewView {
+                    conn: scope.conn,
+                    db: scope.db.clone(),
+                    schema: scope.schema.clone(),
+                }));
                 ui.close();
             }
             if ui.button(tr("Refresh objects")).clicked() {

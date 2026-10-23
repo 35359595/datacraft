@@ -637,5 +637,21 @@
     "Search time limit reached (5 minutes)": "検索の制限時間 (5 分) に達しました",
     "Each table is read in full on the server (15 s per table, 5 minutes in all): avoid busy production databases.": "各テーブルはサーバー上で全件読み取られます (テーブルごとに 15 秒、合計 5 分)。負荷の高い本番データベースでは使用を避けてください。",
     "Snowflake: the search runs on the warehouse and uses credits.": "Snowflake: 検索はウェアハウス上で実行され、クレジットを消費します。"
+  },
+  "views": {
+    "New View…": "新規ビュー…",
+    "Edit View…": "ビューを編集…",
+    "New View": "新規ビュー",
+    "Edit View": "ビューを編集",
+    "Query:": "クエリ:",
+    "Loading the view definition…": "ビューの定義を読み込み中…",
+    "Columns:": "列:",
+    "Optional, e.g. id, name": "任意、例: id, name",
+    "Options:": "オプション:",
+    "The SELECT query is required": "SELECT クエリは必須です",
+    "View “{name}” saved": "ビュー「{name}」を保存しました",
+    "View “{name}” created": "ビュー「{name}」を作成しました",
+    "The definition of view “{name}” is not available": "ビュー「{name}」の定義は利用できません",
+    "The view definition request timed out": "ビュー定義の取得がタイムアウトしました"
   }
 }

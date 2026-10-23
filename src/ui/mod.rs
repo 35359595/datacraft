@@ -15,6 +15,7 @@ pub mod object_organization;
 pub mod results;
 pub mod schema_search;
 pub mod theme;
+pub mod view_dialog;
 
 use crate::db::Driver;
 
