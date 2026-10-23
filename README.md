@@ -27,7 +27,6 @@ Shortcuts are written with ⌘ / ⌥ (macOS); on Windows use Ctrl / Alt.
 - **Languages:** English and Spanish; follows the system language and can be changed in Settings.
 - **Passwords:** stored in the macOS Keychain or the Windows Credential Manager, never in the connections file.
 
-![About DataCraft](docs/screenshots/about.png)
 
 ## Download
 
