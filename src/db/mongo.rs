@@ -111,7 +111,8 @@ impl MongoSession {
         let specs: Vec<_> = db.list_collections().await.map_err(|e| self.fail(e))?.try_collect().await.map_err(|e| self.fail(e))?;
         let mut tables = Vec::new();
         for (i, spec) in specs.into_iter().filter(|s| !s.name.starts_with("system.")).enumerate() {
-            let mut fields: Vec<(String, String)> = vec![("_id".into(), "objectId".into())];
+            // `_id` first; its type comes from the sample like the others.
+            let mut fields: Vec<(String, String)> = vec![("_id".into(), "null".into())];
             if i < SAMPLED_COLLECTIONS {
                 let docs: Vec<Document> = db
                     .collection::<Document>(&spec.name)
@@ -131,6 +132,9 @@ impl MongoSession {
                         }
                     }
                 }
+            }
+            if fields[0].1 == "null" {
+                fields[0].1 = "objectId".into();
             }
             let kind = if matches!(spec.collection_type, CollectionType::View) { ObjectKind::View } else { ObjectKind::Table };
             let columns = fields
