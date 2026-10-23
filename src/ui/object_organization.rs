@@ -2,6 +2,7 @@
 use crate::i18n::tr;
 use egui::{Color32, RichText, Ui};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -9,6 +10,7 @@ pub struct Organization {
     pub conn: u64,
     pub db: String,
     pub groups: Vec<String>,
+    group_colors: BTreeMap<String, [u8; 3]>,
     objects: Vec<ObjectStyle>,
 }
 
@@ -51,6 +53,12 @@ impl Organization {
 
     pub fn group(&self, schema: &str, table: &str) -> Option<&str> {
         self.style(schema, table).and_then(|o| o.group.as_deref())
+    }
+
+    pub fn group_color(&self, name: &str) -> Option<Color32> {
+        self.group_colors
+            .get(name)
+            .map(|&[r, g, b]| Color32::from_rgb(r, g, b))
     }
 
     pub fn assign(
@@ -97,11 +105,15 @@ impl Organization {
                 style.group = Some(name.into());
             }
         }
+        if let Some(color) = self.group_colors.remove(old) {
+            self.group_colors.insert(name.into(), color);
+        }
         true
     }
 
     pub fn remove(&mut self, name: &str) {
         self.groups.retain(|g| g != name);
+        self.group_colors.remove(name);
         for style in &mut self.objects {
             if style.group.as_deref() == Some(name) {
                 style.group = None;
@@ -109,7 +121,12 @@ impl Organization {
         }
     }
 
-    pub fn menu(&mut self, ui: &mut Ui, tables: &[crate::ui::explorer::TableRef]) -> bool {
+    pub fn menu(
+        &mut self,
+        ui: &mut Ui,
+        tables: &[crate::ui::explorer::TableRef],
+        groups: &[String],
+    ) -> bool {
         let mut create = false;
         ui.menu_button(tr("Add to group…"), |ui| {
             if ui.button(tr("Ungrouped")).clicked() {
@@ -132,36 +149,60 @@ impl Organization {
                 self.assign(tables, Some(&group));
             }
         });
-        ui.menu_button(tr("Color"), |ui| {
-            if ui.button(tr("Default")).clicked() {
-                for table in tables {
-                    self.style_mut(&table.schema, &table.table).color = None;
-                }
-                ui.close();
-            }
-            for (name, color) in [
-                (tr("Red"), [210, 85, 90]),
-                (tr("Orange"), [201, 133, 45]),
-                (tr("Green"), [65, 163, 112]),
-                (tr("Blue"), [81, 143, 221]),
-                (tr("Purple"), [161, 116, 212]),
-                (tr("Pink"), [204, 110, 165]),
-            ] {
-                if ui
-                    .button(
-                        RichText::new(name).color(Color32::from_rgb(color[0], color[1], color[2])),
-                    )
-                    .clicked()
-                {
-                    for table in tables {
-                        self.style_mut(&table.schema, &table.table).color = Some(color);
-                    }
-                    ui.close();
-                }
-            }
-        });
+        self.color_menu(ui, tables, groups);
         create
     }
+
+    pub fn color_menu(
+        &mut self,
+        ui: &mut Ui,
+        tables: &[crate::ui::explorer::TableRef],
+        groups: &[String],
+    ) {
+        if let Some(color) = color_menu(ui) {
+            for table in tables {
+                self.style_mut(&table.schema, &table.table).color = color;
+            }
+            for group in groups.iter().filter(|g| self.groups.contains(g)) {
+                match color {
+                    Some(color) => {
+                        self.group_colors.insert(group.clone(), color);
+                    }
+                    None => {
+                        self.group_colors.remove(group);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Outer None means no action; Some(None) resets the selected objects to their default.
+fn color_menu(ui: &mut Ui) -> Option<Option<[u8; 3]>> {
+    let mut chosen = None;
+    ui.menu_button(tr("Color"), |ui| {
+        if ui.button(tr("Default")).clicked() {
+            chosen = Some(None);
+            ui.close();
+        }
+        for (name, color) in [
+            (tr("Red"), [210, 85, 90]),
+            (tr("Orange"), [201, 133, 45]),
+            (tr("Green"), [65, 163, 112]),
+            (tr("Blue"), [81, 143, 221]),
+            (tr("Purple"), [161, 116, 212]),
+            (tr("Pink"), [204, 110, 165]),
+        ] {
+            if ui
+                .button(RichText::new(name).color(Color32::from_rgb(color[0], color[1], color[2])))
+                .clicked()
+            {
+                chosen = Some(Some(color));
+                ui.close();
+            }
+        }
+    });
+    chosen
 }
 
 #[cfg(test)]
@@ -179,13 +220,20 @@ mod tests {
         let style = org.style_mut("public", "orders");
         style.group = Some("Sales".into());
         style.color = Some([81, 143, 221]);
+        org.group_colors.insert("Sales".into(), [161, 116, 212]);
         org.rename("Sales", "Orders");
         let mut org: Organization =
             serde_json::from_str(&serde_json::to_string(&org).unwrap()).unwrap();
         assert_eq!(org.group("public", "orders"), Some("Orders"));
+        assert_eq!(
+            org.group_color("Orders"),
+            Some(Color32::from_rgb(161, 116, 212))
+        );
+        assert!(org.group_color("Sales").is_none());
         assert!(org.group("archive", "orders").is_none());
         assert!(org.color("public", "orders").is_some());
         org.remove("Orders");
+        assert!(org.group_color("Orders").is_none());
         assert!(org.group("public", "orders").is_none());
         assert!(org.color("public", "orders").is_some());
     }

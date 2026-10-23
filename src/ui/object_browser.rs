@@ -288,6 +288,16 @@ impl ObjectBrowser {
             .collect()
     }
 
+    fn selected_groups(&self) -> Vec<String> {
+        self.selection
+            .iter()
+            .filter_map(|key| match key {
+                ItemKey::Group(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn select_item(
         &mut self,
         key: &ItemKey,
@@ -463,7 +473,10 @@ impl ObjectBrowser {
                 {
                     self.enter_group(None);
                 }
-                ui.label(RichText::new(group).font(theme::bold(16.0)));
+                let color = self.organizations[org_index]
+                    .group_color(&group)
+                    .unwrap_or(p.text);
+                ui.label(RichText::new(group).font(theme::bold(16.0)).color(color));
             } else {
                 let title = match scope.kind {
                     Some(ObjectKind::Table) => tr("Tables"),
@@ -913,6 +926,10 @@ impl ObjectBrowser {
         }
         response.context_menu(|ui| match &item.key {
             ItemKey::Group(name) => {
+                let groups = self.selected_groups();
+                let tables = self.selected_tables();
+                self.organizations[org_index].color_menu(ui, &tables, &groups);
+                ui.separator();
                 if ui.button(tr("Open group")).clicked() {
                     self.enter_group(Some(name.clone()));
                     ui.close();
@@ -929,7 +946,8 @@ impl ObjectBrowser {
             }
             ItemKey::Table(_) => {
                 let tables = self.selected_tables();
-                if self.organizations[org_index].menu(ui, &tables) {
+                let groups = self.selected_groups();
+                if self.organizations[org_index].menu(ui, &tables, &groups) {
                     self.new_group_dialog(None, tables.clone());
                 }
                 ui.separator();
@@ -1190,7 +1208,7 @@ fn format_bytes(bytes: u64) -> String {
 fn item_color(item: &Item<'_>, organization: &Organization) -> Option<egui::Color32> {
     match &item.key {
         ItemKey::Table(t) => organization.color(&t.schema, &t.table),
-        _ => None,
+        ItemKey::Group(name) => organization.group_color(name),
     }
 }
 
@@ -1510,13 +1528,22 @@ mod tests {
         );
     }
 
+    fn color_item(h: &mut egui_kittest::Harness<'_, State>, label: &str, color: &str) {
+        h.get_all_by_label(label).last().unwrap().click_secondary();
+        h.run_steps(3);
+        h.get_by_label("Color ⏵").click();
+        h.run_steps(2);
+        h.get_by_label(color).click();
+        h.run_steps(3);
+    }
+
     fn drag_selected_to_group(
         h: &mut egui_kittest::Harness<'_, State>,
         source: &str,
         group: &str,
         render: bool,
     ) {
-        let source = h.get_by_label(source).rect().center();
+        let source = h.get_all_by_label(source).last().unwrap().rect().center();
         let target = h.get_by_label(group).rect().center();
         h.event(egui::Event::PointerMoved(source));
         h.run_steps(2);
@@ -1619,6 +1646,68 @@ mod tests {
     }
 
     #[test]
+    fn groups_expose_the_same_color_menu_as_tables() {
+        for layout in [ObjectLayout::List, ObjectLayout::Grid] {
+            let mut h = harness(layout, true);
+            create_group(&mut h, "Sales");
+            h.get_by_label("Sales").click_secondary();
+            h.run_steps(3);
+            assert!(h.query_by_label("Color ⏵").is_some());
+            h.get_by_label("Color ⏵").click();
+            h.run_steps(2);
+            h.get_by_label("Red").click();
+            h.run_steps(3);
+            assert_eq!(
+                h.state().browser.organizations[0].group_color("Sales"),
+                Some(egui::Color32::from_rgb(210, 85, 90))
+            );
+            let saved = serde_json::to_string(&h.state().browser.organizations[0]).unwrap();
+            let restored: Organization = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                restored.group_color("Sales"),
+                Some(egui::Color32::from_rgb(210, 85, 90))
+            );
+            h.get_by_label("customers")
+                .click_modifiers(egui::Modifiers::COMMAND);
+            h.run_steps(2);
+            h.get_all_by_label("customers")
+                .last()
+                .unwrap()
+                .click_secondary();
+            h.run_steps(2);
+            h.get_by_label("Color ⏵").click();
+            h.run_steps(2);
+            h.get_by_label("Green").click();
+            h.run_steps(3);
+            let green = Some(egui::Color32::from_rgb(65, 163, 112));
+            assert_eq!(
+                h.state().browser.organizations[0].group_color("Sales"),
+                green
+            );
+            assert_eq!(
+                h.state().browser.organizations[0].color("public", "customers"),
+                green
+            );
+            h.get_by_label("Sales").click_secondary();
+            h.run_steps(2);
+            h.get_by_label("Color ⏵").click();
+            h.run_steps(2);
+            h.get_by_label("Default").click();
+            h.run_steps(3);
+            assert!(
+                h.state().browser.organizations[0]
+                    .group_color("Sales")
+                    .is_none()
+            );
+            assert!(
+                h.state().browser.organizations[0]
+                    .color("public", "customers")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn truncate_is_available_only_for_one_writable_table_and_uses_the_existing_action() {
         let mut h = harness(ObjectLayout::Grid, true);
         h.get_by_label("customers").click_secondary();
@@ -1674,19 +1763,13 @@ mod tests {
     fn render_group_drag() {
         let mut h = harness(ObjectLayout::Grid, true);
         create_group(&mut h, "Sales");
-        h.get_by_label("customers").click();
+        color_item(&mut h, "Sales", "Purple");
+        color_item(&mut h, "customers", "Blue");
+        color_item(&mut h, "orders", "Green");
+        h.get_all_by_label("customers").last().unwrap().click();
         h.run_steps(2);
         h.get_by_label("orders")
             .click_modifiers(egui::Modifiers::COMMAND);
-        h.run_steps(2);
-        h.get_all_by_label("orders")
-            .last()
-            .unwrap()
-            .click_secondary();
-        h.run_steps(2);
-        h.get_by_label("Color ⏵").click();
-        h.run_steps(2);
-        h.get_by_label("Blue").click();
         h.run_steps(2);
         drag_selected_to_group(&mut h, "customers", "Sales", true);
         h.get_by_label("Sales").click();
@@ -1753,12 +1836,34 @@ mod tests {
                 }
             }
             h.run_steps(3);
-            h.get_by_label("table_01").click();
+            for (label, color) in [
+                ("Sales", "Purple"),
+                ("Archive", "Orange"),
+                ("table_01", "Red"),
+                ("table_02", "Green"),
+                ("table_03", "Blue"),
+                ("table_04", "Pink"),
+            ] {
+                color_item(&mut h, label, color);
+            }
+            h.get_all_by_label("table_05").last().unwrap().click();
             h.run_steps(3);
             h.render()
                 .unwrap()
                 .save(directory.join(format!("{name}.png")))
                 .unwrap();
+            if layout == ObjectLayout::Grid {
+                h.set_size(vec2(1180.0, 720.0));
+                h.run_steps(3);
+                h.get_by_label("Sales").click_secondary();
+                h.run_steps(3);
+                h.get_by_label("Color ⏵").click();
+                h.run_steps(3);
+                h.render()
+                    .unwrap()
+                    .save(directory.join("group-color-menu.png"))
+                    .unwrap();
+            }
         }
     }
 }

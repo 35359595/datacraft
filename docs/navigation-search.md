@@ -51,6 +51,10 @@ a folder, drop onto **All objects**, or choose **Add to group… → Ungrouped**
 move tables out. A folder's context menu offers rename and delete. Deleting a
 folder removes only its grouping and retains object colors.
 
+**Color** is available on both folders and tables and applies to the full
+selection, including mixed selections. Folder colors also appear in the folder
+heading, survive renaming and app restarts, and can be cleared with **Default**.
+
 Groups and colors are saved in application preferences per connection/database,
 with separate entries for objects of the same name in different schemas. They
 do not create schemas, rename tables, or write organizational metadata to the
