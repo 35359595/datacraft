@@ -17,6 +17,12 @@ pub type ConnId = u64;
 pub type ConsoleId = u64;
 
 pub enum Request {
+    SchemaSearch {
+        conn: ConnId,
+        request_id: u64,
+        request: crate::db::schema_search::SearchRequest,
+        cancel: Arc<tokio::sync::Notify>,
+    },
     /// Opens (or reopens) the connection, lists its databases and loads the default database's schema.
     Connect(ConnectionConfig),
     /// Only tests the connection and closes it.
@@ -70,6 +76,7 @@ pub enum Request {
 }
 
 pub enum Response {
+    SchemaSearch { request_id: u64, result: Result<crate::db::schema_search::SearchReport, String> },
     /// `databases` in order; the default one has `current = true` and its schema loaded.
     Connected { conn: ConnId, databases: Vec<DatabaseInfo> },
     ConnectFailed { conn: ConnId, error: String },
@@ -321,6 +328,14 @@ async fn fetch_object_info(
 
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
+        Request::SchemaSearch { conn, request_id, request, cancel } => {
+            let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
+            let result = match cfg {
+                Some(cfg) => crate::db::schema_search::search(cfg, request, cancel).await.map_err(|e| format!("{e:#}")),
+                None => Err(tr("The connection is not open").into()),
+            };
+            vec![Response::SchemaSearch { request_id, result }]
+        }
         Request::Connect(cfg) => {
             let conn = cfg.id;
             match connect_and_load(&cfg).await {

@@ -5,6 +5,7 @@ use crate::db::{ObjectKind, TableInfo, object_info::ObjectInfo};
 use crate::i18n::tr;
 use crate::ui::explorer::{ExplorerAction, TableRef};
 use crate::ui::icons::{self, Ico};
+use crate::ui::object_organization::{GroupFilter, Organization};
 use crate::ui::theme::{self, pal};
 use egui::{FontId, Key, Rect, RichText, Sense, Ui, pos2, vec2};
 use egui_extras::{Column, TableBuilder};
@@ -27,6 +28,9 @@ pub enum ObjectLayout {
 
 #[derive(Default)]
 pub struct ObjectBrowser {
+    pub schema_search: crate::ui::schema_search::SchemaSearch,
+    pub organizations: Vec<Organization>,
+    group_filter: GroupFilter,
     pub active: bool,
     pub scope: Option<ObjectScope>,
     pub selected: Option<TableRef>,
@@ -43,6 +47,7 @@ pub struct ObjectBrowser {
 }
 
 pub enum BrowserAction {
+    Search(Box<crate::worker::Request>),
     Explorer(ExplorerAction),
     Inspect { table: TableRef, count_rows: bool },
 }
@@ -56,6 +61,7 @@ impl ObjectBrowser {
     pub fn open(&mut self, scope: ObjectScope) -> bool {
         let changed = self.scope.as_ref() != Some(&scope);
         if changed {
+            self.group_filter = GroupFilter::All;
             self.selected = None;
             self.info = None;
             self.loading = false;
@@ -144,6 +150,12 @@ impl ObjectBrowser {
                     .iter()
                     .filter(|t| scope.kind.is_none_or(|kind| kind == t.kind))
                     .filter(|t| {
+                        self.organizations
+                            .iter()
+                            .find(|o| o.conn == scope.conn && o.db == scope.db)
+                            .is_none_or(|o| o.matches(&s.name, &t.name, &self.group_filter))
+                    })
+                    .filter(|t| {
                         search.is_empty()
                             || t.name.to_lowercase().contains(&search)
                             || s.name.to_lowercase().contains(&search)
@@ -172,7 +184,7 @@ impl ObjectBrowser {
 
     pub fn show(&mut self, ui: &mut Ui, connections: &[ConnState]) -> Vec<BrowserAction> {
         ui.set_min_size(ui.available_size());
-        let mut actions = Vec::new();
+        let mut actions = self.schema_search.show(ui.ctx(), connections);
         let Some(scope) = self.scope.clone() else {
             return actions;
         };
@@ -235,6 +247,24 @@ impl ObjectBrowser {
                 RichText::new(tr("Connect to load current object information")).color(p.muted),
             );
         }
+        let org_index = self
+            .organizations
+            .iter()
+            .position(|o| o.conn == scope.conn && o.db == scope.db)
+            .unwrap_or_else(|| {
+                let mut organization = Organization::default();
+                organization.conn = scope.conn;
+                organization.db.clone_from(&scope.db);
+                self.organizations.push(organization);
+                self.organizations.len() - 1
+            });
+        egui::Panel::left("object_folders")
+            .default_size(155.0)
+            .size_range(130.0..=260.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                self.organizations[org_index].folders(ui, &mut self.group_filter);
+            });
         let entries = self.entries(connections);
         if self
             .selected
@@ -264,6 +294,9 @@ impl ObjectBrowser {
         let grid_rows = ((ui.available_height() - 14.0) / (22.0 + ui.spacing().item_spacing.y))
             .floor()
             .max(1.0) as usize;
+        let background = ui.available_rect_before_wrap();
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let mut over_object = false;
 
         if entries.is_empty() {
             let loading = connections
@@ -279,6 +312,7 @@ impl ObjectBrowser {
                     ui.label(RichText::new(tr("No matching objects")).color(p.muted));
                 }
             });
+            self.background_menu(ui, background, &scope, &mut actions);
             return actions;
         }
         if ui.is_enabled()
@@ -324,6 +358,7 @@ impl ObjectBrowser {
                 }
             }
         }
+        let organization = &mut self.organizations[org_index];
         match self.layout {
             ObjectLayout::List => {
                 egui::ScrollArea::horizontal()
@@ -371,9 +406,8 @@ impl ObjectBrowser {
                                         entry.reference.schema.clone(),
                                         entry.reference.table.clone(),
                                     ));
-                                    row.set_selected(
-                                        self.selected.as_ref() == Some(&entry.reference),
-                                    );
+                                    let selected = self.selected.as_ref() == Some(&entry.reference);
+                                    row.set_selected(selected);
                                     row.col(|ui| {
                                         ui.horizontal(|ui| {
                                             let (rect, _) = ui.allocate_exact_size(
@@ -384,14 +418,29 @@ impl ObjectBrowser {
                                                 ui.painter(),
                                                 rect,
                                                 object_icon(entry.info.kind),
-                                                p.icon,
+                                                organization
+                                                    .color(
+                                                        &entry.reference.schema,
+                                                        &entry.reference.table,
+                                                    )
+                                                    .unwrap_or(p.icon),
                                                 &p,
                                                 true,
                                             );
                                             ui.add(
                                                 egui::Label::new(
-                                                    RichText::new(&entry.reference.table)
-                                                        .color(p.text),
+                                                    RichText::new(&entry.reference.table).color(
+                                                        if selected {
+                                                            p.text
+                                                        } else {
+                                                            organization
+                                                                .color(
+                                                                    &entry.reference.schema,
+                                                                    &entry.reference.table,
+                                                                )
+                                                                .unwrap_or(p.text)
+                                                        },
+                                                    ),
                                                 )
                                                 .truncate(),
                                             );
@@ -424,7 +473,10 @@ impl ObjectBrowser {
                                             );
                                         });
                                     }
-                                    object_response(row.response(), entry, &mut actions);
+                                    let response = row.response();
+                                    over_object |=
+                                        pointer.is_some_and(|p| response.rect.contains(p));
+                                    object_response(response, entry, organization, &mut actions);
                                 })
                             });
                     });
@@ -460,6 +512,7 @@ impl ObjectBrowser {
                                 ui.id().with(("object_cell", index)),
                                 Sense::click(),
                             );
+                            over_object |= pointer.is_some_and(|p| rect.contains(p));
                             response.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::SelectableLabel,
@@ -484,7 +537,9 @@ impl ObjectBrowser {
                                 ui.painter(),
                                 icon,
                                 object_icon(entry.info.kind),
-                                p.icon,
+                                organization
+                                    .color(&entry.reference.schema, &entry.reference.table)
+                                    .unwrap_or(p.icon),
                                 &p,
                                 true,
                             );
@@ -493,15 +548,51 @@ impl ObjectBrowser {
                                 egui::Align2::LEFT_CENTER,
                                 &entry.reference.table,
                                 FontId::proportional(12.0),
-                                p.text,
+                                if selected {
+                                    p.text
+                                } else {
+                                    organization
+                                        .color(&entry.reference.schema, &entry.reference.table)
+                                        .unwrap_or(p.text)
+                                },
                             );
-                            object_response(response, entry, &mut actions);
+                            object_response(response, entry, organization, &mut actions);
                         }
                     }
                 });
             }
         }
+        if !over_object {
+            self.background_menu(ui, background, &scope, &mut actions);
+        }
         actions
+    }
+
+    fn background_menu(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        scope: &ObjectScope,
+        actions: &mut Vec<BrowserAction>,
+    ) {
+        let response = ui.interact(rect, ui.id().with("object_background"), Sense::click());
+        response.context_menu(|ui| {
+            if ui.button(tr("Find in Schema…")).clicked() {
+                self.schema_search.open(scope);
+                ui.close();
+            }
+            if ui.button(tr("New group")).clicked() {
+                ui.memory_mut(|m| m.request_focus(egui::Id::new("new_object_group")));
+                ui.close();
+            }
+            if ui.button(tr("Refresh objects")).clicked() {
+                actions.push(BrowserAction::Explorer(ExplorerAction::LoadDatabase(
+                    scope.conn,
+                    scope.db.clone(),
+                )));
+                ui.close();
+            }
+        });
     }
 
     fn information(
@@ -644,7 +735,12 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn object_response(response: egui::Response, entry: &Entry<'_>, actions: &mut Vec<BrowserAction>) {
+fn object_response(
+    response: egui::Response,
+    entry: &Entry<'_>,
+    organization: &mut Organization,
+    actions: &mut Vec<BrowserAction>,
+) {
     let response = response.on_hover_text(format!(
         "{}.{}",
         entry.reference.schema, entry.reference.table
@@ -661,6 +757,8 @@ fn object_response(response: egui::Response, entry: &Entry<'_>, actions: &mut Ve
         )));
     }
     response.context_menu(|ui| {
+        organization.menu(ui, &entry.reference.schema, &entry.reference.table);
+        ui.separator();
         if ui.button(tr("Open data")).clicked() {
             actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(
                 entry.reference.clone(),
@@ -939,6 +1037,69 @@ mod tests {
     }
 
     #[test]
+    fn empty_space_menu_opens_schema_search_and_object_menu_keeps_organization_actions() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        let position = pos2(500.0, 500.0);
+        h.event(egui::Event::PointerMoved(position));
+        h.run_steps(2);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(2);
+        }
+        h.get_by_label("Find in Schema…").click();
+        h.run_steps(3);
+        assert!(h.state().browser.schema_search.open);
+        h.get_by_label("Close").click();
+        h.run_steps(3);
+        h.get_by_label("customers").click_secondary();
+        h.run_steps(3);
+        assert!(h.query_by_label("Move to group ⏵").is_some());
+        assert!(h.query_by_label("Color ⏵").is_some());
+        assert!(h.query_by_label("Open data").is_some());
+    }
+
+    #[test]
+    fn folders_filter_objects_and_context_menu_assigns_group_and_color() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        h.ctx
+            .memory_mut(|m| m.request_focus(egui::Id::new("new_object_group")));
+        h.input_mut().events.push(egui::Event::Text("Sales".into()));
+        h.run_steps(3);
+        h.get_by_label("New group").click();
+        h.run_steps(3);
+        assert_eq!(h.state().browser.organizations[0].groups, vec!["Sales"]);
+        assert!(h.query_by_label("customers").is_none());
+        h.get_by_label("All objects").click();
+        h.run_steps(3);
+        h.get_by_label("customers").click_secondary();
+        h.run_steps(3);
+        h.get_by_label("Move to group ⏵").click();
+        h.run_steps(3);
+        h.get_all_by_label("Sales").last().unwrap().click();
+        h.run_steps(3);
+        h.get_by_label("Sales").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("customers").is_some());
+        assert!(h.query_by_label("orders").is_none());
+        h.get_by_label("customers").click_secondary();
+        h.run_steps(3);
+        h.get_by_label("Color ⏵").click();
+        h.run_steps(3);
+        h.get_by_label("Blue").click();
+        h.run_steps(3);
+        assert!(
+            h.state().browser.organizations[0]
+                .color("public", "customers")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn grid_navigation_fills_down_then_moves_to_the_next_column() {
         assert_eq!(object_navigation(Some(0), Key::ArrowDown, 70, 30), 1);
         assert_eq!(object_navigation(Some(29), Key::ArrowDown, 70, 30), 29);
@@ -959,6 +1120,13 @@ mod tests {
             h.set_size(vec2(1800.0, 1000.0));
             {
                 let state = h.state_mut();
+                state.browser.organizations[0] = serde_json::from_value(serde_json::json!({
+                    "conn": 7, "db": "shop", "groups": ["Sales", "Archive"],
+                    "objects": [
+                        { "schema": "public", "table": "customers", "group": "Sales", "color": [81, 143, 221] },
+                        { "schema": "public", "table": "orders", "group": "Sales", "color": [65, 163, 112] }
+                    ]
+                })).unwrap();
                 let schema = &mut state.connections[0].databases[0].schemas.as_mut().unwrap()[0];
                 let columns = schema.tables[0].columns.clone();
                 for i in 1..=40 {

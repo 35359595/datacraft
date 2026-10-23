@@ -11,6 +11,7 @@ DataGrip-style database client for macOS and Windows (Islands theme), written in
   with role, database, schema and warehouse per data source.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
 - **Object browser:** click a database, schema, tables or views folder to browse its objects in a [list or grid](docs/object-browser.md), with a selection information pane on the right.
+- **Navigation and organization:** [find loaded cells or search all tables](docs/navigation-search.md), organize objects with local groups/colors, and close tabs in bulk. Keyboard navigation keeps the active cell visible in wide tables.
 Shortcuts are written with ⌘ / ⌥ (macOS); on Windows use Ctrl / Alt.
 
 - **SQL consoles:** highlighting, autocompletion, ⌘↩ (statement under the cursor or selection) and ⌘⇧↩ (everything; `GO` batches on SQL Server). Each console runs against the database you pick.
@@ -89,6 +90,7 @@ Cliente de bases de datos para macOS y Windows al estilo de DataGrip (tema Islan
   programático, con rol, base de datos, esquema y almacén por fuente de datos.
 - **Database Explorer:** todas las bases del servidor (se cargan al expandirlas), esquemas, tablas, vistas, columnas y claves primarias.
 - **Explorador de objetos:** haz clic en una base, esquema o carpeta de tablas/vistas para ver sus objetos en [lista o cuadrícula](docs/object-browser.md), con información de la selección a la derecha.
+- **Navegación y organización:** [busca en las celdas cargadas o en todas las tablas](docs/navigation-search.md), organiza objetos con grupos y colores locales y cierra pestañas en bloque. La navegación por teclado mantiene visible la celda activa en tablas anchas.
 Los atajos se indican con ⌘ / ⌥ (macOS); en Windows son Ctrl / Alt.
 
 - **Consolas SQL:** resaltado, autocompletado, ⌘↩ (sentencia bajo el cursor o selección) y ⌘⇧↩ (todo; lotes `GO` en SQL Server). Cada consola ejecuta en la base que elijas.

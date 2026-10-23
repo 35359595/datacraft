@@ -27,6 +27,8 @@ pub enum CloseResults {
     One(usize),
     /// All but this one.
     Others(usize),
+    Left(usize),
+    Right(usize),
     All,
 }
 
@@ -36,6 +38,8 @@ impl CloseResults {
         match self {
             CloseResults::One(i) => (i < n).then_some(i).into_iter().collect(),
             CloseResults::Others(i) => (0..n).filter(|&j| j != i).collect(),
+            CloseResults::Left(i) => (0..i.min(n)).collect(),
+            CloseResults::Right(i) => (i.saturating_add(1)..n).collect(),
             CloseResults::All => (0..n).collect(),
         }
     }
@@ -383,6 +387,10 @@ impl Console {
     /// Opens the find bar (with the selection as the search text if it is a single line).
     /// `replace` also shows the replace row. For the app's Find / Replace menu commands.
     pub fn open_find(&mut self, replace: bool) {
+        if self.table.is_some() {
+            if let Some(i) = self.edit_view_index() { self.results[i].open_find(); }
+            return;
+        }
         let selected = self.selection().filter(|s| !s.contains('\n')).map(str::to_string);
         let prev = self.find.take();
         let (query, repl, case_sensitive, shown) = match prev {
@@ -1216,6 +1224,12 @@ impl Console {
                                     if ui.add_enabled(!busy && n > 1, egui::Button::new(tr("Close others"))).clicked() {
                                         close = Some(CloseResults::Others(i));
                                         ui.close();
+                                    }
+                                    for (label, which, enabled) in [
+                                        (tr("Close to the left"), CloseResults::Left(i), i > 0),
+                                        (tr("Close to the right"), CloseResults::Right(i), i + 1 < n),
+                                    ] {
+                                        if ui.add_enabled(!busy && enabled, egui::Button::new(label)).clicked() { close = Some(which); ui.close(); }
                                     }
                                     if ui.add_enabled(!busy, egui::Button::new(tr("Close all"))).clicked() {
                                         close = Some(CloseResults::All);
@@ -2287,6 +2301,9 @@ mod tests {
         assert_eq!(CloseResults::One(1).indices(3), vec![1]);
         assert!(CloseResults::One(5).indices(3).is_empty());
         assert_eq!(CloseResults::Others(1).indices(3), vec![0, 2]);
+        assert_eq!(CloseResults::Left(2).indices(4), vec![0, 1]);
+        assert_eq!(CloseResults::Right(1).indices(4), vec![2, 3]);
+        assert!(CloseResults::Right(usize::MAX).indices(4).is_empty());
         assert_eq!(CloseResults::All.indices(2), vec![0, 1]);
     }
 

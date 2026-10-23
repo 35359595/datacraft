@@ -162,6 +162,7 @@ impl ConnState {
 enum Discard {
     Close(u64),
     CloseAll,
+    CloseTabs(u64, CloseResults),
     Reload(u64),
     Run(u64, bool),
     /// Close a console's result tabs.
@@ -202,6 +203,7 @@ struct PersistedConsole {
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Persisted {
+    object_organizations: Vec<crate::ui::object_organization::Organization>,
     /// Islands Dark theme (Islands Light by default). Replaces the old `dark` (Darcula).
     islands_dark: bool,
     font_size: f32,
@@ -220,6 +222,7 @@ struct Persisted {
 impl Default for Persisted {
     fn default() -> Self {
         Self {
+            object_organizations: Vec::new(),
             islands_dark: false,
             font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000,
@@ -319,7 +322,11 @@ impl DataCraftApp {
             console_counter: persisted.console_counter,
             result_salt: 0,
             explorer: ExplorerState::default(),
-            object_browser: crate::ui::object_browser::ObjectBrowser::default(),
+            object_browser: {
+                let mut browser = crate::ui::object_browser::ObjectBrowser::default();
+                browser.organizations = persisted.object_organizations;
+                browser
+            },
             dialog: None,
             confirm_delete: None,
             create: None,
@@ -695,6 +702,7 @@ impl DataCraftApp {
                 }
                 Response::ObjectInfo { conn, request_id, result } => self.object_browser.receive(conn, request_id, result.map(|info| *info)),
                 Response::ObjectCatalog { conn, request_id, result } => self.object_browser.receive_catalog(conn, request_id, result),
+                Response::SchemaSearch { request_id, result } => self.object_browser.schema_search.receive(request_id, result),
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
             }
@@ -970,6 +978,7 @@ impl DataCraftApp {
     /// true if the action can go ahead now; with unsaved changes, asks for confirmation.
     fn guard(&mut self, action: Discard) -> bool {
         let dirty = match action {
+            Discard::CloseTabs(id, which) => self.tab_close_indices(id, which).iter().any(|&i| self.consoles[i].has_pending_edits()),
             Discard::CloseAll => self.consoles.iter().any(|c| c.has_pending_edits()),
             Discard::Close(id) | Discard::Reload(id) | Discard::Run(id, _) => {
                 self.consoles.iter().any(|c| c.id == id && c.has_pending_edits())
@@ -985,9 +994,12 @@ impl DataCraftApp {
     /// Runs a confirmed action, discarding the pending changes.
     fn discard_and_do(&mut self, action: Discard) {
         match action {
+            Discard::CloseTabs(id, which) => self.close_tabs_now(id, which),
             Discard::CloseAll => {
                 self.consoles.clear();
                 self.active = 0;
+                self.object_browser.scope = None;
+                self.object_browser.active = false;
             }
             Discard::Close(id) => {
                 if let Some(i) = self.consoles.iter().position(|c| c.id == id) {
@@ -1560,6 +1572,7 @@ impl DataCraftApp {
     fn delete_connection(&mut self, id: ConnId) {
         self.worker.send(Request::Disconnect(id));
         self.conns.retain(|c| c.cfg.id != id);
+        self.object_browser.organizations.retain(|o| o.conn != id);
         config::delete_secrets(id);
         for c in self.consoles.iter_mut().filter(|c| c.conn == Some(id)) {
             c.conn = None;
@@ -1615,6 +1628,28 @@ impl DataCraftApp {
             && self.guard(Discard::Close(id))
         {
             self.close_console_now(idx);
+        }
+    }
+
+    fn tab_close_indices(&self, id: u64, which: CloseResults) -> Vec<usize> {
+        // Console IDs start at 1; 0 identifies the leading Objects tab.
+        if id == 0 { return (0..self.consoles.len()).collect(); }
+        let Some(i) = self.consoles.iter().position(|c| c.id == id) else { return Vec::new() };
+        match which {
+            CloseResults::One(_) => CloseResults::One(i),
+            CloseResults::Others(_) => CloseResults::Others(i),
+            CloseResults::Left(_) => CloseResults::Left(i),
+            CloseResults::Right(_) => CloseResults::Right(i),
+            CloseResults::All => CloseResults::All,
+        }.indices(self.consoles.len())
+    }
+
+    fn close_tabs_now(&mut self, id: u64, which: CloseResults) {
+        for i in self.tab_close_indices(id, which).into_iter().rev() { self.close_console_now(i); }
+        if id == 0 { self.object_browser.active = true; }
+        else if matches!(which, CloseResults::Others(_) | CloseResults::Left(_) | CloseResults::All) {
+            self.object_browser.scope = None;
+            self.object_browser.active = false;
         }
     }
 
@@ -1706,7 +1741,7 @@ impl DataCraftApp {
 
     /// A modal dialog is open: shortcuts and run commands are ignored.
     fn modal_open(&self) -> bool {
-        self.dialog.is_some()
+        self.object_browser.schema_search.open || self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.create.is_some()
             || self.drop.is_some()
@@ -1750,13 +1785,13 @@ impl DataCraftApp {
                 M::NewConsole if !modal => self.new_console_here(),
                 M::OpenSql if !modal => self.open_sql_file(),
                 M::SaveSqlAs if !modal && !self.object_browser.active => self.save_console_as(),
-                M::CloseTab if !modal && self.object_browser.active => self.object_browser.active = false,
+                M::CloseTab if !modal && self.object_browser.active => { self.object_browser.active = false; self.object_browser.scope = None; }
                 M::CloseTab if !modal && !self.consoles.is_empty() => self.close_console(self.active),
                 // In a console: find in the editor; elsewhere: filter the explorer.
-                M::Find => {
+                M::Find if !modal => {
                     if self.object_browser.active {
                         ctx.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
-                    } else if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                    } else if let Some(c) = self.consoles.get_mut(self.active) {
                         c.open_find(false);
                     } else {
                         self.show_explorer = true;
@@ -2228,6 +2263,8 @@ impl DataCraftApp {
         let mut start_rename = None;
         let mut new = false;
         let mut close_all = false;
+        let mut close_tabs = None;
+        let mut close_objects = false;
         let w = ui.available_width();
         ui.allocate_ui_with_layout(vec2(w, 40.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_size(vec2(w, 40.0));
@@ -2240,6 +2277,14 @@ impl DataCraftApp {
                         if self.object_browser.scope.is_some() {
                             let (response, _) = theme::tab(ui, self.object_browser.active, Some(Ico::Folder), tr("Objects"), false);
                             if response.clicked() { self.object_browser.active = true; }
+                            response.context_menu(|ui| {
+                                if ui.button(tr("Close")).clicked() { close_objects = true; ui.close(); }
+                                for label in [tr("Close others"), tr("Close to the right")] {
+                                    if ui.add_enabled(!self.consoles.is_empty(), egui::Button::new(label)).clicked() { close_tabs = Some((0, CloseResults::All)); ui.close(); }
+                                }
+                                ui.add_enabled(false, egui::Button::new(tr("Close to the left")));
+                                if ui.button(tr("Close all")).clicked() { close_all = true; ui.close(); }
+                            });
                         }
                         for (i, c) in self.consoles.iter().enumerate() {
                             if let Some((id, name)) = self.renaming.as_mut()
@@ -2290,6 +2335,17 @@ impl DataCraftApp {
                                     close = Some(i);
                                     ui.close();
                                 }
+                                for (label, which, enabled) in [
+                                    (tr("Close others"), CloseResults::Others(i), self.consoles.len() > 1 || self.object_browser.scope.is_some()),
+                                    (tr("Close to the left"), CloseResults::Left(i), i > 0 || self.object_browser.scope.is_some()),
+                                    (tr("Close to the right"), CloseResults::Right(i), i + 1 < self.consoles.len()),
+                                    (tr("Close all"), CloseResults::All, true),
+                                ] {
+                                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                        close_tabs = Some((c.id, which));
+                                        ui.close();
+                                    }
+                                }
                             });
                         }
                     });
@@ -2335,9 +2391,10 @@ impl DataCraftApp {
             self.close_console(i);
         }
         if close_all && self.guard(Discard::CloseAll) {
-            self.consoles.clear();
-            self.active = 0;
+            self.discard_and_do(Discard::CloseAll);
         }
+        if let Some((id, which)) = close_tabs && self.guard(Discard::CloseTabs(id, which)) { self.close_tabs_now(id, which); }
+        if close_objects { self.object_browser.scope = None; self.object_browser.active = false; }
         if new {
             self.new_console_here();
         }
@@ -2355,6 +2412,7 @@ impl DataCraftApp {
             });
             for action in actions {
                 match action {
+                    crate::ui::object_browser::BrowserAction::Search(request) => self.worker.send(*request),
                     crate::ui::object_browser::BrowserAction::Explorer(action) => self.handle_explorer(ui.ctx(), vec![action]),
                     crate::ui::object_browser::BrowserAction::Inspect { table, count_rows } => self.inspect_object(table, count_rows),
                 }
@@ -2616,7 +2674,7 @@ impl DataCraftApp {
                 ui.label(RichText::new(tr("Unsaved changes")).font(theme::bold(15.0)));
                 ui.add_space(8.0);
                 ui.label(match action {
-                    Discard::Close(_) | Discard::CloseAll => tr("Closing the tab will discard the pending grid changes."),
+                    Discard::Close(_) | Discard::CloseAll | Discard::CloseTabs(..) => tr("Closing the tab will discard the pending grid changes."),
                     Discard::Reload(_) => tr("Reloading the data will discard the pending grid changes."),
                     Discard::CloseResults(..) => tr("Closing the result tab will discard the pending grid changes."),
                     Discard::Run(..) => tr("Running again will discard the pending grid changes."),
@@ -3094,6 +3152,7 @@ impl eframe::App for DataCraftApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let state = Persisted {
+            object_organizations: self.object_browser.organizations.clone(),
             islands_dark: self.dark,
             font_size: self.font_size,
             max_rows: self.max_rows,
@@ -3126,6 +3185,63 @@ impl eframe::App for DataCraftApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tabs_app() -> DataCraftApp {
+        DataCraftApp {
+            worker: Worker::start(egui::Context::default()), conns: Vec::new(),
+            consoles: (1..=4).map(|id| Console::new(id, format!("Query {id}"), String::new(), None)).collect(),
+            active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
+            explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
+            dialog: None, confirm_delete: None, create: None, drop: None, import: None, renaming: None,
+            show_about: false, show_settings: false, native_menu: None, show_explorer: true,
+            show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
+            max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,
+            zoom: 1.0, applied_zoom: None, preview: None, confirm_discard: None,
+            demo_explorer_w: None, demo_window: None, lang: None,
+        }
+    }
+
+    #[test]
+    fn bulk_tab_closing_preserves_pending_edits_until_confirmed_and_keeps_active_tab() {
+        use crate::db::ResultSet;
+        use crate::ui::editing::{EditTarget, RowRef};
+        let mut app = tabs_app();
+        let mut view = ResultView::new(ResultSet { columns: vec!["note".into()], rows: vec![vec![Some("before".into())]], ..Default::default() }, 1);
+        view.set_edit_target(Ok(EditTarget { schema: "main".into(), table: "notes".into(), col_names: vec!["note".into()], key_cols: vec![0], binary_cols: vec![false], has_pk: false }));
+        view.edit.as_mut().unwrap().state.set_value(&view.rs, RowRef::Existing(0), 0, Some("after".into()));
+        app.consoles[3].results.push(view);
+        let action = Discard::CloseTabs(2, CloseResults::Right(1));
+        assert!(!app.guard(action));
+        assert_eq!(app.consoles.len(), 4);
+        assert_eq!(app.confirm_discard, Some(action));
+        app.confirm_discard = None;
+        assert!(app.consoles[3].has_pending_edits());
+        app.discard_and_do(action);
+        assert_eq!(app.consoles.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(app.consoles[app.active].id, 2);
+        app.close_tabs_now(2, CloseResults::Left(99));
+        assert_eq!(app.consoles[0].id, 2);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders the real editor tab context menu"]
+    fn render_tab_menu() {
+        use egui_kittest::kittest::Queryable;
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(820.0, 300.0)).build_ui_state(
+            move |ui, app: &mut DataCraftApp| {
+                if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); theme::apply(ui.ctx(), true); return; }
+                app.editor_tabs(ui);
+            }, tabs_app());
+        h.run_steps(3);
+        h.get_by_label("Query 2").click_secondary();
+        h.run_steps(3);
+        assert!(h.query_by_label("Close to the right").is_some());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render().unwrap().save(dir.join("tab-menu.png")).unwrap();
+    }
 
     #[test]
     fn zoom_steps() {

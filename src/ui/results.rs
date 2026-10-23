@@ -130,6 +130,9 @@ pub struct ResultView {
     selected_rows: BTreeSet<usize>,
     anchor: Option<usize>,
     scroll_to: Option<usize>,
+    find_open: bool,
+    find_query: String,
+    find_focus: bool,
     /// Salt for the table id (changes on every run to reset widths).
     salt: u64,
     /// Some if the result is editable.
@@ -143,6 +146,38 @@ pub struct ResultView {
 }
 
 impl ResultView {
+    pub fn open_find(&mut self) {
+        self.find_open = true;
+        self.find_focus = true;
+    }
+
+    fn find_matches(&self) -> Vec<(usize, usize)> {
+        if self.find_query.is_empty() { return Vec::new(); }
+        let query = self.find_query.to_lowercase();
+        (0..self.n_view_rows()).flat_map(|r| {
+            let query = &query;
+            (0..self.rs.columns.len()).filter_map(move |c| {
+                let row = self.row_ref(r)?;
+                self.display_value(row, c).flatten()
+                    .filter(|v| v.to_lowercase().contains(query)).map(|_| (r, c))
+            })
+        }).collect()
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        let matches = self.find_matches();
+        let next = if forward {
+            matches.iter().find(|&&cell| self.selected.is_none_or(|s| cell > s)).or(matches.first())
+        } else {
+            matches.iter().rev().find(|&&cell| self.selected.is_none_or(|s| cell < s)).or(matches.last())
+        }.copied();
+        if let Some((r, c)) = next {
+            self.commit_edit();
+            self.select_cell(r, c, Modifiers::NONE);
+            self.scroll_to = Some(r);
+        }
+    }
+
     pub fn new(rs: ResultSet, salt: u64) -> Self {
         let title = statement_title(&rs.statement);
         let order = (0..rs.rows.len()).collect();
@@ -161,6 +196,9 @@ impl ResultView {
             selected_rows: BTreeSet::new(),
             anchor: None,
             scroll_to: None,
+            find_open: false,
+            find_query: String::new(),
+            find_focus: false,
             salt,
             edit: None,
             record_view: None,
@@ -1020,12 +1058,48 @@ pub fn show_result(
     }
 
     let mut actions: Vec<GridAction> = Vec::new();
+    let previous_row = view.selected_row();
+    if ui.is_enabled() && !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+        view.open_find();
+    }
+    if view.find_open {
+        let mut step = None;
+        let mut restart = false;
+        ui.horizontal(|ui| {
+            let response = ui.add(egui::TextEdit::singleline(&mut view.find_query)
+                .id_salt(("grid_find", view.salt)).hint_text(tr("Find in loaded rows…")).desired_width(240.0));
+            if std::mem::take(&mut view.find_focus) { response.request_focus(); }
+            if response.changed() {
+                restart = true;
+                step = Some(true);
+            }
+            let enter = (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
+            if enter { response.request_focus(); }
+            if ui.button(tr("Previous")).clicked() { step = Some(false); }
+            if ui.button(tr("Next")).clicked() || enter { step = Some(!ui.input(|i| i.modifiers.shift)); }
+            let matches = view.find_matches().len();
+            ui.label(if matches == 1 { tr("1 match").into() } else { trf("{n} matches", &[("n", &matches)]) });
+            let escape = (response.has_focus() || response.lost_focus())
+                && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            if theme::icon_button(ui, Ico::Close, true, tr("Close (Esc)")).clicked()
+                || escape {
+                view.find_open = false;
+                response.surrender_focus();
+            }
+        });
+        if let Some(forward) = step {
+            let previous = view.selected;
+            if restart { view.selected = None; }
+            view.find_step(forward);
+            if view.selected.is_none() { view.selected = previous; }
+        }
+    }
     let editable = view.edit.is_some();
     demo_filter(view, area_rect);
     demo_grid(view);
     let filters_active: Vec<usize> = view.filters.keys().copied().collect();
     let editing_now = view.edit.as_ref().is_some_and(|e| e.editing.is_some());
-    let previous_row = view.selected_row();
     let edit_id = egui::Id::new(("cell_edit", view.salt));
     let page_rows = (area_rect.height() / ROW_H).floor().max(1.0) as usize;
     let owns_focus = ui.memory(|m| m.focused().is_none() || m.has_focus(edit_id));
@@ -1220,6 +1294,7 @@ pub fn show_result(
     };
 
     egui::ScrollArea::horizontal().id_salt(("result_h", view.salt)).auto_shrink([false, false]).show(ui, |ui| {
+        let mut scroll_cell = None;
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         {
             let v = ui.visuals_mut();
@@ -1254,6 +1329,7 @@ pub fn show_result(
                     let mut sort_hit = Rect::NOTHING;
                     let (_, resp) = header.col(|ui| {
                         let r = ui.max_rect();
+                        if scroll_to.is_some() && view.selected.is_some_and(|(_, c)| c == i) { scroll_cell = Some(r); }
                         ui.painter().rect_filled(r, 0.0, p.header_bg);
                         ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.grid));
                         let painter = ui.painter_at(r);
@@ -1336,7 +1412,6 @@ pub fn show_result(
                             || inline.as_ref().is_some_and(|ed| editing_here && ed.changed);
                         let (_, resp) = row.col(|ui| {
                             let r = ui.max_rect();
-                            if view.selected == Some((vr, c)) && scroll_to == Some(vr) { ui.scroll_to_rect(r, None); }
                             let bg = if modified && !deleted {
                                 Some(p.cell_modified)
                             } else if is_sel && !editing_here {
@@ -1477,6 +1552,9 @@ pub fn show_result(
                     }
                 });
             });
+        // The inner vertical scroll area consumes scroll targets on both axes.
+        // Request horizontal visibility after it has finished.
+        if let Some(rect) = scroll_cell { ui.scroll_to_rect(rect, None); }
     });
 
     if let Some(e) = view.edit.as_mut() {
@@ -2111,6 +2189,97 @@ mod filter_tests {
 #[cfg(test)]
 mod keyboard_tests {
     use super::*;
+
+    fn wide_table_scenario(render: bool) {
+        let mut view = ResultView::new(ResultSet {
+            columns: (0..30).map(|c| format!("column_{c:02}")).collect(),
+            rows: (0..200).map(|r| (0..30).map(|c| Some(format!("value_{r}_{c}"))).collect()).collect(),
+            ..Default::default()
+        }, 991);
+        view.select_cell(0, 0, Modifiers::NONE);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 460.0)).build_ui_state(
+            move |ui, state: &mut (ResultView, f32)| {
+                if std::mem::take(&mut first) {
+                    theme::install_fonts(ui.ctx());
+                    theme::apply(ui.ctx(), true);
+                    return;
+                }
+                let id = ui.make_persistent_id(egui::IdSalt::new(("result_h", state.0.salt)));
+                show_result(ui, &mut state.0, false, None, false);
+                state.1 = egui::scroll_area::State::load(ui.ctx(), id).expect("horizontal scroll state").offset.x;
+            }, (view, 0.0));
+        h.run_steps(3);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::ArrowRight);
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((0, 29)));
+        assert!(h.state().1 > 1000.0, "cursor must reveal the last column: {}", h.state().1);
+        if render {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
+            std::fs::create_dir_all(&dir).unwrap();
+            h.render().unwrap().save(dir.join("wide-table.png")).unwrap();
+        }
+        h.key_press_modifiers(Modifiers::COMMAND, Key::ArrowLeft);
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((0, 0)));
+        assert!(h.state().1 < 60.0, "cursor must reveal the first column, offset {}", h.state().1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text("value_199_29".into()));
+        h.run_steps(20);
+        assert_eq!(h.state().0.selected, Some((199, 29)));
+        assert!(h.state().1 > 1000.0, "find must also reveal the matched column");
+        if render {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
+            h.render().unwrap().save(dir.join("table-find.png")).unwrap();
+        }
+    }
+
+    #[test]
+    fn horizontal_keyboard_navigation_reveals_the_selected_column() { wide_table_scenario(false); }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders horizontal navigation on test data"]
+    fn render_wide_table() { wide_table_scenario(true); }
+
+    #[test]
+    fn ctrl_f_finds_loaded_values_and_wraps_without_changing_data() {
+        let mut h = harness(false, false);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        assert!(h.state().view.find_open);
+        h.input_mut().events.push(egui::Event::Text("C".into()));
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        assert!(!h.state().view.is_dirty());
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().view.find_open);
+    }
+
+    #[test]
+    fn finding_outside_an_edited_batch_respects_opt_in_auto_save() {
+        let mut h = harness(true, true);
+        h.input_mut().events.push(egui::Event::Text("edited".into()));
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().view.is_dirty());
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().view.is_dirty(), "closing find must not discard pending row changes");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text("c".into()));
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((2, 1)));
+        assert_eq!(h.state().submits, 1);
+    }
 
     fn view() -> ResultView {
         let mut view = ResultView::new(
