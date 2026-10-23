@@ -1,11 +1,14 @@
 # Application icon
 
-DataCraft uses one minimalist white database cylinder on a cobalt rounded square. The project menu,
+DataCraft uses the user-selected DC mark with a cyan frame and database/table motifs. The project menu,
 About dialog and native window share the same mark. The UI uses 32/64 px variants
 for crisp small controls; native windows use `assets/icon.png`. Windows executables
 embed `assets/icon.ico`; macOS bundles use `assets/DataCraft.icns`.
 
-The committed assets, including `assets/icon.svg`, are generated together:
+The selected original is preserved as `assets/icon-reference.png`. The production
+master in `assets/icon-master.png` was prepared with the built-in imagegen tool
+to remove the surrounding background. Its exact prompt is saved in `assets/icon-generation.txt`. All
+application sizes and native icon formats are exported from this same master:
 
 ```sh
 python -m pip install Pillow

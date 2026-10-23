@@ -859,6 +859,9 @@
     "Actions": "操作",
     "Record": "记录",
     "Record {row}": "记录 {row}",
-    "Select a row to see its values": "选择一行以查看其值"
+    "Select a row to see its values": "选择一行以查看其值",
+    "Maximize": "最大化",
+    "Restore window": "还原窗口",
+    "Close window": "关闭窗口"
   }
 }

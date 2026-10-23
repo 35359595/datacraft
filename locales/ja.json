@@ -859,6 +859,9 @@
     "Actions": "操作",
     "Record": "レコード",
     "Record {row}": "レコード {row}",
-    "Select a row to see its values": "行を選択して値を表示します"
+    "Select a row to see its values": "行を選択して値を表示します",
+    "Maximize": "最大化",
+    "Restore window": "ウィンドウを元に戻す",
+    "Close window": "ウィンドウを閉じる"
   }
 }

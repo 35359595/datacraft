@@ -2538,22 +2538,16 @@ impl DataCraftApp {
     fn title_bar(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
         let rect = ui.max_rect();
-        let bg = ui.interact(rect, egui::Id::new("title_bar_drag"), Sense::click_and_drag());
-        if bg.drag_started_by(egui::PointerButton::Primary) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if bg.double_clicked() {
-            let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-        }
+        let mut drag_left = rect.left();
+        let mut drag_right = rect.right();
         let fullscreen = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
         ui.horizontal_centered(|ui| {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
             ui.spacing_mut().item_spacing.x = 4.0;
-            // Room for the traffic lights: 80 screen pt, whatever the IDE zoom.
+            // Reserve traffic-light space only on macOS, independent of IDE zoom.
             let zoom = ui.ctx().zoom_factor().max(0.1);
-            ui.add_space(if fullscreen { 10.0 } else { 80.0 / zoom });
+            ui.add_space(crate::ui::window_chrome::leading_space(cfg!(target_os = "macos"), fullscreen, zoom));
 
             // Project widget uses the same mark as the native window and executable.
             let font = theme::bold(13.0);
@@ -2615,9 +2609,14 @@ impl DataCraftApp {
             if let Some(id) = chosen {
                 self.set_active_connection(id);
             }
+            drag_left = ui.min_rect().right();
 
                 }
                 theme::Side::Right => {
+                if cfg!(target_os = "windows") {
+                    if let Some(command) = crate::ui::window_chrome::controls(ui) { ui.ctx().send_viewport_cmd(command); }
+                    ui.add_space(8.0);
+                }
                 ui.add_space(5.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let gear = theme::icon_button_sized(ui, Ico::Gear, true, tr("Settings"), 30.0);
@@ -2633,9 +2632,19 @@ impl DataCraftApp {
                     self.show_explorer = true;
                     self.explorer.show_filter = !self.explorer.show_filter;
                 }
+                drag_right = ui.min_rect().left();
                 }
             });
         });
+        if drag_right > drag_left {
+            let drag_rect = Rect::from_min_max(pos2(drag_left, rect.top()), pos2(drag_right, rect.bottom()));
+            let drag = ui.interact(drag_rect, egui::Id::new("title_bar_drag"), Sense::click_and_drag());
+            if drag.drag_started_by(egui::PointerButton::Primary) { ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag); }
+            if drag.double_clicked() {
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+        }
     }
 
     /// Changes the active console's connection (if it is not busy).
@@ -3854,6 +3863,7 @@ impl eframe::App for DataCraftApp {
             .frame(bar.inner_margin(Margin { left, ..Margin::ZERO }))
             .show(ui, |ui| self.central(ui));
         self.dialogs(&ctx);
+        if cfg!(target_os = "windows") { crate::ui::window_chrome::resize_edges(&ctx); }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

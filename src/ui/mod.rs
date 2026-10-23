@@ -3,6 +3,7 @@
 pub mod connection_dialog;
 pub mod backup_dialog;
 pub mod branding;
+pub mod window_chrome;
 pub mod copy_dialog;
 pub mod console;
 pub mod create_dialog;

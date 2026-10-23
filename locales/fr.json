@@ -859,6 +859,9 @@
     "Actions": "Actions",
     "Record": "Enregistrement",
     "Record {row}": "Enregistrement {row}",
-    "Select a row to see its values": "Sélectionnez une ligne pour afficher ses valeurs"
+    "Select a row to see its values": "Sélectionnez une ligne pour afficher ses valeurs",
+    "Maximize": "Agrandir",
+    "Restore window": "Restaurer la fenêtre",
+    "Close window": "Fermer la fenêtre"
   }
 }

@@ -859,6 +859,9 @@
     "Actions": "Aktionen",
     "Record": "Datensatz",
     "Record {row}": "Datensatz {row}",
-    "Select a row to see its values": "Zeile auswählen, um ihre Werte anzuzeigen"
+    "Select a row to see its values": "Zeile auswählen, um ihre Werte anzuzeigen",
+    "Maximize": "Maximieren",
+    "Restore window": "Fenster wiederherstellen",
+    "Close window": "Fenster schließen"
   }
 }

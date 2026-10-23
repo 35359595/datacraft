@@ -859,6 +859,9 @@
     "Actions": "Akcje",
     "Record": "Rekord",
     "Record {row}": "Rekord {row}",
-    "Select a row to see its values": "Zaznacz wiersz, aby zobaczyć jego wartości"
+    "Select a row to see its values": "Zaznacz wiersz, aby zobaczyć jego wartości",
+    "Maximize": "Maksymalizuj",
+    "Restore window": "Przywróć okno",
+    "Close window": "Zamknij okno"
   }
 }
