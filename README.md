@@ -24,7 +24,7 @@ Shortcuts are written with ⌘ / ⌥ (macOS); on Windows use Ctrl / Alt.
 - **Export:** results to CSV, TSV, JSON, SQL `INSERT`s or Markdown, to the clipboard or a file.
 - **Zoom:** IDE zoom (⌘+ / ⌘− / ⌘0) and editor font size (⌥⌘+ / ⌥⌘−).
 - **Native macOS menu bar** with the usual shortcuts (on Windows, the same keyboard shortcuts).
-- **Languages:** English, Spanish, French, Portuguese (Brazil), German, Simplified Chinese and Japanese; follows the system language and can be changed in Settings. Translations live in `locales/<code>.json` (one file per language, keyed by the English text), so adding or fixing one needs no Rust.
+- **Languages:** English, Spanish, French, Portuguese (Brazil), German, Polish, Simplified Chinese and Japanese; follows the system language and can be changed in Settings. Translations live in `locales/<code>.json` (one file per language, keyed by the English text), so adding or fixing one needs no Rust.
 - **Passwords:** stored in the macOS Keychain or the Windows Credential Manager, never in the connections file.
 
 
@@ -104,7 +104,7 @@ Los atajos se indican con ⌘ / ⌥ (macOS); en Windows son Ctrl / Alt.
 - **Exportación:** resultados a CSV, TSV, JSON, `INSERT`s SQL o Markdown, al portapapeles o a un fichero.
 - **Zoom:** zoom del IDE (⌘+ / ⌘− / ⌘0) y tamaño de fuente del editor (⌥⌘+ / ⌥⌘−).
 - **Menú nativo de macOS** con los atajos habituales (en Windows, los mismos atajos de teclado).
-- **Idiomas:** inglés, español, francés, portugués (Brasil), alemán, chino simplificado y japonés; sigue el idioma del sistema y se puede cambiar en Ajustes. Las traducciones están en `locales/<código>.json` (un fichero por idioma, con el texto en inglés como clave), así que añadir o corregir uno no requiere tocar Rust.
+- **Idiomas:** inglés, español, francés, portugués (Brasil), alemán, polaco, chino simplificado y japonés; sigue el idioma del sistema y se puede cambiar en Ajustes. Las traducciones están en `locales/<código>.json` (un fichero por idioma, con el texto en inglés como clave), así que añadir o corregir uno no requiere tocar Rust.
 - **Contraseñas:** se guardan en el Llavero de macOS o en el Administrador de credenciales de Windows, nunca en el fichero de conexiones.
 
 ### Descarga

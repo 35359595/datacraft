@@ -18,7 +18,7 @@
 //! several queries, run with "Run all" (one result tab each).
 //! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
 //! `<column>=<text>` types that text in its search box (which also filters the grid).
-//! `DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja` forces the interface language.
+//! `DATACRAFT_DEMO_LANG=en|es|fr|pt|de|pl|zh|ja` forces the interface language.
 //! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
 //! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
 //! `DATACRAFT_DEMO_COPY=1` opens "Copy Table To…" on the first table, into `<name>_copy`;
@@ -305,7 +305,7 @@ impl DataCraftApp {
             cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default()
         };
         // Before any text is created (native menu, first console...).
-        // Demo mode can force the language: DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja.
+        // Demo mode can force the language: DATACRAFT_DEMO_LANG=en|es|fr|pt|de|pl|zh|ja.
         let demo_lang = demo.as_ref().and(std::env::var("DATACRAFT_DEMO_LANG").ok()).map(|l| Lang::from_locale(&l));
         i18n::set_lang(demo_lang.or(persisted.lang).unwrap_or_else(Lang::system));
         let conns: Vec<ConnState> = if demo.is_some() {
