@@ -102,6 +102,8 @@ struct InlineEdit {
     changed: bool,
 }
 
+type FindKey = (String, usize, Option<(usize, SortDir)>, usize);
+
 /// Edit state of an editable result.
 pub struct EditSession {
     pub target: EditTarget,
@@ -133,6 +135,9 @@ pub struct ResultView {
     find_open: bool,
     find_query: String,
     find_focus: bool,
+    /// Match count shown in the find bar, with what it was counted for: counting scans every
+    /// loaded cell, so it is redone when the query or the view changes, and at most once a second.
+    find_count: Option<(FindKey, std::time::Instant, usize)>,
     /// Salt for the table id (changes on every run to reset widths).
     salt: u64,
     /// Some if the result is editable.
@@ -162,6 +167,19 @@ impl ResultView {
                     .filter(|v| v.to_lowercase().contains(query)).map(|_| (r, c))
             })
         }).collect()
+    }
+
+    fn find_count(&mut self) -> usize {
+        let key: FindKey = (self.find_query.clone(), self.n_view_rows(), self.sort, self.filters.len());
+        if let Some((k, at, n)) = &self.find_count
+            && *k == key
+            && at.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return *n;
+        }
+        let n = self.find_matches().len();
+        self.find_count = Some((key, std::time::Instant::now(), n));
+        n
     }
 
     fn find_step(&mut self, forward: bool) {
@@ -199,6 +217,7 @@ impl ResultView {
             find_open: false,
             find_query: String::new(),
             find_focus: false,
+            find_count: None,
             salt,
             edit: None,
             record_view: None,
@@ -415,9 +434,11 @@ impl ResultView {
         if !ed.changed {
             return;
         }
+        // The selection only gets the value when the editor is one of its cells; otherwise
+        // (cursor moved by the record view, a reverted new row…) only the edited cell does.
         let mut cells = self.selected_cell_refs();
-        if cells.is_empty() {
-            cells.push((ed.row, ed.col));
+        if !cells.contains(&(ed.row, ed.col)) {
+            cells = vec![(ed.row, ed.col)];
         }
         self.apply_cell_values(cells.into_iter().map(|(row, col)| (row, col, Some(ed.buffer.clone()))).collect());
     }
@@ -711,6 +732,25 @@ impl ResultView {
             if let Some(row) = row {
                 e.state.revert_row(row);
             }
+        }
+        // Reverting a new row shifts the ones after it: `New(j)` becomes `New(j - 1)`, and so do
+        // their view rows.
+        if let Some(RowRef::New(i)) = row {
+            self.edit_rows = std::mem::take(&mut self.edit_rows)
+                .into_iter()
+                .map(|r| match r {
+                    RowRef::New(j) if j > i => RowRef::New(j - 1),
+                    other => other,
+                })
+                .collect();
+            let removed = self.order.len() + i;
+            let shift = |r: usize| if r > removed { r - 1 } else { r };
+            self.selected_cells = std::mem::take(&mut self.selected_cells)
+                .into_iter()
+                .filter(|&(r, _)| r != removed)
+                .map(|(r, c)| (shift(r), c))
+                .collect();
+            self.selected_rows = std::mem::take(&mut self.selected_rows).into_iter().map(shift).collect();
         }
         self.clamp_selection();
     }
@@ -1078,7 +1118,7 @@ pub fn show_result(
             if enter { response.request_focus(); }
             if ui.button(tr("Previous")).clicked() { step = Some(false); }
             if ui.button(tr("Next")).clicked() || enter { step = Some(!ui.input(|i| i.modifiers.shift)); }
-            let matches = view.find_matches().len();
+            let matches = view.find_count();
             ui.label(if matches == 1 { tr("1 match").into() } else { trf("{n} matches", &[("n", &matches)]) });
             let escape = (response.has_focus() || response.lost_focus())
                 && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
@@ -1814,8 +1854,10 @@ fn record_view_ui(ui: &Ui, view: &mut ResultView, columns_info: Option<&[ColumnI
         });
     if let Some(r) = go {
         view.record_view = Some(r);
-        view.selected = Some((r, view.selected.map_or(0, |(_, c)| c)));
+        let col = view.selected.map_or(0, |(_, c)| c);
+        view.selected = Some((r, col));
         view.selected_rows = BTreeSet::from([r]);
+        view.selected_cells = BTreeSet::from([(r, col)]);
         view.scroll_to = Some(r);
     }
     if !open || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2457,6 +2499,39 @@ mod keyboard_tests {
             2,
             "returning to the batch and leaving it allows retry"
         );
+    }
+
+    #[test]
+    fn editor_outside_the_selection_only_edits_its_own_cell() {
+        // The record view moved the cursor to row 5 while row 3 was still the selected cell.
+        let mut v = batch_view();
+        v.selected_cells = BTreeSet::from([(3, 2)]);
+        assert!(v.start_edit(5, 2));
+        let ed = v.edit.as_mut().unwrap().editing.as_mut().unwrap();
+        ed.buffer = "typed".into();
+        ed.changed = true;
+        v.commit_edit();
+        let changes = &v.edit.as_ref().unwrap().state.changes;
+        assert_eq!(changes.get(&(5, 2)), Some(&Some("typed".into())));
+        assert!(!changes.contains_key(&(3, 2)), "the stale selection must not get the value");
+    }
+
+    #[test]
+    fn reverting_a_new_row_shifts_the_later_ones() {
+        let mut v = batch_view();
+        for _ in 0..3 {
+            v.add_row();
+            v.commit_edit();
+        }
+        let first_new = v.order.len();
+        v.edit_rows.extend((0..3).map(RowRef::New));
+        v.selected = Some((first_new, 1));
+        v.selected_cells = BTreeSet::from([(first_new, 1), (first_new + 2, 1)]);
+        v.cancel_row();
+        assert_eq!(v.edit.as_ref().unwrap().state.inserted.len(), 2);
+        assert!(v.edit_rows.iter().all(|r| !matches!(r, RowRef::New(i) if *i >= 2)));
+        assert!(v.edit_rows.contains(&RowRef::New(1)), "the old third new row is now the second");
+        assert_eq!(v.selected_cells, BTreeSet::from([(first_new + 1, 1)]));
     }
 
     #[test]
