@@ -139,6 +139,11 @@ impl Worker {
                         // The epoch is stamped here, in arrival order: a Disconnect after a
                         // Connect invalidates that Connect even if it finishes later.
                         let epoch = state.bump_if_lifecycle(&req);
+                        match &req {
+                            Request::ObjectInfo { conn, request_id, .. } => state.meta_started(*conn, false, *request_id),
+                            Request::ObjectCatalog { conn, request_id, .. } => state.meta_started(*conn, true, *request_id),
+                            _ => {}
+                        }
                         let state = state.clone();
                         let out = resp_tx.clone();
                         let ctx = ctx.clone();
@@ -174,6 +179,9 @@ struct Live {
     default_db: String,
     /// Key "" = main session. On PostgreSQL, also one session per extra database.
     sessions: HashMap<String, SharedSession>,
+    /// Object browser metadata sessions, per database: their queries neither wait behind a
+    /// console nor take the console's session down when they time out.
+    meta: HashMap<String, SharedSession>,
 }
 
 /// A console's `Execute` in progress. Registered before waiting for the session, so a
@@ -196,6 +204,9 @@ struct State {
     running: std::sync::Mutex<HashMap<ConsoleId, Arc<Running>>>,
     /// Epoch per connection: changes with every Connect/Disconnect.
     epochs: std::sync::Mutex<HashMap<ConnId, u64>>,
+    /// Newest object browser request per (connection, catalog?): older ones still queued for
+    /// the metadata session are skipped (their reply would be discarded anyway).
+    meta_latest: std::sync::Mutex<HashMap<(ConnId, bool), u64>>,
 }
 
 impl State {
@@ -249,6 +260,50 @@ impl State {
         Ok((session, target))
     }
 
+    /// Metadata session for `db` (opened on first use and kept), and the database name to pass to
+    /// the driver.
+    async fn meta_session_for(&self, conn: ConnId, db: &str) -> anyhow::Result<(SharedSession, String)> {
+        let (mut cfg, target, existing) = {
+            let live = self.live.lock().await;
+            let l = live.get(&conn).ok_or_else(|| anyhow::anyhow!(tr("The connection is not open")))?;
+            let target = if db.is_empty() { l.default_db.clone() } else { db.to_string() };
+            (l.cfg.clone(), target.clone(), l.meta.get(&target).cloned())
+        };
+        if let Some(s) = existing {
+            return Ok((s, target));
+        }
+        if cfg.driver == Driver::Postgres {
+            cfg.database = target.clone();
+        }
+        let epoch = self.current_epoch(conn);
+        let session = Arc::new(Mutex::new(Session::connect(&cfg).await?));
+        let mut live = self.live.lock().await;
+        if self.current_epoch(conn) == epoch
+            && let Some(l) = live.get_mut(&conn)
+        {
+            let s = l.meta.entry(target.clone()).or_insert(session);
+            return Ok((s.clone(), target));
+        }
+        Ok((session, target))
+    }
+
+    /// Drops a metadata session (timed out or broken); the next request opens a new one.
+    async fn forget_meta(&self, conn: ConnId, session: &SharedSession) {
+        if let Some(l) = self.live.lock().await.get_mut(&conn) {
+            l.meta.retain(|_, s| !Arc::ptr_eq(s, session));
+        }
+    }
+
+    /// true if a newer object browser request of the same kind has arrived.
+    fn meta_superseded(&self, conn: ConnId, catalog: bool, request_id: u64) -> bool {
+        let latest = self.meta_latest.lock().unwrap_or_else(|e| e.into_inner());
+        latest.get(&(conn, catalog)).is_some_and(|&newest| newest != request_id)
+    }
+
+    fn meta_started(&self, conn: ConnId, catalog: bool, request_id: u64) {
+        self.meta_latest.lock().unwrap_or_else(|e| e.into_inner()).insert((conn, catalog), request_id);
+    }
+
     /// Removes the session if it is still the same one (the connection was lost).
     async fn forget(&self, conn: ConnId, session: &SharedSession) {
         let mut live = self.live.lock().await;
@@ -268,6 +323,8 @@ impl State {
     }
 }
 
+/// Object browser metadata, on the connection's metadata session for `db`. A query that takes
+/// over 15 s is cancelled; if it can't be, only the metadata session is dropped.
 async fn fetch_object_info(
     state: &State,
     conn: ConnId,
@@ -275,19 +332,18 @@ async fn fetch_object_info(
     schema: Option<&str>,
     table: Option<&str>,
     count_rows: bool,
-) -> (
-    Result<Vec<crate::db::object_info::ObjectInfoRow>, String>,
-    bool,
-) {
-    let generation = state.current_epoch(conn);
-    let (session, target) = match state.session_for(conn, Some(db)).await {
-        Ok(value) => value,
-        Err(e) => return (Err(format!("{e:#}")), false),
-    };
+    request_id: u64,
+) -> Result<Vec<crate::db::object_info::ObjectInfoRow>, String> {
+    let catalog = table.is_none();
     let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
-        return (Err(tr("Connection lost").into()), false);
+        return Err(tr("Connection lost").into());
     };
+    let (session, target) = state.meta_session_for(conn, db).await.map_err(|e| format!("{e:#}"))?;
     let mut s = session.lock().await;
+    // Arrowing through tables queues requests: only the newest one runs.
+    if state.meta_superseded(conn, catalog, request_id) {
+        return Err(tr("Object information request superseded").into());
+    }
     let cancel = s.cancel_handle();
     let query = async {
         s.use_database(&target).await?;
@@ -305,25 +361,21 @@ async fn fetch_object_info(
             _ => s.object_list_info(driver, schema).await,
         }
     };
-    let (result, lost) = match tokio::time::timeout(std::time::Duration::from_secs(15), query).await
-    {
+    let (result, broken) = match tokio::time::timeout(std::time::Duration::from_secs(15), query).await {
         Ok(result) => (result.map_err(|e| format!("{e:#}")), s.is_closed()),
         Err(_) => {
             let cancelled = match cancel {
                 Some(h) => h.cancel().await.is_ok(),
                 None => false,
             };
-            (
-                Err(tr("Object information request timed out").into()),
-                !cancelled,
-            )
+            (Err(tr("Object information request timed out").into()), !cancelled)
         }
     };
     drop(s);
-    if lost {
-        state.forget(conn, &session).await;
+    if broken {
+        state.forget_meta(conn, &session).await;
     }
-    (result, lost && state.current_epoch(conn) == generation)
+    result
 }
 
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
@@ -347,7 +399,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                     }
                     let mut sessions = HashMap::new();
                     sessions.insert(String::new(), Arc::new(Mutex::new(session)));
-                    live.insert(conn, Live { cfg, default_db, sessions });
+                    live.insert(conn, Live { cfg, default_db, sessions, meta: HashMap::new() });
                     vec![Response::Connected { conn, databases }]
                 }
                 Err(e) if state.current_epoch(conn) == epoch => {
@@ -403,26 +455,15 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             request_id,
             count_rows,
         } => {
-            let (result, lost) =
-                fetch_object_info(state, conn, &db, Some(&schema), Some(&table), count_rows).await;
+            let result =
+                fetch_object_info(state, conn, &db, Some(&schema), Some(&table), count_rows, request_id).await;
             let result = result.and_then(|rows| {
                 rows.into_iter()
                     .next()
                     .map(|row| Box::new(row.info))
                     .ok_or_else(|| tr("Object information is not available").into())
             });
-            let mut responses = vec![Response::ObjectInfo {
-                conn,
-                request_id,
-                result,
-            }];
-            if lost {
-                responses.push(Response::ConnectFailed {
-                    conn,
-                    error: tr("Connection lost").into(),
-                });
-            }
-            responses
+            vec![Response::ObjectInfo { conn, request_id, result }]
         }
         Request::ObjectCatalog {
             conn,
@@ -430,20 +471,8 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             schema,
             request_id,
         } => {
-            let (result, lost) =
-                fetch_object_info(state, conn, &db, schema.as_deref(), None, false).await;
-            let mut responses = vec![Response::ObjectCatalog {
-                conn,
-                request_id,
-                result,
-            }];
-            if lost {
-                responses.push(Response::ConnectFailed {
-                    conn,
-                    error: tr("Connection lost").into(),
-                });
-            }
-            responses
+            let result = fetch_object_info(state, conn, &db, schema.as_deref(), None, false, request_id).await;
+            vec![Response::ObjectCatalog { conn, request_id, result }]
         }
         Request::ApplyChanges { conn, db, console, statements } => {
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
@@ -469,6 +498,7 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 && let Some(l) = state.live.lock().await.get_mut(&conn)
             {
                 l.sessions.remove(&name);
+                l.meta.remove(&name);
             }
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
                 Ok(s) => s,
@@ -830,6 +860,55 @@ mod tests {
         cfg.database = var("DATACRAFT_MY_DB");
         cfg.read_only = true;
         read_only_rejects_writes(cfg, "create table ro_probe(x int)");
+    }
+
+    /// Live, like `cancels_a_running_mysql_query`: object info doesn't wait behind a console's
+    /// query, and Find in Schema searches the database.
+    #[test]
+    #[ignore]
+    fn mysql_object_info_runs_beside_a_busy_console() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(13, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let (conn, db) = (cfg.id, cfg.database.clone());
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        w.send(Request::RunDdl {
+            conn,
+            db: None,
+            statements: vec![
+                "drop table if exists dc_info".into(),
+                "create table dc_info(id int primary key, note varchar(50))".into(),
+                "insert into dc_info values (1, 'needle_50%'), (2, 'hay')".into(),
+            ],
+            close_db: None,
+            transaction: false,
+        });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { result: Ok(_), .. }));
+        w.send(Request::Execute { conn, db: None, console: 4, statements: vec!["select sleep(4)".into()], max_rows: 10 });
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        for request_id in 1..=3 {
+            w.send(Request::ObjectInfo { conn, db: db.clone(), schema: db.clone(), table: "dc_info".into(), request_id, count_rows: true });
+        }
+        let r = wait_for(&w, |r| matches!(r, Response::ObjectInfo { request_id: 3, .. }));
+        assert!(start.elapsed() < Duration::from_secs(3), "object info waited for the console: {:?}", start.elapsed());
+        let Response::ObjectInfo { result, .. } = r else { unreachable!() };
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let request = crate::db::schema_search::SearchRequest { db: db.clone(), schema: Some(db.to_uppercase()), value: "LE_50%".into(), exact: false, case_sensitive: false };
+        w.send(Request::SchemaSearch { conn, request_id: 9, request, cancel });
+        let r = wait_for(&w, |r| matches!(r, Response::SchemaSearch { request_id: 9, .. }));
+        let Response::SchemaSearch { result: Ok(report), .. } = r else { panic!("search failed") };
+        assert!(report.matches.iter().any(|m| m.table == "dc_info" && m.result.rows.len() == 1), "errors: {:?}", report.errors);
+        w.send(Request::RunDdl { conn, db: None, statements: vec!["drop table dc_info".into()], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
     }
 
     /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).
