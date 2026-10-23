@@ -788,9 +788,8 @@ mod tests {
         );
         drop(restored);
         drop(db);
-        fs::remove_file(target).unwrap();
-        fs::remove_file(source).unwrap();
-        fs::remove_dir(root).unwrap();
+        // macOS's system SQLite keeps the -wal/-shm files after closing.
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn client_passwords_stay_out_of_arguments_and_credentials_are_removed() {
