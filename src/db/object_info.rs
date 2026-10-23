@@ -54,6 +54,7 @@ fn catalog_scope_query(driver: Driver, schema: Option<&str>, table: Option<&str>
              LEFT JOIN all_tab_comments c ON c.owner = o.owner AND c.table_name = o.object_name WHERE o.object_type IN ('TABLE','VIEW') AND o.owner NOT IN ({excluded})"),
             "o.owner", "o.object_name", "")
         },
+        Driver::Redis | Driver::MongoDb => (String::new(), "", "", ""),
         Driver::Snowflake => (
             "SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS object_name, ROW_COUNT AS row_count, BYTES AS data_bytes, CREATED AS created, LAST_ALTERED AS modified, COMMENT AS object_comment \
              FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'".to_string(), "TABLE_SCHEMA", "TABLE_NAME", ""),
@@ -116,6 +117,9 @@ impl Session {
         driver: Driver,
         schema: Option<&str>,
     ) -> anyhow::Result<Vec<ObjectInfoRow>> {
+        if driver.is_nosql() {
+            anyhow::bail!(tr("Object information is not available"));
+        }
         let results = self
             .execute(&catalog_scope_query(driver, schema, None), 100_000)
             .await?;
@@ -157,6 +161,9 @@ impl Session {
         table: &str,
         count_rows: bool,
     ) -> anyhow::Result<ObjectInfo> {
+        if driver.is_nosql() {
+            anyhow::bail!(tr("Object information is not available"));
+        }
         let results = self
             .execute(&catalog_query(driver, schema, table), 1)
             .await?;
@@ -194,7 +201,7 @@ mod tests {
 
     #[test]
     fn catalog_names_are_literals_and_never_trigger_full_counts() {
-        for driver in Driver::ALL {
+        for driver in Driver::ALL.into_iter().filter(|d| !d.is_nosql()) {
             let query = catalog_query(driver, "a'b", "x'; DROP TABLE users; --");
             assert!(query.contains("a''b") || driver == Driver::Sqlite);
             assert!(query.contains("x''; DROP TABLE users; --"));

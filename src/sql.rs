@@ -23,6 +23,27 @@ pub struct Statement {
 /// to the `;` after their outermost `END` (which they keep). MySQL / MariaDB: stored routines
 /// run to the `;` after their outermost `END`, and `DELIMITER x` lines change the separator.
 pub fn split_statements(script: &str, driver: Driver) -> Vec<Statement> {
+    // Redis: one command per line (`#` and `//` comment lines are skipped).
+    if driver == Driver::Redis {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for line in script.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("//") {
+                let start = pos + (line.len() - line.trim_start().len());
+                out.push(Statement { text: trimmed.to_string(), start, end: start + trimmed.len() });
+            }
+            pos += line.len();
+        }
+        return out;
+    }
+    // MongoDB: `mongosh` commands, by `;` or line (see `mongo::split_script`).
+    if driver == Driver::MongoDb {
+        return crate::db::mongo::split_script(script)
+            .into_iter()
+            .map(|(start, end)| Statement { text: script[start..end].to_string(), start, end })
+            .collect();
+    }
     let dialect = Dialect::for_driver(driver);
     let oracle = driver == Driver::Oracle;
     let mysql = matches!(driver, Driver::MySql | Driver::MariaDb);
@@ -271,7 +292,9 @@ pub fn statement_at(script: &str, cursor: usize, driver: Driver) -> Option<State
 /// function bodies and Snowflake's `$$…$$` procedure bodies).
 pub fn split_batches(script: &str, driver: Driver) -> Vec<Statement> {
     match driver {
-        Driver::Postgres | Driver::MySql | Driver::MariaDb | Driver::Oracle | Driver::Snowflake => split_statements(script, driver),
+        Driver::Postgres | Driver::MySql | Driver::MariaDb | Driver::Oracle | Driver::Snowflake | Driver::Redis | Driver::MongoDb => {
+            split_statements(script, driver)
+        }
         Driver::MsSql | Driver::Sqlite => {
             let dialect = Dialect::for_driver(driver);
             let mut out = Vec::new();
@@ -666,6 +689,7 @@ pub fn explain_statements(stmt: &str, driver: Driver) -> Vec<String> {
         Driver::Postgres | Driver::MySql | Driver::MariaDb => vec![format!("EXPLAIN {s}")],
         Driver::Sqlite => vec![format!("EXPLAIN QUERY PLAN {s}")],
         Driver::Snowflake => vec![format!("EXPLAIN USING TEXT {s}")],
+        Driver::Redis | Driver::MongoDb => Vec::new(),
         Driver::MsSql => vec!["SET SHOWPLAN_TEXT ON".into(), s.to_string(), "SET SHOWPLAN_TEXT OFF".into()],
         Driver::Oracle => vec![
             format!("EXPLAIN PLAN FOR {s}"),
@@ -1231,6 +1255,21 @@ impl Dialect {
                 single_quote_backslash: false,
                 slash_comments: false,
             },
+            // Only used for highlighting their commands.
+            Driver::Redis | Driver::MongoDb => Dialect {
+                brackets: false,
+                backticks: false,
+                dollar_quotes: false,
+                nested_comments: false,
+                tsql_names: false,
+                go_separator: false,
+                hash_comments: true,
+                backslash_escapes: true,
+                q_quotes: false,
+                slash_separator: false,
+                single_quote_backslash: true,
+                slash_comments: true,
+            },
             Driver::Snowflake => Dialect {
                 brackets: false,
                 backticks: false,
@@ -1688,7 +1727,7 @@ mod tests {
 
     #[test]
     fn unclosed_constructs_do_not_panic() {
-        for d in Driver::ALL {
+        for d in Driver::ALL.into_iter().filter(|d| !d.is_nosql()) {
             for s in [
                 "SELECT 'abc",
                 "SELECT \"abc",
@@ -1721,7 +1760,7 @@ mod tests {
     #[test]
     fn unicode_text() {
         let s = "SELECT 'canción 🎵;' AS título; -- ñandú 🦤\nSELECT \"año\" FROM café;";
-        for d in Driver::ALL {
+        for d in Driver::ALL.into_iter().filter(|d| !d.is_nosql()) {
             let st = split_statements(s, d);
             assert_eq!(st.len(), 2);
             assert_eq!(st[1].text, "SELECT \"año\" FROM café");

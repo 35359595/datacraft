@@ -545,6 +545,10 @@ impl Console {
 
     /// Reformat Code: the selection or, without one, the whole console (like DataGrip).
     fn reformat(&mut self, ctx: &egui::Context, cx: &ConsoleCtx<'_>) {
+        // The SQL formatter would mangle Redis and mongosh commands.
+        if cx.driver.is_nosql() {
+            return;
+        }
         let len = self.text.chars().count();
         let sel = self.cursor.filter(|(a, b)| a != b && self.selection().is_some());
         let (s, e) = sel.unwrap_or((0, len));

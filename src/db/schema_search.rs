@@ -103,6 +103,7 @@ fn search_sql(
                 }
                 Driver::Oracle => format!("CAST({column} AS VARCHAR2(4000))"),
                 Driver::Snowflake => format!("TO_VARCHAR({column})"),
+                Driver::Redis | Driver::MongoDb => column.clone(),
                 Driver::Postgres | Driver::Sqlite => format!("CAST({column} AS TEXT)"),
             };
             let text = if request.case_sensitive {
@@ -150,6 +151,9 @@ pub async fn search(
         cfg.database.clone_from(&request.db);
     }
     cfg.read_only = true;
+    if cfg.driver.is_nosql() {
+        anyhow::bail!(tr("Find in Schema is not available for this engine"));
+    }
     let connect = || async {
         let mut session = Session::connect(&cfg).await?;
         session.use_database(&request.db).await?;

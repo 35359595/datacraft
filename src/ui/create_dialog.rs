@@ -63,6 +63,7 @@ fn common_types(driver: Driver) -> &'static [&'static str] {
             "number", "number(10)", "number(10,2)", "binary_double", "varchar2(255)", "nvarchar2(255)", "char(1)",
             "clob", "date", "timestamp", "blob", "raw(16)",
         ],
+        Driver::Redis | Driver::MongoDb => &[],
         Driver::Snowflake => &[
             "number(38,0)", "number(10,2)", "float", "boolean", "varchar", "varchar(255)", "date", "time",
             "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "variant", "object", "array", "binary",
@@ -77,6 +78,7 @@ pub fn default_schema(driver: Driver) -> &'static str {
         Driver::MsSql => "dbo",
         Driver::Sqlite => "main",
         Driver::Snowflake => "PUBLIC",
+        Driver::Redis | Driver::MongoDb => "",
         // MySQL: the database itself; Oracle: the connected user (filled in by the caller).
         Driver::MySql | Driver::MariaDb | Driver::Oracle => "",
     }
@@ -90,6 +92,7 @@ fn id_column(driver: Driver) -> NewColumn {
         Driver::MySql | Driver::MariaDb => "int",
         Driver::Oracle => "number(10)",
         Driver::Snowflake => "number(38,0)",
+        Driver::Redis | Driver::MongoDb => "string",
     };
     NewColumn { name: "id".into(), data_type: data_type.into(), not_null: true, primary_key: true, default: String::new() }
 }

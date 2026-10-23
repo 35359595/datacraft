@@ -4,6 +4,7 @@
 //! know each engine's native types.
 
 pub mod copy;
+pub mod mongo;
 pub mod mssql;
 pub mod object_info;
 pub mod schema_search;
@@ -11,6 +12,7 @@ pub mod subset;
 pub mod mysql;
 pub mod oracle;
 pub mod postgres;
+pub mod redis_db;
 pub mod snowflake;
 pub mod sqlite;
 pub mod url;
@@ -27,11 +29,29 @@ pub enum Driver {
     MariaDb,
     Oracle,
     Snowflake,
+    /// Redis and Valkey (same protocol).
+    Redis,
+    MongoDb,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 7] =
-        [Driver::Postgres, Driver::MySql, Driver::MariaDb, Driver::MsSql, Driver::Oracle, Driver::Snowflake, Driver::Sqlite];
+    pub const ALL: [Driver; 9] = [
+        Driver::Postgres,
+        Driver::MySql,
+        Driver::MariaDb,
+        Driver::MsSql,
+        Driver::Oracle,
+        Driver::Snowflake,
+        Driver::Sqlite,
+        Driver::MongoDb,
+        Driver::Redis,
+    ];
+
+    /// Redis and MongoDB: no SQL. Their consoles take the engine's own commands, the grid is
+    /// read-only and the SQL tools (DDL, import, copy, schema search…) are not offered.
+    pub fn is_nosql(self) -> bool {
+        matches!(self, Driver::Redis | Driver::MongoDb)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -42,6 +62,8 @@ impl Driver {
             Driver::MariaDb => "MariaDB",
             Driver::Oracle => "Oracle",
             Driver::Snowflake => "Snowflake",
+            Driver::Redis => "Redis / Valkey",
+            Driver::MongoDb => "MongoDB",
         }
     }
 
@@ -52,6 +74,8 @@ impl Driver {
             Driver::MySql | Driver::MariaDb => 3306,
             Driver::Oracle => 1521,
             Driver::Snowflake => 443,
+            Driver::Redis => 6379,
+            Driver::MongoDb => 27017,
             Driver::Sqlite => 0,
         }
     }
@@ -59,7 +83,7 @@ impl Driver {
     /// Engines where each database has a single schema with its own name (SQLite: "main"),
     /// shown flattened in the explorer.
     pub fn flat_schema(self) -> bool {
-        matches!(self, Driver::Sqlite | Driver::MySql | Driver::MariaDb)
+        matches!(self, Driver::Sqlite | Driver::MySql | Driver::MariaDb | Driver::Redis | Driver::MongoDb)
     }
 
     /// Engines whose server has several databases that can be created and dropped from the app.
@@ -72,7 +96,9 @@ impl Driver {
         match self {
             Driver::MsSql => format!("[{}]", name.replace(']', "]]")),
             Driver::MySql | Driver::MariaDb => format!("`{}`", name.replace('`', "``")),
-            Driver::Postgres | Driver::Sqlite | Driver::Oracle | Driver::Snowflake => format!("\"{}\"", name.replace('"', "\"\"")),
+            Driver::Postgres | Driver::Sqlite | Driver::Oracle | Driver::Snowflake | Driver::Redis | Driver::MongoDb => {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
         }
     }
 }
@@ -157,6 +183,8 @@ impl ConnectionConfig {
                 Driver::MsSql => "master".into(),
                 // Oracle: service name of the pluggable database.
                 Driver::Oracle => "FREEPDB1".into(),
+                Driver::MongoDb => "test".into(),
+                Driver::Redis => "0".into(),
                 Driver::Sqlite | Driver::MySql | Driver::MariaDb | Driver::Snowflake => String::new(),
             },
             user: match driver {
@@ -164,7 +192,7 @@ impl ConnectionConfig {
                 Driver::MsSql => "sa".into(),
                 Driver::MySql | Driver::MariaDb => "root".into(),
                 Driver::Oracle => "system".into(),
-                Driver::Sqlite | Driver::Snowflake => String::new(),
+                Driver::Sqlite | Driver::Snowflake | Driver::Redis | Driver::MongoDb => String::new(),
             },
             password: String::new(),
             file_path: String::new(),
@@ -339,6 +367,8 @@ pub enum Session {
     MySql(Box<mysql::MySession>),
     Oracle(Box<oracle::OraSession>),
     Snowflake(Box<snowflake::SfSession>),
+    Redis(Box<redis_db::RedisSession>),
+    MongoDb(Box<mongo::MongoSession>),
 }
 
 impl Session {
@@ -375,6 +405,8 @@ impl Session {
             Driver::MySql | Driver::MariaDb => Session::MySql(Box::new(mysql::MySession::connect(cfg).await?)),
             Driver::Oracle => Session::Oracle(Box::new(oracle::OraSession::connect(cfg).await?)),
             Driver::Snowflake => Session::Snowflake(Box::new(snowflake::SfSession::connect(cfg).await?)),
+            Driver::Redis => Session::Redis(Box::new(redis_db::RedisSession::connect(cfg).await?)),
+            Driver::MongoDb => Session::MongoDb(Box::new(mongo::MongoSession::connect(cfg).await?)),
         })
     }
 
@@ -388,6 +420,8 @@ impl Session {
             Session::MySql(s) => s.execute(sql, max_rows).await,
             Session::Oracle(s) => s.execute(sql, max_rows).await,
             Session::Snowflake(s) => s.execute(sql, max_rows).await,
+            Session::Redis(s) => s.execute(sql, max_rows).await,
+            Session::MongoDb(s) => s.execute(sql, max_rows).await,
         }
     }
 
@@ -400,6 +434,8 @@ impl Session {
             Session::MySql(s) => s.current_database().await,
             Session::Oracle(s) => s.current_database().await,
             Session::Snowflake(s) => s.current_database().await,
+            Session::Redis(s) => s.current_database().await,
+            Session::MongoDb(s) => s.current_database().await,
         }
     }
 
@@ -412,6 +448,8 @@ impl Session {
             Session::MySql(s) => s.list_databases().await,
             Session::Oracle(s) => s.list_databases().await,
             Session::Snowflake(s) => s.list_databases().await,
+            Session::Redis(s) => s.list_databases().await,
+            Session::MongoDb(s) => s.list_databases().await,
         }
     }
 
@@ -427,6 +465,8 @@ impl Session {
             Session::MsSql(s) if !db.is_empty() => s.use_database(db).await,
             Session::MySql(s) if !db.is_empty() => s.use_database(db).await,
             Session::Snowflake(s) if !db.is_empty() => s.use_database(db).await,
+            Session::Redis(s) if !db.is_empty() => s.use_database(db).await,
+            Session::MongoDb(s) if !db.is_empty() => s.use_database(db).await,
             _ => Ok(()),
         }
     }
@@ -442,6 +482,7 @@ impl Session {
             Session::MySql(s) => s.apply_changes(statements).await,
             Session::Oracle(s) => s.apply_changes(statements).await,
             Session::Snowflake(s) => s.apply_changes(statements).await,
+            Session::Redis(_) | Session::MongoDb(_) => anyhow::bail!(crate::i18n::tr("Editing is not available for this engine")),
         }
     }
 
@@ -464,6 +505,9 @@ impl Session {
     /// Runs the statements in ONE transaction (all or nothing), without the one-row rule of
     /// `apply_changes`. Returns the affected rows when the engine reports them.
     pub async fn run_transaction(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        if matches!(self, Session::Redis(_) | Session::MongoDb(_)) {
+            anyhow::bail!(crate::i18n::tr("Editing is not available for this engine"));
+        }
         if let Session::Oracle(s) = self {
             return s.run_transaction(statements).await;
         }
@@ -499,6 +543,8 @@ impl Session {
             Session::MySql(s) => s.is_closed(),
             Session::Oracle(s) => s.is_closed(),
             Session::Snowflake(s) => s.is_closed(),
+            Session::Redis(s) => s.is_closed(),
+            Session::MongoDb(s) => s.is_closed(),
         }
     }
 
@@ -511,12 +557,19 @@ impl Session {
             Session::MySql(s) => s.introspect().await,
             Session::Oracle(s) => s.introspect().await,
             Session::Snowflake(s) => s.introspect().await,
+            Session::Redis(s) => s.introspect().await,
+            Session::MongoDb(s) => s.introspect().await,
         }
     }
 
     /// Product and version for the dialog's Test Connection ("Snowflake 10.37.102",
     /// "PostgreSQL 16.4"…), or None when the server won't say.
     pub async fn server_version(&mut self, driver: Driver) -> Option<String> {
+        match self {
+            Session::Redis(s) => return s.server_version().await,
+            Session::MongoDb(s) => return s.server_version().await,
+            _ => {}
+        }
         let sql = match driver {
             Driver::Postgres => "SHOW server_version",
             Driver::MySql | Driver::MariaDb => "SELECT VERSION()",
@@ -524,6 +577,7 @@ impl Session {
             Driver::Oracle => "SELECT version FROM product_component_version WHERE product LIKE 'Oracle%'",
             Driver::Sqlite => "SELECT sqlite_version()",
             Driver::Snowflake => "SELECT CURRENT_VERSION()",
+            Driver::Redis | Driver::MongoDb => return None,
         };
         let rs = self.execute(sql, 1).await.ok()?;
         let v = rs.into_iter().next()?.rows.into_iter().next()?.into_iter().next()??;
@@ -542,6 +596,8 @@ impl Session {
     pub fn quote_table(driver: Driver, schema: &str, table: &str) -> String {
         match driver {
             Driver::Postgres | Driver::Snowflake => format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\"")),
+            // No qualified names: a collection or a key pattern, as is.
+            Driver::Redis | Driver::MongoDb => table.to_string(),
             Driver::Sqlite => format!("\"{}\"", table.replace('"', "\"\"")),
             Driver::MsSql => format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]")),
             // MySQL: the schema is the database.
