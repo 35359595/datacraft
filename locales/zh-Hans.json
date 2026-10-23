@@ -855,6 +855,10 @@
     "Use an Oracle directory object and a .dmp filename": "请使用 Oracle 目录对象和 .dmp 文件名",
     "{n} rows": "{n} 行",
     "…": "…",
-    "Backup created: {path}": "备份已创建：{path}"
+    "Backup created: {path}": "备份已创建：{path}",
+    "Actions": "操作",
+    "Record": "记录",
+    "Record {row}": "记录 {row}",
+    "Select a row to see its values": "选择一行以查看其值"
   }
 }

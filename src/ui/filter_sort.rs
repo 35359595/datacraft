@@ -229,14 +229,14 @@ impl Group {
                     ui.selectable_value(&mut self.any, false, tr("All (AND)"));
                     ui.selectable_value(&mut self.any, true, tr("Any (OR)"));
                 });
-            if theme::tool_button(ui, Ico::Plus, tr("Add condition"), false).clicked() {
+            if theme::add_button(ui, Ico::Plus, tr("Add condition")).clicked() {
                 self.children.push(Node::Condition(Condition::new(
                     columns.first().map(|c| c.name.clone()).unwrap_or_default(),
                 )));
             }
             if ui
                 .add_enabled_ui(depth < 8, |ui| {
-                    theme::tool_button(ui, Ico::Folder, tr("Add group"), false)
+                    theme::add_button(ui, Ico::Folder, tr("Add group"))
                 })
                 .inner
                 .clicked()
@@ -425,8 +425,7 @@ impl FilterSort {
                         ui.horizontal(|ui| {
                             ui.strong(tr("Sort By"));
                             if !self.text_mode
-                                && theme::tool_button(ui, Ico::Plus, tr("Add sort column"), false)
-                                    .clicked()
+                                && theme::add_button(ui, Ico::Plus, tr("Add sort column")).clicked()
                             {
                                 self.sort.push(SortRule {
                                     enabled: true,

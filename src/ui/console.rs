@@ -175,7 +175,7 @@ pub struct TableTab {
     pub info_generation: u64,
     pub info_loading: bool,
     pub info: Option<Result<crate::db::object_info::ObjectInfo, String>>,
-    inspector_column: bool,
+    inspector_mode: crate::ui::inspector::InspectorMode,
     pub schema: String,
     pub table: String,
     pub where_clause: String,
@@ -280,7 +280,7 @@ impl Console {
         c.db = db;
         c.table = Some(TableTab {
             view: TableViewOptions::default(), filter_sort: crate::ui::filter_sort::FilterSort::default(), offset: 0, page_size: 1000, page_input: String::new(),
-            counting_page: false, info_requested: false, info_generation: 0, info_loading: false, info: None, inspector_column: false,
+            counting_page: false, info_requested: false, info_generation: 0, info_loading: false, info: None, inspector_mode: crate::ui::inspector::InspectorMode::default(),
             schema,
             table,
             where_clause: String::new(),
@@ -875,7 +875,7 @@ impl Console {
         let mut actions = Vec::new();
         let p = pal(ui);
         if !cx.driver.is_nosql() && self.table.as_ref().is_some_and(|t| t.view.inspector) {
-            egui::Panel::right(egui::Id::new(("table_inspector", self.id))).default_size(250.0).size_range(220.0..=460.0).resizable(true).show(ui, |ui| self.table_inspector(ui, cx, &mut actions));
+            egui::Panel::right(egui::Id::new(("table_inspector", self.id))).default_size(280.0).size_range(240.0..=460.0).resizable(true).show(ui, |ui| self.table_inspector(ui, cx, &mut actions));
         }
         egui::Panel::bottom(egui::Id::new(("table_footer", self.id))).resizable(false).show_separator_line(true).show(ui, |ui| self.table_footer(ui, cx, &mut actions));
         if self.table.as_ref().is_some_and(|t| t.view.cell_editor) {
@@ -1201,34 +1201,54 @@ impl Console {
     }
 
     fn table_inspector(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
+        use crate::ui::inspector::{self, InspectorMode};
         let Some(t) = &mut self.table else { return };
-        ui.set_min_width(210.0);
+        ui.set_min_width(220.0);
         ui.horizontal(|ui| {
-            if theme::tool_button(ui, Ico::Table, tr("Table"), !t.inspector_column).clicked() { t.inspector_column = false; }
-            if theme::tool_button(ui, Ico::Column, tr("Column"), t.inspector_column).clicked() { t.inspector_column = true; }
-            if theme::icon_button(ui, Ico::Refresh, !t.info_loading && !cx.driver.is_nosql(), tr("Refresh information")).clicked() { actions.push(ConsoleAction::Inspect(false)); }
+            inspector::tabs(ui, &mut t.inspector_mode, true);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = theme::icon_button_sized(ui, Ico::MoreVert, !t.info_loading, tr("Actions"), 24.0);
+                egui::Popup::menu(&more).show(|ui| {
+                    if ui.button(tr("Count rows exactly")).clicked() { actions.push(ConsoleAction::Inspect(true)); ui.close(); }
+                });
+                if theme::icon_button_sized(ui, Ico::Refresh, !t.info_loading, tr("Refresh information"), 24.0).clicked() { actions.push(ConsoleAction::Inspect(false)); }
+            });
         });
         let connection = cx.connections.iter().find(|c| Some(c.id) == self.conn).map_or("", |c| c.name.as_str());
         let db = self.db.as_deref().unwrap_or("");
         egui::ScrollArea::vertical().id_salt(("inspector_fields", self.id)).auto_shrink([false, false]).show(ui, |ui| {
-            if t.inspector_column {
-                let selected = self.results.last().and_then(|v| v.selected_cell().map(|(_, c, _)| &v.rs.columns[c]));
-                if let Some(name) = selected {
-                    crate::ui::inspector::header(ui, name, tr("Column"), connection, db);
-                    let column = cx.columns.and_then(|cols| cols.iter().find(|c| c.name == *name));
-                    crate::ui::inspector::property(ui, tr("Type"), column.map(|c| c.data_type.as_str()));
-                    crate::ui::inspector::property(ui, tr("Not null"), column.map(|c| if c.nullable { tr("No") } else { tr("Yes") }));
-                    crate::ui::inspector::property(ui, tr("Primary key"), column.map(|c| if c.primary_key { tr("Yes") } else { tr("No") }));
-                    crate::ui::inspector::property(ui, tr("Default value"), None);
-                    crate::ui::inspector::property(ui, tr("Comment"), None);
-                } else { ui.label(tr("Select a cell to see column information")); }
-            } else {
-                crate::ui::inspector::header(ui, &t.table, tr("Table"), connection, db);
-                if t.info_loading { ui.spinner(); }
-                if let Some(Err(error)) = &t.info { ui.colored_label(ui.visuals().error_fg_color, error); }
-                let info = t.info.as_ref().and_then(|r| r.as_ref().ok());
-                crate::ui::inspector::table_fields(ui, info);
-                if ui.add_enabled(!t.info_loading && !cx.driver.is_nosql(), egui::Button::new(tr("Count rows exactly"))).clicked() { actions.push(ConsoleAction::Inspect(true)); }
+            match t.inspector_mode {
+                InspectorMode::Columns => {
+                    let selected = self.results.last().and_then(|v| v.selected_cell().map(|(_, c, _)| &v.rs.columns[c]));
+                    if let Some(name) = selected {
+                        inspector::header(ui, name, tr("Column"), connection, db, Ico::Column);
+                        let column = cx.columns.and_then(|cols| cols.iter().find(|c| c.name == *name));
+                        inspector::property(ui, tr("Type"), column.map(|c| c.data_type.as_str()));
+                        inspector::property(ui, tr("Not null"), column.map(|c| if c.nullable { tr("No") } else { tr("Yes") }));
+                        inspector::property(ui, tr("Primary key"), column.map(|c| if c.primary_key { tr("Yes") } else { tr("No") }));
+                    } else { ui.label(tr("Select a cell to see column information")); }
+                }
+                InspectorMode::Record => {
+                    if let Some((row, values)) = self.results.last().and_then(ResultView::selected_record) {
+                        let title = trf("Record {row}", &[("row", &(t.offset + row))]);
+                        inspector::header(ui, &title, &t.table, connection, db, Ico::Record);
+                        for (name, value) in values {
+                            let p = pal(ui);
+                            ui.label(RichText::new(name).size(12.0).color(p.muted));
+                            let text = value.as_deref().unwrap_or("NULL");
+                            let response = ui.add(egui::Label::new(text).truncate());
+                            response.context_menu(|ui| { if ui.button(tr("Copy value")).clicked() { ui.ctx().copy_text(text.into()); ui.close(); } });
+                            ui.add_space(12.0);
+                        }
+                    } else { ui.label(tr("Select a row to see its values")); }
+                }
+                InspectorMode::Information => {
+                    let kind = cx.schemas.and_then(|schemas| schemas.iter().find(|schema| schema.name == t.schema)).and_then(|schema| schema.tables.iter().find(|table| table.name == t.table)).map_or(ObjectKind::Table, |table| table.kind);
+                    inspector::header(ui, &t.table, if kind == ObjectKind::View { tr("View") } else { tr("Table") }, connection, db, if kind == ObjectKind::View { Ico::View } else { Ico::Table });
+                    if t.info_loading { ui.spinner(); }
+                    if let Some(Err(error)) = &t.info { ui.colored_label(ui.visuals().error_fg_color, error); }
+                    inspector::table_fields(ui, t.info.as_ref().and_then(|r| r.as_ref().ok()));
+                }
             }
         });
     }
@@ -2256,6 +2276,24 @@ mod tests {
     }
 
     #[test]
+    fn record_inspector_follows_selection_and_pending_values_without_changing_the_grid() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = table_harness();
+        h.state_mut().console.results[0].finish_inline_edit();
+        let view = &mut h.state_mut().console.results[0];
+        view.edit.as_mut().unwrap().state.set_value(&view.rs, crate::ui::editing::RowRef::Existing(0), 1, Some("Pending value".into()));
+        h.get_by_label("Record").click(); h.run_steps(3);
+        assert_eq!(h.state().console.table.as_ref().unwrap().inspector_mode, crate::ui::inspector::InspectorMode::Record);
+        assert!(h.query_by_label("Record 1").is_some());
+        assert!(h.query_all_by_label("Pending value").next().is_some());
+        h.key_press(Key::ArrowDown); h.run_steps(3);
+        assert!(h.query_by_label("Record 2").is_some());
+        assert!(h.query_by_label("Second note").is_some());
+        assert_eq!(h.state().submits, 0);
+        assert!(h.state().console.has_pending_edits());
+    }
+
+    #[test]
     fn table_view_toggles_roundtrip_and_inspector_is_available_without_editing() {
         let view = TableViewOptions { cell_editor: true, filter_sort: true, inspector: false };
         let view: TableViewOptions = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
@@ -2332,6 +2370,10 @@ mod tests {
         h.get_by_label("Filter & Sort").click(); h.get_by_label("Cell Editor").click(); h.run_steps(4);
         assert!(h.query_by_value("Delivery instructions\nLeave at reception.").is_some());
         h.render().unwrap().save(dir.join("cell-editor.png")).unwrap();
+        h.get_by_label("Cell Editor").click(); h.get_by_label("Record").click(); h.run_steps(4);
+        h.render().unwrap().save(dir.join("record-inspector.png")).unwrap();
+        h.get_by_label("Column").click(); h.run_steps(4);
+        h.render().unwrap().save(dir.join("column-inspector.png")).unwrap();
     }
 
     #[test]

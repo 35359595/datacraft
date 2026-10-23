@@ -41,6 +41,7 @@ pub struct ObjectBrowser {
     pub scope: Option<ObjectScope>,
     pub selected: Option<TableRef>,
     pub layout: ObjectLayout,
+    inspector_mode: crate::ui::inspector::InspectorMode,
     pub search: String,
     pub info: Option<Result<ObjectInfo, String>>,
     pub loading: bool,
@@ -504,8 +505,6 @@ impl ObjectBrowser {
                         scope.db.clone(),
                     )));
                 }
-                ui.selectable_value(&mut self.layout, ObjectLayout::Grid, tr("Grid"));
-                ui.selectable_value(&mut self.layout, ObjectLayout::List, tr("List"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .id(egui::Id::new("object_search"))
@@ -556,7 +555,7 @@ impl ObjectBrowser {
                         &[("n", &self.selection.len())],
                     ));
                 }
-                self.information(ui, &entries, connected, &mut actions);
+                self.information(ui, &entries, connection, connected, &mut actions);
             });
         ui.set_clip_rect(ui.clip_rect().intersect(ui.available_rect_before_wrap()));
         let background = ui.available_rect_before_wrap();
@@ -1098,67 +1097,65 @@ impl ObjectBrowser {
         });
     }
 
+    pub fn layout_controls(&mut self, ui: &mut Ui) {
+        if theme::icon_tab(ui, Ico::Grid, tr("Grid"), self.layout == ObjectLayout::Grid).clicked() { self.layout = ObjectLayout::Grid; }
+        if theme::icon_tab(ui, Ico::List, tr("List"), self.layout == ObjectLayout::List).clicked() { self.layout = ObjectLayout::List; }
+    }
+
     fn information(
-        &self,
+        &mut self,
         ui: &mut Ui,
         entries: &[Entry<'_>],
+        connection: Option<&ConnState>,
         connected: bool,
         actions: &mut Vec<BrowserAction>,
     ) {
+        use crate::ui::inspector::{self, InspectorMode};
         let p = pal(ui);
-        ui.add_space(8.0);
-        ui.heading(tr("Information"));
-        ui.separator();
-        let Some(selected) = &self.selected else {
-            ui.label(RichText::new(tr("Select an object to see its information")).color(p.muted));
-            return;
-        };
-        let table = entries
-            .iter()
-            .find(|e| &e.reference == selected)
-            .map(|e| e.info);
-        egui::ScrollArea::vertical().id_salt("object_information_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            crate::ui::inspector::header(ui, &selected.table, table.map(|t| object_kind(t.kind)).unwrap_or(tr("Table")), "", &format!("{} / {}", selected.db, selected.schema));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(connected, egui::Button::new(tr("Open data"))).clicked() {
-                    actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(selected.clone())));
-                }
-                if ui.add_enabled(connected, egui::Button::new("DDL")).clicked() {
-                    actions.push(BrowserAction::Explorer(ExplorerAction::GenerateDdl(selected.clone())));
-                }
-                if theme::icon_button(ui, Ico::Refresh, connected && !self.loading, tr("Refresh information")).clicked() {
+        ui.horizontal(|ui| {
+            inspector::tabs(ui, &mut self.inspector_mode, false);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = theme::icon_button_sized(ui, Ico::MoreVert, self.selected.is_some(), tr("Actions"), 24.0);
+                egui::Popup::menu(&more).show(|ui| {
+                    if let Some(selected) = &self.selected {
+                        for (label, action) in [(tr("Open data"), ExplorerAction::OpenTable(selected.clone())), ("DDL", ExplorerAction::GenerateDdl(selected.clone()))] {
+                            if ui.add_enabled(connected, egui::Button::new(label)).clicked() { actions.push(BrowserAction::Explorer(action)); ui.close(); }
+                        }
+                        if ui.add_enabled(connected && !self.loading, egui::Button::new(tr("Count rows exactly"))).on_hover_text(tr("Runs COUNT(*). Large tables and views may take time.")).clicked() {
+                            actions.push(BrowserAction::Inspect { table: selected.clone(), count_rows: true }); ui.close();
+                        }
+                    }
+                });
+                if theme::icon_button_sized(ui, Ico::Refresh, connected && !self.loading && self.selected.is_some(), tr("Refresh information"), 24.0).clicked() && let Some(selected) = &self.selected {
                     actions.push(BrowserAction::Inspect { table: selected.clone(), count_rows: false });
                 }
             });
-            if self.loading { ui.horizontal(|ui| { ui.spinner(); ui.label(tr("Loading…")); }); }
+        });
+        let connection_name = connection.map_or("", |c| c.cfg.name.as_str());
+        egui::ScrollArea::vertical().id_salt("object_information_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            let Some(selected) = &self.selected else {
+                if let Some(scope) = &self.scope {
+                    inspector::header(ui, &scope.db, tr("Database"), connection_name, scope.schema.as_deref().unwrap_or(""), Ico::Database);
+                    ui.label(RichText::new(tr("Select an object to see its information")).small().color(p.muted));
+                }
+                return;
+            };
+            let table = entries.iter().find(|e| &e.reference == selected).map(|e| e.info);
+            let kind = table.map(|t| t.kind).unwrap_or(ObjectKind::Table);
+            inspector::header(ui, &selected.table, object_kind(kind), connection_name, &selected.db, object_icon(kind));
+            if self.loading { ui.spinner(); }
             if let Some(Err(error)) = &self.info { ui.colored_label(p.error, error); }
-            if ui.add_enabled(connected && !self.loading, egui::Button::new(tr("Count rows exactly")))
-                .on_hover_text(tr("Runs COUNT(*). Large tables and views may take time.")).clicked()
-            {
-                actions.push(BrowserAction::Inspect { table: selected.clone(), count_rows: true });
-            }
-            let info = self.info.as_ref().and_then(|result| result.as_ref().ok());
-            ui.add_space(8.0);
-            crate::ui::inspector::property(ui, tr("Type"), table.map(|t| object_kind(t.kind)));
-            let columns = table.map(|t| t.columns.len().to_string());
-            crate::ui::inspector::property(ui, tr("Columns"), columns.as_deref());
-            crate::ui::inspector::table_fields(ui, info);
-            ui.label(RichText::new(tr("Row estimates and timestamps come from the engine; modified may refer to a definition change.")).small().color(p.muted));
-            if let Some(table) = table {
-                ui.separator();
-                egui::CollapsingHeader::new(tr("Columns")).default_open(true).show(ui, |ui| {
-                    for column in &table.columns {
-                        ui.horizontal_wrapped(|ui| {
-                            if column.primary_key { ui.label(RichText::new("PK").small().color(p.accent)); }
-                            ui.strong(&column.name);
-                            ui.label(RichText::new(&column.data_type).small().color(p.muted));
-                            if !column.nullable { ui.label(RichText::new("NOT NULL").small().color(p.muted)); }
-                        });
-                    }
-                });
+            if self.inspector_mode == InspectorMode::Columns {
+                if let Some(table) = table { for column in &table.columns {
+                    let value = format!("{}{}{}", column.data_type, if column.nullable { "" } else { " · NOT NULL" }, if column.primary_key { " · PK" } else { "" });
+                    inspector::property(ui, &column.name, Some(&value));
+                } }
+            } else {
+                inspector::table_fields(ui, self.info.as_ref().and_then(|result| result.as_ref().ok()));
             }
         });
     }
+
 }
 
 fn object_navigation(
@@ -1395,6 +1392,12 @@ mod tests {
                         theme::apply(ui.ctx(), dark);
                         return;
                     }
+                    egui::Panel::bottom("fixture_status_bar").exact_size(28.0).show(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            state.browser.layout_controls(ui);
+                            ui.label("42 rows · 8 ms");
+                        });
+                    });
                     for action in state.browser.show(ui, &state.connections) {
                         match action {
                             BrowserAction::Inspect { table, count_rows } => {
@@ -1447,6 +1450,7 @@ mod tests {
                 "customers"
             );
             assert!(h.query_all_by_label("≈ 42").next().is_some());
+            h.get_by_label("Actions").click(); h.run_steps(2);
             h.get_by_label("Count rows exactly").click();
             h.run_steps(3);
             assert!(
@@ -1459,6 +1463,7 @@ mod tests {
                     .unwrap()
                     .rows_exact
             );
+            h.get_by_label("Actions").click(); h.run_steps(2);
             h.get_by_label("Open data").click();
             h.run_steps(2);
             assert_eq!(h.state().opened.as_ref().unwrap().table, "customers");
@@ -1466,11 +1471,27 @@ mod tests {
     }
 
     #[test]
+    fn inspector_tabs_separate_columns_from_metadata_and_layout_icons_stay_at_the_bottom() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        assert!(h.get_by_label("List").rect().top() > 670.0);
+        assert!(h.get_by_label("Grid").rect().width() <= 26.0);
+        h.get_by_label("List").click(); h.run_steps(2);
+        assert_eq!(h.state().browser.layout, ObjectLayout::List);
+        h.get_by_label("customers").click(); h.run_steps(3);
+        assert!(h.query_by_label("Open data").is_none());
+        h.get_by_label("Columns").click(); h.run_steps(2);
+        assert_eq!(h.state().browser.inspector_mode, crate::ui::inspector::InspectorMode::Columns);
+        assert!(h.query_by_label("integer · NOT NULL · PK").is_some());
+        h.get_by_label("Information").click(); h.run_steps(2);
+        assert!(h.query_by_label("integer · NOT NULL · PK").is_none());
+    }
+
+    #[test]
     fn compact_grid_shows_only_object_names_while_list_has_statistics_columns() {
         let grid = harness(ObjectLayout::Grid, false);
         assert!(grid.query_by_label("customers").is_some());
         assert!(grid.query_by_label("Rows").is_none());
-        assert!(grid.query_all_by_label("public").next().is_none());
+        assert_eq!(grid.query_all_by_label("public").count(), 1, "schema belongs to the database inspector, not the grid entries");
         let list = harness(ObjectLayout::List, false);
         assert!(list.query_by_label("Rows").is_some());
         assert!(list.query_by_label("Data length").is_some());
@@ -1838,6 +1859,9 @@ mod tests {
                 }
             }
             h.run_steps(3);
+            if layout == ObjectLayout::Grid {
+                h.render().unwrap().save(directory.join("database-overview.png")).unwrap();
+            }
             for (label, color) in [
                 ("Sales", "Purple"),
                 ("Archive", "Orange"),
@@ -1854,6 +1878,9 @@ mod tests {
                 .unwrap()
                 .save(directory.join(format!("{name}.png")))
                 .unwrap();
+            h.get_by_label("Columns").click(); h.run_steps(3);
+            h.render().unwrap().save(directory.join(format!("{name}-columns.png"))).unwrap();
+            h.get_by_label("Information").click(); h.run_steps(3);
             if layout == ObjectLayout::Grid {
                 h.set_size(vec2(1180.0, 720.0));
                 h.run_steps(3);

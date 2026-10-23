@@ -169,6 +169,12 @@ impl ResultView {
 
     pub fn row_position(&self) -> Option<(usize, usize)> { self.selected.map(|(r, _)| (r + 1, self.n_view_rows())) }
 
+    pub fn selected_record(&self) -> Option<(usize, Vec<(&str, Cell)>)> {
+        let (r, _) = self.selected?;
+        let row = self.row_ref(r)?;
+        Some((r + 1, self.rs.columns.iter().enumerate().map(|(c, name)| (name.as_str(), self.display_value(row, c).flatten())).collect()))
+    }
+
     fn commit_cell_editor(&mut self) {
         if let Some(editor) = self.cell_editor.take().filter(|e| e.changed) {
             let value = if editor.null { None } else { Some(editor.buffer) };

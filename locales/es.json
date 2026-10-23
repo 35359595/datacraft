@@ -855,6 +855,10 @@
     "Use an Oracle directory object and a .dmp filename": "Usa un objeto de directorio de Oracle y un archivo .dmp",
     "{n} rows": "{n} filas",
     "…": "…",
-    "Backup created: {path}": "Copia de seguridad creada: {path}"
+    "Backup created: {path}": "Copia de seguridad creada: {path}",
+    "Actions": "Acciones",
+    "Record": "Registro",
+    "Record {row}": "Registro {row}",
+    "Select a row to see its values": "Selecciona una fila para ver sus valores"
   }
 }

@@ -2819,6 +2819,10 @@ impl DataCraftApp {
                         .prefix(tr("max rows: ")),
                 )
                 .on_hover_text(tr("Maximum rows per query (drag or double-click to edit)"));
+                if self.object_browser.active {
+                    self.object_browser.layout_controls(ui);
+                    theme::toolbar_separator(ui);
+                }
                 if let Some(c) = self.consoles.get(self.active) {
                     if c.table.is_none() {
                         let (l, col) = c.line_col();

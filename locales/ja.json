@@ -855,6 +855,10 @@
     "Use an Oracle directory object and a .dmp filename": "Oracle ディレクトリオブジェクトと .dmp ファイル名を指定してください",
     "{n} rows": "{n} 行",
     "…": "…",
-    "Backup created: {path}": "バックアップを作成しました: {path}"
+    "Backup created: {path}": "バックアップを作成しました: {path}",
+    "Actions": "操作",
+    "Record": "レコード",
+    "Record {row}": "レコード {row}",
+    "Select a row to see its values": "行を選択して値を表示します"
   }
 }

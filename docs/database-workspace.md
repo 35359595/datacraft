@@ -6,15 +6,20 @@ reveals matching objects. A collapsed database does not display child folders.
 
 Table editors have **Cell Editor**, **Filter & Sort** and **Information** toggles.
 Their visibility is restored with each saved table tab. The information pane shares
-its layout with Objects and shows catalog metadata or details for the selected
-column. Missing metadata is shown as unavailable. Exact row counts are explicit
-actions; opening a table does not automatically scan it.
+its layout with Objects, with a large colored object icon and small icon tabs.
+Objects separates metadata from its columns; table editors offer table information,
+selected-column details and a record inspector that follows the selected row and
+shows pending values. Metadata actions live in the inspector's menu. Missing
+metadata is shown as unavailable. Exact row counts are explicit actions; opening
+a table does not automatically scan it. Objects' list/grid icons sit in the bottom
+status bar beside the result statistics; their layout preference is still saved.
 
 The cell editor shows multiline text and UTF-8 hex bytes. Apply or moving to another
 cell stages the value through the same pending-edit system as the grid, including
 bulk selections, undo, SQL preview, read-only protection and Save on row change.
 Reset discards only the current panel draft. Hex is a viewer, not a binary editor.
 
+Colored add buttons distinguish adding conditions, groups and sort columns.
 The filter builder supports enabled conditions, nested AND/OR groups, ranges,
 newline-separated value lists, NULL/empty values and literal text matching.
 Pattern characters are escaped. Sort rules can be reordered independently. Text
