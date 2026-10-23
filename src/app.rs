@@ -2555,7 +2555,7 @@ impl DataCraftApp {
             let zoom = ui.ctx().zoom_factor().max(0.1);
             ui.add_space(if fullscreen { 10.0 } else { 80.0 / zoom });
 
-            // Project widget: purple square with the initial + name + chevron.
+            // Project widget uses the same mark as the native window and executable.
             let font = theme::bold(13.0);
             let galley = ui.painter().layout_no_wrap("DataCraft".into(), font, p.text);
             let w = 8.0 + 20.0 + 8.0 + galley.size().x + 4.0 + 14.0 + 8.0;
@@ -2564,8 +2564,7 @@ impl DataCraftApp {
                 ui.painter().rect_filled(r, 6.0, if resp.is_pointer_button_down_on() { p.pressed } else { p.hover });
             }
             let sq = Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 10.0), vec2(20.0, 20.0));
-            ui.painter().rect_filled(sq, 5.0, p.project_badge);
-            ui.painter().text(sq.center(), egui::Align2::CENTER_CENTER, "D", theme::bold(11.5), egui::Color32::WHITE);
+            crate::ui::branding::paint(ui, sq);
             ui.painter().galley(pos2(sq.right() + 8.0, r.center().y - galley.size().y / 2.0), galley.clone(), p.text);
             icons::paint(
                 ui.painter(),
@@ -2820,7 +2819,8 @@ impl DataCraftApp {
                 )
                 .on_hover_text(tr("Maximum rows per query (drag or double-click to edit)"));
                 if self.object_browser.active {
-                    self.object_browser.layout_controls(ui);
+                    let connected = self.object_browser.scope.as_ref().and_then(|scope| self.conn(scope.conn)).is_some_and(|connection| connection.status == ConnStatus::Connected);
+                    if let Some(action) = self.object_browser.status_controls(ui, connected) { self.handle_explorer(ui.ctx(), vec![action]); }
                     theme::toolbar_separator(ui);
                 }
                 if let Some(c) = self.consoles.get(self.active) {
@@ -3009,9 +3009,10 @@ impl DataCraftApp {
             let mut actions = Vec::new();
             theme::island_frame(&p).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
+                actions.extend(self.object_browser.show_inspector(ui, &self.conns));
                 self.editor_tabs(ui);
                 separator(ui, p.island_border);
-                actions = self.object_browser.show(ui, &self.conns);
+                actions.extend(self.object_browser.show(ui, &self.conns));
             });
             for action in actions {
                 match action {
@@ -3365,8 +3366,7 @@ impl DataCraftApp {
                 ui.set_width(320.0);
                 ui.vertical_centered(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                    ui.painter().rect_filled(r, 10.0, p.project_badge);
-                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "D", theme::bold(24.0), egui::Color32::WHITE);
+                    crate::ui::branding::paint(ui, r);
                     ui.add_space(8.0);
                     ui.label(RichText::new("DataCraft").font(theme::bold(17.0)));
                     ui.label(RichText::new(trf("Version {version}", &[("version", &env!("CARGO_PKG_VERSION"))])).color(p.muted));
@@ -4012,6 +4012,65 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/navigation-snapshots");
         std::fs::create_dir_all(&dir).unwrap();
         h.render().unwrap().save(dir.join("tab-menu.png")).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders the project widget and About with the same application mark"]
+    fn render_application_branding() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/branding-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        for dark in [false, true] {
+            let mut app = tabs_app(); app.dark = dark; app.show_about = true;
+            let mut first = true;
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 620.0)).build_ui_state(move |ui, app: &mut DataCraftApp| {
+                if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); theme::apply(ui.ctx(), dark); return; }
+                egui::Panel::top("branding_title").exact_size(40.0).show(ui, |ui| app.title_bar(ui));
+                egui::CentralPanel::default().show(ui, |ui| { app.editor_tabs(ui); });
+                app.dialogs(ui.ctx());
+            }, app);
+            h.run_steps(4);
+            h.render().unwrap().save(dir.join(if dark { "application-brand-dark.png" } else { "application-brand-light.png" })).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders Objects with the real title, tabs, explorer and status bar"]
+    fn render_objects_with_application_chrome() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = tabs_app();
+        let mut cfg = ConnectionConfig::new(7, Driver::MariaDb); cfg.name = "Development".into();
+        let mut connection = ConnState::new(cfg); connection.status = ConnStatus::Connected;
+        let columns = vec![ColumnInfo { name: "id".into(), data_type: "int".into(), nullable: false, primary_key: true }];
+        let tables = ["customers", "orders", "products", "invoices", "payments", "shipments"].into_iter().map(|name| TableInfo { name: name.into(), kind: crate::db::ObjectKind::Table, columns: columns.clone() }).collect();
+        connection.databases.push(DatabaseInfo { name: "shop".into(), current: true, schemas: Some(vec![SchemaInfo { name: "shop".into(), tables }]) });
+        app.conns.push(connection);
+        app.consoles[app.active].conn = Some(7); app.consoles[app.active].db = Some("shop".into());
+        app.explorer.expanded.extend(["c:7".into(), "d:7:shop".into()]);
+        app.object_browser.open(crate::ui::object_browser::ObjectScope { conn: 7, db: "shop".into(), schema: None, kind: None });
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(move |ui, app: &mut DataCraftApp| {
+            if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); theme::apply(ui.ctx(), true); return; }
+            egui::Panel::top("fixture_title").exact_size(40.0).show(ui, |ui| app.title_bar(ui));
+            egui::Panel::bottom("fixture_status").exact_size(28.0).show(ui, |ui| app.status_bar(ui));
+            egui::Panel::left("fixture_explorer").exact_size(250.0).show(ui, |ui| { explorer::show(ui, &mut app.explorer, &app.conns); });
+            egui::CentralPanel::default().show(ui, |ui| app.central(ui));
+        }, app);
+        h.run_steps(4);
+        let tabs_bottom = h.get_all_by_label("Objects").map(|node| node.rect().bottom()).min_by(f32::total_cmp).unwrap();
+        assert!(h.get_by_label("Information").rect().top() < tabs_bottom);
+        assert!(h.get_by_label("Search objects…").rect().top() > 940.0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/branding-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (layout, name) in [(crate::ui::object_browser::ObjectLayout::Grid, "objects-grid"), (crate::ui::object_browser::ObjectLayout::List, "objects-list")] {
+            h.state_mut().object_browser.layout = layout; h.run_steps(3);
+            if h.state().object_browser.selected.is_none() { h.get_by_label("orders").click(); h.run_steps(2); }
+            let app = h.state_mut();
+            let table = app.object_browser.selected.clone().unwrap();
+            let request = app.object_browser.start_request(table);
+            app.object_browser.receive(7, request, Ok(crate::db::object_info::ObjectInfo { rows: Some(42), engine: Some("InnoDB".into()), row_format: Some("Dynamic".into()), auto_increment: Some(43), created: Some("2026-10-01 09:30:00".into()), data_bytes: Some(16384), ..Default::default() }));
+            h.run_steps(3);
+            h.render().unwrap().save(dir.join(format!("{name}.png"))).unwrap();
+        }
     }
 
     #[test]

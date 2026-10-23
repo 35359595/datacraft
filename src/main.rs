@@ -21,7 +21,7 @@ fn main() -> eframe::Result {
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false)
-            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()),
+            .with_icon(ui::branding::icon_data()),
         ..Default::default()
     };
     // Demo mode (see app.rs): don't touch the user's persisted state.

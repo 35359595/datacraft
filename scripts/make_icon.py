@@ -1,45 +1,62 @@
-"""Generates assets/DataCraft.icns (database cylinder on a rounded background)."""
-import pathlib, subprocess, tempfile
+"""Generate every DataCraft application icon from one geometric mark (requires Pillow)."""
+import argparse
+import io
+from pathlib import Path
+
 from PIL import Image, ImageDraw
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-S = 1024
+ROOT = Path(__file__).resolve().parent.parent
+BLUE = (53, 116, 240, 255)
+SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+LEFT, INNER, CENTER, RADIUS, HOLE = 10, 13, 15, 8, 5
+
 
 def draw(size: int) -> Image.Image:
-    k = 4  # supersampling
-    n = size * k
-    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    m = int(n * 0.09)
-    # background with a vertical gradient
-    grad = Image.new("RGBA", (n, n))
-    gd = ImageDraw.Draw(grad)
-    for y in range(n):
-        t = y / n
-        gd.line([(0, y), (n, y)], fill=(int(32 + 20 * t), int(120 - 50 * t), int(214 - 60 * t), 255))
-    mask = Image.new("L", (n, n), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([m, m, n - m, n - m], radius=int(n * 0.2), fill=255)
-    img.paste(grad, (0, 0), mask)
-    # cylinder
-    cx, w = n // 2, int(n * 0.46)
-    top, h, eh = int(n * 0.25), int(n * 0.5), int(n * 0.13)
-    x0, x1 = cx - w // 2, cx + w // 2
-    body = (236, 242, 250, 255)
-    edge = (40, 90, 170, 255)
-    d.rectangle([x0, top + eh // 2, x1, top + h], fill=body)
-    d.ellipse([x0, top + h - eh // 2, x1, top + h + eh // 2], fill=body)
-    for i in (1, 2):
-        y = top + h * i // 3
-        d.arc([x0, y - eh // 2, x1, y + eh // 2], 0, 180, fill=edge, width=int(n * 0.014))
-    d.ellipse([x0, top, x1, top + eh], fill=(255, 255, 255, 255), outline=edge, width=int(n * 0.014))
-    return img.resize((size, size), Image.LANCZOS)
+    scale = size * 4 / 32
+    image = Image.new("RGBA", (size * 4, size * 4))
+    canvas = ImageDraw.Draw(image)
+    box = lambda values: tuple(round(v * scale) for v in values)
+    canvas.rounded_rectangle(box((2, 2, 30, 30)), radius=round(7 * scale), fill=BLUE)
+    for left, radius, color in [(LEFT, RADIUS, "white"), (INNER, HOLE, BLUE)]:
+        canvas.rectangle(box((left, 16 - radius, CENTER, 16 + radius)), fill=color)
+        canvas.pieslice(box((CENTER - radius, 16 - radius, CENTER + radius, 16 + radius)), 270, 90, fill=color)
+    return image.resize((size, size), Image.Resampling.LANCZOS)
 
-with tempfile.TemporaryDirectory() as tmp:
-    iconset = pathlib.Path(tmp) / "DataCraft.iconset"
-    iconset.mkdir()
-    for s in (16, 32, 128, 256, 512):
-        draw(s).save(iconset / f"icon_{s}x{s}.png")
-        draw(s * 2).save(iconset / f"icon_{s}x{s}@2x.png")
-    draw(512).save(ROOT / "assets" / "icon.png")
-    subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(ROOT / "assets" / "DataCraft.icns")], check=True)
-print("ok")
+
+def generate() -> dict[str, bytes]:
+    output = {}
+    for name, size, fmt, options in [
+        ("icon.png", 512, "PNG", {}),
+        ("icon-32.png", 32, "PNG", {}),
+        ("icon-64.png", 64, "PNG", {}),
+        ("icon.ico", 256, "ICO", {"sizes": [(s, s) for s in SIZES], "append_images": [draw(s) for s in SIZES[:-1]]}),
+        ("DataCraft.icns", 1024, "ICNS", {}),
+    ]:
+        buffer = io.BytesIO()
+        draw(size).save(buffer, format=fmt, **options)
+        output[name] = buffer.getvalue()
+    color = "#" + "".join(f"{channel:02x}" for channel in BLUE[:3])
+    output["icon.svg"] = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect x="2" y="2" width="28" height="28" rx="7" fill="{color}"/>
+  <path fill="#fff" fill-rule="evenodd" d="M{LEFT} {16-RADIUS}H{CENTER}a{RADIUS} {RADIUS} 0 0 1 0 {RADIUS*2}H{LEFT}Z M{INNER} {16-HOLE}H{CENTER}a{HOLE} {HOLE} 0 0 1 0 {HOLE*2}H{INNER}Z"/>
+</svg>
+'''.encode()
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="check that committed assets match the generator")
+    args = parser.parse_args()
+    for name, content in generate().items():
+        path = ROOT / "assets" / name
+        if args.check:
+            if not path.is_file() or path.read_bytes() != content:
+                parser.error(f"{path} is out of date; run python scripts/make_icon.py")
+        else:
+            path.write_bytes(content)
+    print("Application icons are up to date." if args.check else "Generated PNG, ICO, ICNS and SVG application icons.")
+
+
+if __name__ == "__main__":
+    main()

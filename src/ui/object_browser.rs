@@ -461,9 +461,6 @@ impl ObjectBrowser {
         let copyable = connection.is_some_and(|c| c.cfg.driver != crate::db::Driver::Redis);
         // New / Edit View: SQL engines only.
         let views = writable && connection.is_some_and(|c| !c.cfg.driver.is_nosql());
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
-            ui.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
-        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
@@ -496,22 +493,7 @@ impl ObjectBrowser {
                 })
                 .color(p.muted),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(12.0);
-                if theme::icon_button(ui, Ico::Refresh, connected, tr("Refresh objects")).clicked()
-                {
-                    actions.push(BrowserAction::Explorer(ExplorerAction::LoadDatabase(
-                        scope.conn,
-                        scope.db.clone(),
-                    )));
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .id(egui::Id::new("object_search"))
-                        .desired_width(180.0)
-                        .hint_text(tr("Search objects…")),
-                );
-            });
+
         });
         ui.add_space(8.0);
         ui.separator();
@@ -544,19 +526,6 @@ impl ObjectBrowser {
             self.loading = false;
             self.request_id = self.request_id.wrapping_add(1);
         }
-        egui::Panel::right("object_information")
-            .default_size(300.0)
-            .size_range(220.0..=520.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                if self.selection.len() > 1 {
-                    ui.label(crate::i18n::trf(
-                        "{n} objects selected",
-                        &[("n", &self.selection.len())],
-                    ));
-                }
-                self.information(ui, &entries, connection, connected, &mut actions);
-            });
         ui.set_clip_rect(ui.clip_rect().intersect(ui.available_rect_before_wrap()));
         let background = ui.available_rect_before_wrap();
         let grid_rows = ((ui.available_height() - 14.0) / (22.0 + ui.spacing().item_spacing.y))
@@ -1097,9 +1066,39 @@ impl ObjectBrowser {
         });
     }
 
-    pub fn layout_controls(&mut self, ui: &mut Ui) {
+    pub fn status_controls(&mut self, ui: &mut Ui, connected: bool) -> Option<ExplorerAction> {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
+            ui.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
+        }
         if theme::icon_tab(ui, Ico::Grid, tr("Grid"), self.layout == ObjectLayout::Grid).clicked() { self.layout = ObjectLayout::Grid; }
         if theme::icon_tab(ui, Ico::List, tr("List"), self.layout == ObjectLayout::List).clicked() { self.layout = ObjectLayout::List; }
+        let refresh = theme::icon_button_sized(ui, Ico::Refresh, connected, tr("Refresh objects"), 24.0).clicked();
+        let previous = self.search.clone();
+        let search = ui.add(egui::TextEdit::singleline(&mut self.search).id(egui::Id::new("object_search")).desired_width(180.0).hint_text(tr("Search objects…")));
+        search.widget_info(|| egui::WidgetInfo { label: Some(tr("Search objects…").into()), ..egui::WidgetInfo::text_edit(ui.is_enabled(), &previous, &self.search, tr("Search objects…")) });
+        if refresh { self.scope.as_ref().map(|scope| ExplorerAction::LoadDatabase(scope.conn, scope.db.clone())) } else { None }
+    }
+
+    pub fn show_inspector(&mut self, ui: &mut Ui, connections: &[ConnState]) -> Vec<BrowserAction> {
+        let mut actions = Vec::new();
+        let Some(scope) = &self.scope else { return actions; };
+        let connection = connections.iter().find(|connection| connection.cfg.id == scope.conn);
+        let connected = connection.is_some_and(|connection| connection.status == ConnStatus::Connected);
+        let entries = self.entries(connections);
+        egui::Panel::right("object_information")
+            .default_size(300.0)
+            .size_range(220.0..=520.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                if self.selection.len() > 1 {
+                    ui.label(crate::i18n::trf(
+                        "{n} objects selected",
+                        &[("n", &self.selection.len())],
+                    ));
+                }
+                self.information(ui, &entries, connection, connected, &mut actions);
+            });
+        actions
     }
 
     fn information(
@@ -1394,11 +1393,13 @@ mod tests {
                     }
                     egui::Panel::bottom("fixture_status_bar").exact_size(28.0).show(ui, |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            state.browser.layout_controls(ui);
+                            state.browser.status_controls(ui, true);
                             ui.label("42 rows · 8 ms");
                         });
                     });
-                    for action in state.browser.show(ui, &state.connections) {
+                    let mut actions = state.browser.show_inspector(ui, &state.connections);
+                    actions.extend(state.browser.show(ui, &state.connections));
+                    for action in actions {
                         match action {
                             BrowserAction::Inspect { table, count_rows } => {
                                 let request = state.browser.start_request(table);
@@ -1475,6 +1476,12 @@ mod tests {
         let mut h = harness(ObjectLayout::Grid, true);
         assert!(h.get_by_label("List").rect().top() > 670.0);
         assert!(h.get_by_label("Grid").rect().width() <= 26.0);
+        assert!(h.get_by_label("Search objects…").rect().top() > 670.0);
+        assert!(h.get_by_label("Information").rect().top() < 35.0);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::F); h.run_steps(2);
+        h.input_mut().events.push(egui::Event::Text("orders".into())); h.run_steps(3);
+        assert_eq!(h.state().browser.search, "orders");
+        h.state_mut().browser.search.clear(); h.run_steps(2);
         h.get_by_label("List").click(); h.run_steps(2);
         assert_eq!(h.state().browser.layout, ObjectLayout::List);
         h.get_by_label("customers").click(); h.run_steps(3);

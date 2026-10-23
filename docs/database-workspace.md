@@ -11,8 +11,10 @@ Objects separates metadata from its columns; table editors offer table informati
 selected-column details and a record inspector that follows the selected row and
 shows pending values. Metadata actions live in the inspector's menu. Missing
 metadata is shown as unavailable. Exact row counts are explicit actions; opening
-a table does not automatically scan it. Objects' list/grid icons sit in the bottom
-status bar beside the result statistics; their layout preference is still saved.
+a table does not automatically scan it. Objects' search field, refresh and list/grid
+icons sit in the bottom status bar beside the result statistics; their layout
+preference is still saved. Ctrl+F focuses the search field. The object inspector
+starts alongside the editor tabs, above the object-list heading.
 
 The cell editor shows multiline text and UTF-8 hex bytes. Apply or moving to another
 cell stages the value through the same pending-edit system as the grid, including
