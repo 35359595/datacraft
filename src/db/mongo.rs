@@ -743,6 +743,37 @@ pub fn split_script(script: &str) -> Vec<(usize, usize)> {
     out
 }
 
+impl MongoSession {
+    /// "Copy Table To…" target: inserts the documents with one unordered `insertMany`, creating
+    /// the collection if needed. Documents whose `_id` is already there (duplicate key) are
+    /// skipped instead of failing the copy; any other error fails it. Returns (inserted, skipped).
+    pub async fn insert_skipping_duplicates(&mut self, collection: &str, docs: Vec<Document>) -> anyhow::Result<(u64, u64)> {
+        use mongodb::error::ErrorKind;
+        let n = docs.len() as u64;
+        if n == 0 {
+            return Ok((0, 0));
+        }
+        let coll = self.client.database(&self.db).collection::<Document>(collection);
+        match coll.insert_many(docs).ordered(false).await {
+            Ok(r) => Ok((r.inserted_ids.len() as u64, 0)),
+            Err(e) => {
+                if let ErrorKind::InsertMany(ref im) = *e.kind
+                    && im.write_concern_error.is_none()
+                    && let Some(errors) = &im.write_errors
+                    && errors.iter().all(|w| w.code == DUPLICATE_KEY)
+                {
+                    let skipped = errors.len() as u64;
+                    return Ok((n.saturating_sub(skipped), skipped));
+                }
+                Err(self.fail(e))
+            }
+        }
+    }
+}
+
+/// Server error code of a write that breaks a unique index (`_id` included).
+const DUPLICATE_KEY: i32 = 11000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1248,14 +1248,18 @@ impl DataCraftApp {
                 ExplorerAction::DropObject(t, _)
                 | ExplorerAction::TruncateTable(t)
                 | ExplorerAction::ImportData(t)
-                | ExplorerAction::CopyTable(t)
                 | ExplorerAction::RenameTable(t)
                 | ExplorerAction::GenerateSelect(t)
                 | ExplorerAction::GenerateInsert(t)
                 | ExplorerAction::GenerateDdl(t) => Some(t.conn),
                 _ => None,
             };
-            if sql_only.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.driver.is_nosql()) {
+            // Copying works with MongoDB collections too, but not with Redis keys.
+            let redis = match &a {
+                ExplorerAction::CopyTable(t) => self.conn(t.conn).is_some_and(|c| c.cfg.driver == Driver::Redis),
+                _ => false,
+            };
+            if redis || sql_only.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.driver.is_nosql()) {
                 self.error(tr("Not available for this engine").to_string());
                 continue;
             }
@@ -1436,10 +1440,17 @@ impl DataCraftApp {
     fn start_copy(&mut self, request: crate::db::copy::CopyRequest) {
         let Some(d) = self.copy.as_mut() else { return };
         let Some(driver) = self.conns.iter().find(|c| c.cfg.id == d.source).map(|c| c.cfg.driver) else { return };
-        let select = crate::db::copy::select_sql(driver, &request.source_schema, &request.source_table, &request.columns, &request.filter, None);
-        if request.filter.contains(';') || !is_query(&select) {
-            d.error = Some(tr("The WHERE condition can only read data").to_string());
-            return;
+        if driver == Driver::MongoDb {
+            if !crate::db::copy::is_read_filter(&request.filter) {
+                d.error = Some(tr("The filter must be one JSON document that only reads, e.g. {status: \"active\"}").to_string());
+                return;
+            }
+        } else {
+            let select = crate::db::copy::select_sql(driver, &request.source_schema, &request.source_table, &request.columns, &request.filter, None);
+            if request.filter.contains(';') || !is_query(&select) {
+                d.error = Some(tr("The WHERE condition can only read data").to_string());
+                return;
+            }
         }
         let mut request = request;
         if request.masks.iter().any(|m| *m != crate::db::copy::Mask::Keep) {

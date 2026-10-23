@@ -706,7 +706,7 @@ fn object_groups(
     s: &SchemaInfo,
     filter: &str,
     depth: usize,
-    // Redis and MongoDB: their own folder names, and no DDL, import or copy. Schema-level
+    // Redis and MongoDB: their own folder names, and no DDL or import (MongoDB can copy). Schema-level
     // callers (only SQL engines get there) pass any SQL driver.
     driver: Driver,
 ) {
@@ -772,12 +772,13 @@ fn object_groups(
         }
         for t in tables {
             let tref = TableRef { conn, db: db.to_string(), schema: s.name.clone(), table: t.name.clone() };
-            table_rows(ui, state, actions, tref, t, depth + 1, sql);
+            table_rows(ui, state, actions, tref, t, depth + 1, sql, driver != Driver::Redis);
         }
     }
 }
 
-fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize, sql: bool) {
+#[allow(clippy::too_many_arguments)]
+fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize, sql: bool, copyable: bool) {
     let p = pal(ui);
     let tkey = table_key(&tref);
     let open = state.expanded.contains(&tkey);
@@ -816,8 +817,15 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             ui.ctx().copy_text(t.name.clone());
             ui.close();
         }
-        // Redis and MongoDB: no SQL generation, DDL, import or copy.
+        // Redis and MongoDB: no SQL generation, DDL or import; MongoDB collections can be copied.
         if !sql {
+            if copyable {
+                ui.separator();
+                if ui.button(tr("Copy Table To…")).clicked() {
+                    actions.push(ExplorerAction::CopyTable(tref.clone()));
+                    ui.close();
+                }
+            }
             return;
         }
         ui.separator();

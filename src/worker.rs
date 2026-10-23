@@ -1318,4 +1318,83 @@ mod tests {
         assert_eq!(cols, vec!["_id", "name", "tags", "at", "age"]);
         first_rows(&w, 42, 3, &["db.users.drop()"]);
     }
+
+    /// SQLite → MongoDB (masking the names), MongoDB → MongoDB (again: duplicates skipped) and
+    /// MongoDB → SQLite (creating the table). Needs `DATACRAFT_MONGO_PORT` like the test above.
+    #[test]
+    #[ignore]
+    fn copies_between_sqlite_and_mongodb() {
+        use crate::db::copy::Mask;
+        let dir = std::env::temp_dir().join(format!("datacraft-copy-mongo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = people_db(&dir);
+        let target = dir.join("target.db");
+        rusqlite::Connection::open(&target).unwrap();
+        let mut cfg = ConnectionConfig::new(43, Driver::MongoDb);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27017);
+        cfg.database = "dc_test".into();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(sqlite_cfg(44, &source)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 44, .. }));
+        w.send(Request::Connect(sqlite_cfg(45, &target)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 45, .. }));
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 43, .. } | Response::ConnectFailed { conn: 43, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        first_rows(&w, 43, 1, &["db.dc_people.drop()", "db.dc_people2.drop()"]);
+
+        // SQLite → MongoDB: typed fields, fake names.
+        let mut req = copy_request("dc_test", "dc_people", "", 100, true, false);
+        req.masks[1] = Mask::Name;
+        assert_eq!(run_copy(&w, 44, 43, 1, req), Ok(40));
+        let rs = first_rows(&w, 43, 2, &[
+            "db.dc_people.countDocuments({id: {$type: 'int'}, ok: {$type: 'bool'}})",
+            "db.dc_people.countDocuments({ok: true})",
+            "db.dc_people.countDocuments({name: /^O'Brien/})",
+        ]);
+        let count = |i: usize| rs[i].rows[0][0].clone().unwrap();
+        assert_eq!((count(0), count(1), count(2)), ("40".into(), "20".into(), "0".into()));
+
+        // MongoDB → MongoDB, twice: the second time every `_id` is already there.
+        let col = |name: &str, ty: &str| crate::db::ColumnInfo { name: name.into(), data_type: ty.into(), nullable: name != "_id", primary_key: name == "_id" };
+        let columns = vec![col("_id", "objectId"), col("id", "int"), col("name", "string"), col("ok", "bool")];
+        let mongo_req = |target_table: &str, filter: &str, create: bool| crate::db::copy::CopyRequest {
+            source_db: "dc_test".into(),
+            source_schema: "dc_test".into(),
+            source_table: "dc_people".into(),
+            target_names: columns.iter().map(|c| c.name.clone()).collect(),
+            columns: columns.clone(),
+            filter: filter.into(),
+            percent: 100,
+            target_db: if target_table.starts_with("dc_") { "dc_test".into() } else { "main".into() },
+            target_schema: if target_table.starts_with("dc_") { "dc_test".into() } else { "main".into() },
+            target_table: target_table.into(),
+            create,
+            clear: false,
+            masks: vec![Mask::Keep; 4],
+            mask_key: "test-key".into(),
+            parents: false,
+            children: false,
+            mask_related: false,
+        };
+        assert_eq!(run_copy(&w, 43, 43, 2, mongo_req("dc_people2", "", true)), Ok(40));
+        assert_eq!(run_copy(&w, 43, 43, 3, mongo_req("dc_people2", "", false)), Ok(0));
+        let rs = first_rows(&w, 43, 3, &["db.dc_people2.countDocuments({_id: {$type: 'objectId'}, id: {$type: 'int'}})"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("40"));
+
+        // MongoDB → SQLite with a filter (braces optional), creating the table.
+        assert_eq!(run_copy(&w, 43, 45, 4, mongo_req("from_mongo", "ok: true", true)), Ok(20));
+        let db = rusqlite::Connection::open(&target).unwrap();
+        let (n, ids, oks, keys, real): (i64, i64, i64, i64, i64) = db
+            .query_row(
+                "select count(*), sum(typeof(id) = 'integer'), sum(ok = 1), sum(length(_id) = 24), sum(name like 'O''Brien%') from from_mongo",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((n, ids, oks, keys, real), (20, 20, 20, 20, 0));
+        first_rows(&w, 43, 4, &["db.dc_people.drop()", "db.dc_people2.drop()"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

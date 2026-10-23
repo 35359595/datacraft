@@ -457,6 +457,7 @@ impl ObjectBrowser {
         let connection = connections.iter().find(|c| c.cfg.id == scope.conn);
         let connected = connection.is_some_and(|c| c.status == ConnStatus::Connected);
         let writable = connected && connection.is_some_and(|c| !c.cfg.read_only);
+        let copyable = connection.is_some_and(|c| c.cfg.driver != crate::db::Driver::Redis);
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
         }
@@ -858,7 +859,7 @@ impl ObjectBrowser {
             .map(|(item, r)| (item.key.clone(), r.rect.intersect(background)))
             .collect();
         for (item, response) in responses {
-            self.item_response(response, item, &keys, org_index, writable, &mut actions);
+            self.item_response(response, item, &keys, org_index, writable, copyable, &mut actions);
         }
         if items.is_empty() {
             ui.label(RichText::new(tr("No matching objects")).color(p.muted));
@@ -884,6 +885,8 @@ impl ObjectBrowser {
         actions
     }
 
+    /// `copyable`: "Copy Table To…" is offered (SQL tables and MongoDB collections, not Redis).
+    #[allow(clippy::too_many_arguments)]
     fn item_response(
         &mut self,
         response: egui::Response,
@@ -891,6 +894,7 @@ impl ObjectBrowser {
         keys: &[ItemKey],
         org_index: usize,
         writable: bool,
+        copyable: bool,
         actions: &mut Vec<BrowserAction>,
     ) {
         let mods = response.ctx.input(|i| i.modifiers);
@@ -977,7 +981,7 @@ impl ObjectBrowser {
                     }
                     ui.close();
                 }
-                if ui.add_enabled(tables.len() == 1, egui::Button::new(tr("Copy Table To…"))).clicked() {
+                if copyable && ui.add_enabled(tables.len() == 1, egui::Button::new(tr("Copy Table To…"))).clicked() {
                     if let Some(table) = tables.first() {
                         actions.push(BrowserAction::Explorer(ExplorerAction::CopyTable(table.clone())));
                     }
