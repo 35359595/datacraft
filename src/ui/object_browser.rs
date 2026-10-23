@@ -433,6 +433,10 @@ impl ObjectBrowser {
         ui.set_min_size(ui.available_size());
         let mut actions = self.schema_search.show(ui.ctx(), connections);
         let Some(scope) = self.scope.clone() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() / 3.0);
+                ui.label(RichText::new(tr("Select a database in the explorer to browse its objects.")).color(pal(ui).muted));
+            });
             return actions;
         };
         let org_index = self

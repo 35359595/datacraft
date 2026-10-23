@@ -1,5 +1,6 @@
 {
   "app": {
+    "Select a database in the explorer to browse its objects.": "エクスプローラーでデータベースを選択して、そのオブジェクトを参照してください。",
     "Another save is in progress; try again when it finishes": "別の保存処理が実行中です。完了してから再試行してください",
     "Cancel": "キャンセル",
     "Close": "閉じる",

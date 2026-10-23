@@ -397,28 +397,7 @@ impl DataCraftApp {
             demo_window: None,
             lang: persisted.lang,
         };
-        for pc in persisted.consoles {
-            let conn = pc.conn.filter(|id| app.conns.iter().any(|c| c.cfg.id == *id));
-            let id = app.alloc_console_id();
-            match (pc.table, conn) {
-                (Some((schema, table)), Some(conn)) => {
-                    let mut console = Console::new_table(id, conn, pc.db, schema, table);
-                    if let Some(t) = &mut console.table { t.save_on_row_change = app.save_on_row_change; t.view = pc.table_view; }
-                    app.consoles.push(console);
-                }
-                (Some(_), None) => {}
-                (None, _) => {
-                    let mut c = Console::new(id, pc.title, pc.text, conn);
-                    c.db = pc.db.filter(|_| conn.is_some());
-                    app.consoles.push(c);
-                }
-            }
-        }
-        if app.consoles.is_empty() && demo.is_none() {
-            let conn = app.conns.first().map(|c| c.cfg.id);
-            app.new_console(conn, None, String::new());
-        }
-        app.active = persisted.active.min(app.consoles.len().saturating_sub(1));
+        app.restore_tabs(persisted.consoles, persisted.active);
         if let Some(path) = demo {
             app.start_demo(&path);
         }
@@ -429,6 +408,29 @@ impl DataCraftApp {
         cc.egui_ctx.set_zoom_factor(app.zoom);
         app.applied_zoom = Some(app.zoom);
         app
+    }
+
+    /// Keep saved SQL accessible without selecting or creating a console at startup.
+    fn restore_tabs(&mut self, consoles: Vec<PersistedConsole>, active: usize) {
+        for pc in consoles {
+            let conn = pc.conn.filter(|id| self.conns.iter().any(|c| c.cfg.id == *id));
+            let id = self.alloc_console_id();
+            match (pc.table, conn) {
+                (Some((schema, table)), Some(conn)) => {
+                    let mut console = Console::new_table(id, conn, pc.db, schema, table);
+                    if let Some(t) = &mut console.table { t.save_on_row_change = self.save_on_row_change; t.view = pc.table_view; }
+                    self.consoles.push(console);
+                }
+                (Some(_), None) => {}
+                (None, _) => {
+                    let mut c = Console::new(id, pc.title, pc.text, conn);
+                    c.db = pc.db.filter(|_| conn.is_some());
+                    self.consoles.push(c);
+                }
+            }
+        }
+        self.active = active.min(self.consoles.len().saturating_sub(1));
+        self.object_browser.active = true;
     }
 
     /// Demo mode (`DATACRAFT_DEMO`): temporary SQLite connection, console and data editor.
@@ -2886,7 +2888,7 @@ impl DataCraftApp {
                 egui::ScrollArea::horizontal().id_salt("editor_tabs").max_width(scroll_w).show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if self.object_browser.scope.is_some() {
+                        if self.object_browser.active || self.object_browser.scope.is_some() {
                             let (response, _) = theme::tab(ui, self.object_browser.active, Some(Ico::Folder), tr("Objects"), false);
                             if response.clicked() { self.object_browser.active = true; }
                             response.context_menu(|ui| {
@@ -3921,6 +3923,38 @@ mod tests {
             demo_explorer_w: None, demo_window: None, lang: None,
             modify: None,
         }
+    }
+
+    #[test]
+    fn startup_opens_objects_without_creating_or_losing_console_tabs() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = tabs_app();
+        app.consoles.clear();
+        app.restore_tabs(Vec::new(), 9);
+        assert!(app.consoles.is_empty());
+        assert_eq!(app.active, 0);
+        assert!(app.object_browser.active);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().build_ui_state(move |ui, app: &mut DataCraftApp| {
+            if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); return; }
+            app.central(ui);
+        }, app);
+        h.run_steps(3);
+        assert!(h.query_by_label("Objects").is_some());
+        assert!(h.query_by_label("Select a database in the explorer to browse its objects.").is_some());
+        let app = h.state_mut();
+        app.restore_tabs(vec![PersistedConsole {
+            title: "Saved query".into(), text: "SELECT 42;".into(), conn: None,
+            table: None, table_view: Default::default(), db: None,
+        }], 7);
+        assert!(app.object_browser.active);
+        assert_eq!(app.consoles.len(), 1);
+        assert_eq!(app.consoles[0].text, "SELECT 42;");
+        h.run_steps(2);
+        h.get_by_label("Saved query").click();
+        h.run_steps(2);
+        assert!(!h.state().object_browser.active);
+        assert_eq!(h.state().consoles[0].text, "SELECT 42;");
     }
 
     #[test]

@@ -40,3 +40,7 @@ writes. Oracle page navigation beyond the first page requires Oracle 12c or late
 The structured builder and SQL paging apply to SQL engines. Redis and MongoDB keep
 their existing engine-specific query fields. Backups are described in
 [Database backups](database-backups.md).
+
+Startup opens the empty Objects workspace instead of creating or selecting a SQL
+console. Existing query and data tabs are restored and remain available; selecting
+a database in the explorer opens its objects.

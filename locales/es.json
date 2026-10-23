@@ -1,5 +1,6 @@
 {
   "app": {
+    "Select a database in the explorer to browse its objects.": "Selecciona una base de datos en el explorador para ver sus objetos.",
     "Another save is in progress; try again when it finishes": "Hay otro guardado en curso; inténtalo de nuevo cuando termine",
     "Cancel": "Cancelar",
     "Close": "Cerrar",
