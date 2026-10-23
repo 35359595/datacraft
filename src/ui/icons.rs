@@ -41,6 +41,8 @@ pub enum Ico {
     SortAsc,
     SortDesc,
     Lock,
+    /// A user or role (Database Explorer "Users" / "Roles").
+    User,
     Services,
     Terminal,
     Problems,
@@ -265,6 +267,10 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
             arc(painter, at(8.0, 6.5), 3.0 * s, PI, TAU, st(color));
             line(&[(5.0, 6.5), (5.0, 7.0)], color);
             line(&[(11.0, 6.5), (11.0, 7.0)], color);
+        }
+        Ico::User => {
+            painter.circle_stroke(at(8.0, 5.5), 2.8 * s, st(color));
+            arc(painter, at(8.0, 14.5), 5.5 * s, PI, TAU, st(color));
         }
         Ico::Services => {
             painter.circle_stroke(at(8.0, 8.0), 6.0 * s, st(color));

@@ -33,6 +33,8 @@
 //! `DATACRAFT_DEMO_VIEW=new|edit` opens "New View" over the first table or "Edit View" on the first view.
 //! `DATACRAFT_DEMO_MODIFY=1` opens "Modify Table…" on the first table; `edit` also makes a few
 //! sample changes (shown in the preview, never run).
+//! `DATACRAFT_DEMO_USERS=1` expands the "Users" / "Roles" folder; `new|edit|drop` also opens that
+//! dialog (edit and drop on the first account that is not root).
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -123,17 +125,20 @@ pub struct ConnState {
     pub loading: HashSet<String>,
     /// Last error loading each database.
     pub db_errors: HashMap<String, String>,
+    /// The "Users" / "Roles" folder.
+    pub users: crate::ui::user_dialog::UsersNode,
 }
 
 impl ConnState {
     pub fn new(cfg: ConnectionConfig) -> Self {
-        Self { cfg, status: ConnStatus::Disconnected, databases: Vec::new(), loading: HashSet::new(), db_errors: HashMap::new() }
+        Self { cfg, status: ConnStatus::Disconnected, databases: Vec::new(), loading: HashSet::new(), db_errors: HashMap::new(), users: Default::default() }
     }
 
     fn clear(&mut self) {
         self.databases.clear();
         self.loading.clear();
         self.db_errors.clear();
+        self.users = Default::default();
     }
 
     /// The connection's default database (if connected).
@@ -279,6 +284,8 @@ pub struct DataCraftApp {
     mask_export: Option<MaskExportDialog>,
     /// "Modify Table…".
     modify: Option<ModifyTableDialog>,
+    /// "New User…" / "Edit User…" / "Drop User…" (and the PostgreSQL role ones).
+    user_dialog: Option<crate::ui::user_dialog::UserDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -358,6 +365,7 @@ impl DataCraftApp {
             copy: None,
             mask_export: None,
             modify: None,
+            user_dialog: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -600,6 +608,10 @@ impl DataCraftApp {
                     self.recheck_edit_targets(conn);
                     if self.demo_pending {
                         self.demo_pending = false;
+                        if std::env::var("DATACRAFT_DEMO_USERS").is_ok() {
+                            self.explorer.expanded.insert(format!("u:{conn}"));
+                            self.load_users(conn);
+                        }
                         let first = self.conn(conn).and_then(|c| {
                             let db = c.default_db()?.to_string();
                             c.schemas(None)?
@@ -761,6 +773,7 @@ impl DataCraftApp {
                 Response::ViewDefinition { conn, request_id, result } => self.view_definition_received(conn, request_id, result),
                 Response::TableDetails { request_id, result } => self.modify_loaded(request_id, result.map(|d| *d)),
                 Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
+                Response::Users { conn, result } => self.users_response(conn, result),
             }
         }
     }
@@ -1397,6 +1410,10 @@ impl DataCraftApp {
                 ExplorerAction::GenerateSelect(t) => self.generate(ctx, &t, Generate::Select),
                 ExplorerAction::GenerateInsert(t) => self.generate(ctx, &t, Generate::Insert),
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
+                ExplorerAction::LoadUsers(id) => self.load_users(id),
+                ExplorerAction::NewUser(id) => self.open_user_dialog(id, None, false),
+                ExplorerAction::EditUser(id, account) => self.open_user_dialog(id, Some(account), false),
+                ExplorerAction::DropUser(id, account) => self.open_user_dialog(id, Some(account), true),
                 ExplorerAction::Hide => self.show_explorer = false,
             }
         }
@@ -1701,6 +1718,157 @@ impl DataCraftApp {
         self.info(trf("Table “{name}” modified", &[("name", &new_name)]));
     }
 
+    /// Loads (or reloads) the "Users" / "Roles" folder of a connection.
+    fn load_users(&mut self, conn: ConnId) {
+        let Some(c) = self.conn_mut(conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        if crate::db::users::UserModel::of(c.cfg.driver).is_none() {
+            return;
+        }
+        c.users.loading = true;
+        self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::List });
+    }
+
+    /// User editor: a new user (`account` None), an existing one, or the confirmation to drop it.
+    /// Read-only connections can open the editor to look, but not create or drop.
+    fn open_user_dialog(&mut self, conn: ConnId, account: Option<crate::db::users::Account>, drop: bool) {
+        use crate::ui::user_dialog::UserDialog;
+        if (drop || account.is_none()) && self.refuse_read_only(conn) {
+            return;
+        }
+        let Some(c) = self.conn(conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        let (driver, read_only) = (c.cfg.driver, c.cfg.read_only);
+        if crate::db::users::UserModel::of(driver).is_none() {
+            return;
+        }
+        if c.users.list.is_none() && !c.users.loading {
+            self.load_users(conn);
+        }
+        self.user_dialog = Some(match account {
+            None => UserDialog::new_user(conn, driver),
+            Some(a) if drop => UserDialog::drop(conn, driver, a),
+            Some(a) => {
+                self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::Detail(a.clone()) });
+                UserDialog::edit(conn, driver, a, read_only)
+            }
+        });
+    }
+
+    /// Demo mode: `DATACRAFT_DEMO_USERS=1` expands the "Users" / "Roles" folder; `new`, `edit` or
+    /// `drop` also opens that dialog (on the first account that is not root), once.
+    fn demo_users(&mut self, conn: ConnId, first: Option<crate::db::users::Account>) {
+        static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("DATACRAFT_DEMO").is_err() {
+            return;
+        }
+        let Ok(mode) = std::env::var("DATACRAFT_DEMO_USERS") else { return };
+        if OPENED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match mode.as_str() {
+            "new" => self.open_user_dialog(conn, None, false),
+            "edit" if first.is_some() => self.open_user_dialog(conn, first, false),
+            "drop" if first.is_some() => self.open_user_dialog(conn, first, true),
+            _ => {}
+        }
+    }
+
+    fn users_response(&mut self, conn: ConnId, result: Result<crate::db::users::UsersReply, String>) {
+        use crate::db::users::UsersReply;
+        match result {
+            Ok(UsersReply::List(list)) => {
+                let first = list.accounts.iter().find(|a| a.account.name != "root" && !a.account.name.is_empty()).map(|a| a.account.clone());
+                if let Some(c) = self.conn_mut(conn) {
+                    c.users = crate::ui::user_dialog::UsersNode { list: Some(list), loading: false, error: None };
+                }
+                self.demo_users(conn, first);
+            }
+            Ok(UsersReply::Detail(account, user)) => {
+                if let Some(d) = self.user_dialog.as_mut().filter(|d| d.conn == conn && d.pending.as_ref() == Some(&account)) {
+                    d.pending = None;
+                    let keep_edits = !d.loading;
+                    d.loaded(*user, keep_edits);
+                }
+            }
+            Err(e) => {
+                // A failed detail belongs to the dialog waiting for it, if any; otherwise to the list.
+                if let Some(d) = self.user_dialog.as_mut().filter(|d| d.conn == conn && d.pending.is_some()) {
+                    d.pending = None;
+                    if d.loading {
+                        d.load_failed(e);
+                    }
+                } else if let Some(c) = self.conn_mut(conn) {
+                    c.users.loading = false;
+                    c.users.error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// Reply to the user dialog's statements.
+    fn user_ddl_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.user_dialog.as_mut() else { return };
+        let conn = d.conn;
+        if let Err(e) = result {
+            d.set_error(&e);
+            // What ran before the error stays (account statements commit on their own): read the
+            // user again so the next Apply only sends what is still missing.
+            if !d.dropping {
+                let account = d.edited_account();
+                d.pending = Some(account.clone());
+                self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::Detail(account) });
+            }
+            self.load_users(conn);
+            return;
+        }
+        let Some(d) = self.user_dialog.take() else { return };
+        let name = d.edited_account().label(d.driver);
+        let args: &[(&str, &dyn std::fmt::Display)] = &[("name", &name)];
+        let msg = match (d.driver == Driver::Postgres, d.dropping, d.original.is_some()) {
+            (false, true, _) => trf("User “{name}” dropped", args),
+            (false, false, true) => trf("User “{name}” saved", args),
+            (false, false, false) => trf("User “{name}” created", args),
+            (true, true, _) => trf("Role “{name}” dropped", args),
+            (true, false, true) => trf("Role “{name}” saved", args),
+            (true, false, false) => trf("Role “{name}” created", args),
+        };
+        self.info(msg);
+        self.explorer.expanded.insert(format!("u:{conn}"));
+        self.load_users(conn);
+    }
+
+    fn user_dialog_ui(&mut self, ctx: &egui::Context) {
+        use crate::db::users::PrivTarget;
+        use crate::ui::user_dialog::{UserContext, UserDialogResult};
+        let Some(d) = self.user_dialog.as_ref() else { return };
+        let conn = d.conn;
+        let Some(c) = self.conns.iter().find(|c| c.cfg.id == conn) else {
+            self.user_dialog = None;
+            return;
+        };
+        let mut uc = UserContext { databases: c.databases.iter().map(|d| d.name.clone()).collect(), objects: Vec::new(), list: c.users.list.as_ref() };
+        if c.cfg.driver == Driver::Postgres {
+            for s in c.schemas(None).unwrap_or_default() {
+                uc.objects.push(PrivTarget::Schema(s.name.clone()));
+                uc.objects.extend(s.tables.iter().map(|t| PrivTarget::Table(s.name.clone(), t.name.clone())));
+            }
+        }
+        let Some(d) = self.user_dialog.as_mut() else { return };
+        match d.show(ctx, &uc) {
+            Some(UserDialogResult::Apply(statements)) => {
+                // Read-only connections never get here (no Apply button), but check anyway.
+                if c.cfg.read_only {
+                    d.error = Some(tr("Read-only connection").into());
+                    return;
+                }
+                d.running = true;
+                d.error = None;
+                self.worker.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: false });
+            }
+            Some(UserDialogResult::Cancel) => self.user_dialog = None,
+            None => {}
+        }
+    }
+
     /// Reply to the "New Database" / "New Table" dialog's statements.
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
         if self.view_ddl_done(conn, &result) {
@@ -1708,6 +1876,10 @@ impl DataCraftApp {
         }
         if self.modify.as_ref().is_some_and(|d| d.conn == conn && d.running) {
             self.modify_done(result);
+            return;
+        }
+        if self.user_dialog.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.user_ddl_done(result);
             return;
         }
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
@@ -2064,6 +2236,7 @@ impl DataCraftApp {
             || self.import.is_some()
             || self.copy.is_some()
             || self.mask_export.is_some()
+            || self.user_dialog.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2923,6 +3096,7 @@ impl DataCraftApp {
         }
 
         self.view_dialog(ctx);
+        self.user_dialog_ui(ctx);
 
         if let Some(d) = self.import.as_mut() {
             match d.show(ctx) {
@@ -3588,7 +3762,7 @@ mod tests {
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             save_on_row_change: false,
-            dialog: None, confirm_delete: None, create: None, drop: None, views: Default::default(), import: None, copy: None, mask_export: None, renaming: None,
+            dialog: None, confirm_delete: None, create: None, drop: None, views: Default::default(), import: None, copy: None, mask_export: None, user_dialog: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,

@@ -18,6 +18,7 @@ pub mod snowflake;
 pub mod sqlite;
 pub mod url;
 pub mod views;
+pub mod users;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

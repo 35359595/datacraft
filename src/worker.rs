@@ -85,6 +85,8 @@ pub enum Request {
     /// Cancels what a console's `Execute` is running. Engines without a native cancel
     /// abandon the query and close the session (it reconnects on the next run).
     Cancel { console: ConsoleId },
+    /// Users / roles: the list or one user's privileges, on the metadata session.
+    Users { conn: ConnId, request: crate::db::users::UsersRequest },
 }
 
 pub enum Response {
@@ -130,6 +132,8 @@ pub enum Response {
     /// Result of `RunDdl`.
     DdlDone { conn: ConnId, result: Result<(), String> },
     TableDetails { request_id: u64, result: Result<Box<crate::db::alter::TableDetails>, String> },
+    /// Result of `Users`.
+    Users { conn: ConnId, result: Result<crate::db::users::UsersReply, String> },
 }
 
 pub struct Worker {
@@ -423,8 +427,26 @@ async fn fetch_view_definition(state: &State, conn: ConnId, db: &str, schema: &s
     result
 }
 
+/// Users / roles, on the connection's metadata session for its default database (so the list
+/// does not wait behind a console).
+async fn fetch_users(state: &State, conn: ConnId, request: &crate::db::users::UsersRequest) -> Result<crate::db::users::UsersReply, String> {
+    let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
+        return Err(tr("The connection is not open").into());
+    };
+    let (session, _) = state.meta_session_for(conn, "").await.map_err(|e| format!("{e:#}"))?;
+    let mut s = session.lock().await;
+    let result = crate::db::users::load(&mut s, driver, request).await.map_err(|e| format!("{e:#}"));
+    let broken = s.is_closed();
+    drop(s);
+    if broken {
+        state.forget_meta(conn, &session).await;
+    }
+    result
+}
+
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
+        Request::Users { conn, request } => vec![Response::Users { conn, result: fetch_users(state, conn, &request).await }],
         Request::SchemaSearch { conn, request_id, request, cancel } => {
             let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
             let result = match cfg {
@@ -989,6 +1011,74 @@ mod tests {
         assert!(report.matches.iter().any(|m| m.table == "dc_info" && m.result.rows.len() == 1), "errors: {:?}", report.errors);
         w.send(Request::RunDdl { conn, db: None, statements: vec!["drop table dc_info".into()], close_db: None, transaction: false });
         wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
+    }
+
+    /// Live, like `cancels_a_running_mysql_query`: creates a user with the user editor's
+    /// statements, changes its privileges, reads it back (no differences left) and drops it.
+    #[test]
+    #[ignore]
+    fn mysql_user_editor_round_trip() {
+        use crate::db::users::{self, Account, PrivSet, PrivTarget, UserState, UsersReply, UsersRequest};
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(14, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let (conn, db) = (cfg.id, cfg.database.clone());
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        let run = |statements: Vec<String>| {
+            w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: false });
+            let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+            result
+        };
+        let list = || {
+            w.send(Request::Users { conn, request: UsersRequest::List });
+            match wait_for(&w, |r| matches!(r, Response::Users { .. })) {
+                Response::Users { result: Ok(UsersReply::List(l)), .. } => l,
+                _ => panic!("list failed"),
+            }
+        };
+        let detail = |a: &Account| {
+            w.send(Request::Users { conn, request: UsersRequest::Detail(a.clone()) });
+            match wait_for(&w, |r| matches!(r, Response::Users { .. })) {
+                Response::Users { result: Ok(UsersReply::Detail(_, u)), .. } => *u,
+                Response::Users { result: Err(e), .. } => panic!("{e}"),
+                _ => unreachable!(),
+            }
+        };
+        let account = Account::new("dc_live'user", "%");
+        let _ = run(vec![users::drop_statement(Driver::MariaDb, &account)]);
+        let available = list();
+        assert!(available.accounts.iter().any(|a| a.account.name == var("DATACRAFT_MY_USER")));
+        assert!(available.global_privileges.iter().any(|p| p == "PROCESS"));
+
+        let mut new = UserState::new_user(Driver::MariaDb);
+        new.account = account.clone();
+        new.limits = [0, 0, 0, 3];
+        new.global.privs.insert("PROCESS".into());
+        new.grants.insert(PrivTarget::Database(db.clone()), PrivSet { privs: ["SELECT".into(), "INSERT".into()].into(), grant_option: false });
+        let statements = users::statements(Driver::MariaDb, None, &new, Some("pw'1"), true);
+        run(statements).expect("create");
+        assert!(list().accounts.iter().any(|a| a.account == account));
+        let loaded = detail(&account);
+        assert_eq!(loaded.limits, [0, 0, 0, 3]);
+        assert!(users::statements(Driver::MariaDb, Some(&loaded), &new, None, true).is_empty(), "{loaded:?}");
+
+        let mut edited = loaded.clone();
+        edited.locked = true;
+        edited.global = PrivSet { privs: ["RELOAD".into()].into(), grant_option: true };
+        edited.grants.insert(PrivTarget::Database(db.clone()), PrivSet { privs: ["SELECT".into(), "UPDATE".into()].into(), grant_option: false });
+        run(users::statements(Driver::MariaDb, Some(&loaded), &edited, Some("pw2"), true)).expect("alter");
+        let reloaded = detail(&account);
+        assert!(reloaded.locked);
+        assert!(users::statements(Driver::MariaDb, Some(&reloaded), &edited, None, true).is_empty(), "{reloaded:?}");
+
+        run(vec![users::drop_statement(Driver::MariaDb, &account)]).expect("drop");
+        assert!(!list().accounts.iter().any(|a| a.account == account));
     }
 
     /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).

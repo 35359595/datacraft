@@ -17,6 +17,7 @@ pub mod results;
 pub mod schema_search;
 pub mod theme;
 pub mod view_dialog;
+pub mod user_dialog;
 
 use crate::db::Driver;
 

@@ -72,6 +72,11 @@ pub enum ExplorerAction {
     GenerateSelect(TableRef),
     GenerateInsert(TableRef),
     GenerateDdl(TableRef),
+    /// Load (or reload) the "Users" / "Roles" folder.
+    LoadUsers(ConnId),
+    NewUser(ConnId),
+    EditUser(ConnId, crate::db::users::Account),
+    DropUser(ConnId, crate::db::users::Account),
     Hide,
 }
 
@@ -492,6 +497,99 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
     }
     for d in &c.databases {
         database_rows(ui, state, actions, c, d, filter, name_match);
+    }
+    if !filtering && matches!(c.status, ConnStatus::Connected) && crate::db::users::UserModel::of(c.cfg.driver).is_some() {
+        users_rows(ui, state, actions, c);
+    }
+}
+
+/// "Users" (MySQL / MariaDB) or "Roles" (PostgreSQL) folder at server level, after the databases.
+fn users_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, c: &ConnState) {
+    let p = pal(ui);
+    let id = c.cfg.id;
+    let driver = c.cfg.driver;
+    let roles = driver == Driver::Postgres;
+    let ukey = format!("u:{id}");
+    let open = state.expanded.contains(&ukey);
+    let node = &c.users;
+    let badge = node.list.as_ref().map(|l| l.accounts.len().to_string());
+    let row = tree_row(
+        ui,
+        state,
+        RowSpec {
+            key: &ukey,
+            depth: 1,
+            expandable: true,
+            expanded: open,
+            icon: Ico::Folder,
+            label: if roles { tr("Roles") } else { tr("Users") },
+            badge: badge.as_deref(),
+            detail: node.loading.then(|| (tr("loading…"), p.muted)),
+            status: None,
+            label_color: None,
+        },
+    );
+    if row.toggled {
+        toggle(state, &ukey, open);
+    }
+    if (row.toggled && !open || row.resp.clicked()) && node.list.is_none() && !node.loading {
+        actions.push(ExplorerAction::LoadUsers(id));
+    }
+    let new_label = if roles { tr("New Role…") } else { tr("New User…") };
+    row.resp.context_menu(|ui| {
+        if ui.button(new_label).clicked() {
+            actions.push(ExplorerAction::NewUser(id));
+            ui.close();
+        }
+        if ui.add_enabled(!node.loading, egui::Button::new(tr("Refresh"))).clicked() {
+            actions.push(ExplorerAction::LoadUsers(id));
+            ui.close();
+        }
+    });
+    if !open {
+        return;
+    }
+    if let Some(e) = &node.error {
+        error_line(ui, 2, e);
+    }
+    let Some(list) = &node.list else { return };
+    for a in &list.accounts {
+        let label = if a.account.name.is_empty() { format!("{}{}", tr("(anonymous)"), a.account.label(driver)) } else { a.account.label(driver) };
+        let akey = format!("ua:{id}:{label}");
+        let row = tree_row(
+            ui,
+            state,
+            RowSpec {
+                key: &akey,
+                depth: 2,
+                expandable: false,
+                expanded: false,
+                icon: Ico::User,
+                label: &label,
+                badge: None,
+                detail: (roles && !a.can_login).then(|| (tr("no login"), p.muted)),
+                status: None,
+                label_color: None,
+            },
+        );
+        if row.resp.double_clicked() {
+            actions.push(ExplorerAction::EditUser(id, a.account.clone()));
+        }
+        row.resp.context_menu(|ui| {
+            if ui.button(if roles { tr("Edit Role…") } else { tr("Edit User…") }).clicked() {
+                actions.push(ExplorerAction::EditUser(id, a.account.clone()));
+                ui.close();
+            }
+            if ui.button(new_label).clicked() {
+                actions.push(ExplorerAction::NewUser(id));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button(RichText::new(if roles { tr("Drop Role…") } else { tr("Drop User…") }).color(p.error)).clicked() {
+                actions.push(ExplorerAction::DropUser(id, a.account.clone()));
+                ui.close();
+            }
+        });
     }
 }
 
