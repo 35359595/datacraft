@@ -1,6 +1,6 @@
 # Application icon
 
-DataCraft uses one geometric white D on a cobalt rounded square. The project menu,
+DataCraft uses one minimalist white database cylinder on a cobalt rounded square. The project menu,
 About dialog and native window share the same mark. The UI uses 32/64 px variants
 for crisp small controls; native windows use `assets/icon.png`. Windows executables
 embed `assets/icon.ico`; macOS bundles use `assets/DataCraft.icns`.

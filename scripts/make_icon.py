@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent.parent
 BLUE = (53, 116, 240, 255)
 SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
-LEFT, INNER, CENTER, RADIUS, HOLE = 10, 13, 15, 8, 5
+CENTER, TOP, BOTTOM, RX, RY, STROKE = 16, 9, 23, 8, 3, 2
 
 
 def draw(size: int) -> Image.Image:
@@ -17,9 +17,14 @@ def draw(size: int) -> Image.Image:
     canvas = ImageDraw.Draw(image)
     box = lambda values: tuple(round(v * scale) for v in values)
     canvas.rounded_rectangle(box((2, 2, 30, 30)), radius=round(7 * scale), fill=BLUE)
-    for left, radius, color in [(LEFT, RADIUS, "white"), (INNER, HOLE, BLUE)]:
-        canvas.rectangle(box((left, 16 - radius, CENTER, 16 + radius)), fill=color)
-        canvas.pieslice(box((CENTER - radius, 16 - radius, CENTER + radius, 16 + radius)), 270, 90, fill=color)
+    left, right = CENTER - RX, CENTER + RX
+    width = round(STROKE * scale)
+    canvas.line(box((left, TOP, left, BOTTOM)), fill="white", width=width)
+    canvas.line(box((right, TOP, right, BOTTOM)), fill="white", width=width)
+    half = STROKE / 2
+    for y in ((TOP + BOTTOM) // 2, BOTTOM):
+        canvas.arc(box((left - half, y - RY - half, right + half, y + RY + half)), 0, 180, fill="white", width=width)
+    canvas.ellipse(box((left - half, TOP - RY - half, right + half, TOP + RY + half)), outline="white", width=width)
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
@@ -38,7 +43,10 @@ def generate() -> dict[str, bytes]:
     color = "#" + "".join(f"{channel:02x}" for channel in BLUE[:3])
     output["icon.svg"] = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <rect x="2" y="2" width="28" height="28" rx="7" fill="{color}"/>
-  <path fill="#fff" fill-rule="evenodd" d="M{LEFT} {16-RADIUS}H{CENTER}a{RADIUS} {RADIUS} 0 0 1 0 {RADIUS*2}H{LEFT}Z M{INNER} {16-HOLE}H{CENTER}a{HOLE} {HOLE} 0 0 1 0 {HOLE*2}H{INNER}Z"/>
+  <g fill="none" stroke="#fff" stroke-width="{STROKE}" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="{CENTER}" cy="{TOP}" rx="{RX}" ry="{RY}"/>
+    <path d="M{CENTER-RX} {TOP}V{BOTTOM}a{RX} {RY} 0 0 0 {RX*2} 0V{TOP} M{CENTER-RX} {(TOP+BOTTOM)//2}a{RX} {RY} 0 0 0 {RX*2} 0"/>
+  </g>
 </svg>
 '''.encode()
     return output
