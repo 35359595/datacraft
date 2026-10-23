@@ -57,6 +57,12 @@ pub enum Request {
         schema: Option<String>,
         request_id: u64,
     },
+    /// The real definition of a view (for "Edit View…" and "Generate DDL").
+    ViewDefinition { conn: ConnId, db: String, schema: String, view: String, request_id: u64 },
+    /// "New Database": the server's character sets, collations, roles… for the dialog.
+    DatabaseChoices { conn: ConnId },
+    /// "Modify Table…": the table's full structure (defaults, primary key, indexes).
+    TableDetails { conn: ConnId, db: String, schema: String, table: String, request_id: u64 },
     /// Runs statements in order; stops at the first error.
     /// `db`: database to run them in (`None` = the connection's default database).
     Execute {
@@ -81,6 +87,8 @@ pub enum Request {
     /// Cancels what a console's `Execute` is running. Engines without a native cancel
     /// abandon the query and close the session (it reconnects on the next run).
     Cancel { console: ConsoleId },
+    /// Users / roles: the list or one user's privileges, on the metadata session.
+    Users { conn: ConnId, request: crate::db::users::UsersRequest },
 }
 
 pub enum Response {
@@ -113,6 +121,7 @@ pub enum Response {
         request_id: u64,
         result: Result<Vec<crate::db::object_info::ObjectInfoRow>, String>,
     },
+    ViewDefinition { conn: ConnId, request_id: u64, result: Result<crate::db::views::ViewDefinition, String> },
     /// `results` holds what ran before the error (if there was one).
     Executed {
         console: ConsoleId,
@@ -124,6 +133,10 @@ pub enum Response {
     ChangesApplied { console: ConsoleId, result: Result<u64, String> },
     /// Result of `RunDdl`.
     DdlDone { conn: ConnId, result: Result<(), String> },
+    TableDetails { request_id: u64, result: Result<Box<crate::db::alter::TableDetails>, String> },
+    DatabaseChoices { conn: ConnId, result: Result<crate::db::create_db::DatabaseChoices, String> },
+    /// Result of `Users`.
+    Users { conn: ConnId, result: Result<crate::db::users::UsersReply, String> },
 }
 
 pub struct Worker {
@@ -388,8 +401,66 @@ async fn fetch_object_info(
     result
 }
 
+/// A view's definition, on the metadata session for `db` (15 s at most, like `fetch_object_info`).
+async fn fetch_view_definition(state: &State, conn: ConnId, db: &str, schema: &str, view: &str) -> Result<crate::db::views::ViewDefinition, String> {
+    let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
+        return Err(tr("Connection lost").into());
+    };
+    let (session, target) = state.meta_session_for(conn, db).await.map_err(|e| format!("{e:#}"))?;
+    let mut s = session.lock().await;
+    let cancel = s.cancel_handle();
+    let query = async {
+        s.use_database(&target).await?;
+        s.view_definition(driver, &target, schema, view).await
+    };
+    let (result, broken) = match tokio::time::timeout(std::time::Duration::from_secs(15), query).await {
+        Ok(result) => (result.map_err(|e| format!("{e:#}")), s.is_closed()),
+        Err(_) => {
+            let cancelled = match cancel {
+                Some(h) => h.cancel().await.is_ok(),
+                None => false,
+            };
+            (Err(tr("The view definition request timed out").into()), !cancelled)
+        }
+    };
+    drop(s);
+    if broken {
+        state.forget_meta(conn, &session).await;
+    }
+    result
+}
+
+/// Users / roles, on the connection's metadata session for its default database (so the list
+/// does not wait behind a console).
+async fn fetch_users(state: &State, conn: ConnId, request: &crate::db::users::UsersRequest) -> Result<crate::db::users::UsersReply, String> {
+    let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
+        return Err(tr("The connection is not open").into());
+    };
+    let (session, _) = state.meta_session_for(conn, "").await.map_err(|e| format!("{e:#}"))?;
+    let mut s = session.lock().await;
+    let result = crate::db::users::load(&mut s, driver, request).await.map_err(|e| format!("{e:#}"));
+    let broken = s.is_closed();
+    drop(s);
+    if broken {
+        state.forget_meta(conn, &session).await;
+    }
+    result
+}
+
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
+        Request::DatabaseChoices { conn } => {
+            let result = async {
+                let driver = state.live.lock().await.get(&conn).map(|l| l.cfg.driver).ok_or_else(|| anyhow::anyhow!(tr("Connection lost")))?;
+                let (session, _) = state.meta_session_for(conn, "").await?;
+                let mut s = session.lock().await;
+                s.database_choices(driver).await
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            vec![Response::DatabaseChoices { conn, result }]
+        }
+        Request::Users { conn, request } => vec![Response::Users { conn, result: fetch_users(state, conn, &request).await }],
         Request::SchemaSearch { conn, request_id, request, cancel } => {
             let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
             let result = match cfg {
@@ -496,6 +567,28 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
         } => {
             let result = fetch_object_info(state, conn, &db, schema.as_deref(), None, false, request_id).await;
             vec![Response::ObjectCatalog { conn, request_id, result }]
+        }
+        Request::ViewDefinition { conn, db, schema, view, request_id } => {
+            let result = fetch_view_definition(state, conn, &db, &schema, &view).await;
+            vec![Response::ViewDefinition { conn, request_id, result }]
+        }
+        Request::TableDetails { conn, db, schema, table, request_id } => {
+            // On the metadata session: it doesn't wait behind a console's query.
+            let result = async {
+                let driver = state.live.lock().await.get(&conn).map(|l| l.cfg.driver).ok_or_else(|| anyhow::anyhow!(tr("Connection lost")))?;
+                let (session, target) = state.meta_session_for(conn, &db).await?;
+                let mut s = session.lock().await;
+                s.use_database(&target).await?;
+                let details = crate::db::alter::load_details(&mut s, driver, &schema, &table).await;
+                let broken = s.is_closed();
+                drop(s);
+                if broken {
+                    state.forget_meta(conn, &session).await;
+                }
+                details
+            }
+            .await;
+            vec![Response::TableDetails { request_id, result: result.map(Box::new).map_err(|e| format!("{e:#}")) }]
         }
         Request::ApplyChanges { conn, db, console, statements } => {
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
@@ -934,6 +1027,74 @@ mod tests {
         wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
     }
 
+    /// Live, like `cancels_a_running_mysql_query`: creates a user with the user editor's
+    /// statements, changes its privileges, reads it back (no differences left) and drops it.
+    #[test]
+    #[ignore]
+    fn mysql_user_editor_round_trip() {
+        use crate::db::users::{self, Account, PrivSet, PrivTarget, UserState, UsersReply, UsersRequest};
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(14, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let (conn, db) = (cfg.id, cfg.database.clone());
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        let run = |statements: Vec<String>| {
+            w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: false });
+            let Response::DdlDone { result, .. } = wait_for(&w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+            result
+        };
+        let list = || {
+            w.send(Request::Users { conn, request: UsersRequest::List });
+            match wait_for(&w, |r| matches!(r, Response::Users { .. })) {
+                Response::Users { result: Ok(UsersReply::List(l)), .. } => l,
+                _ => panic!("list failed"),
+            }
+        };
+        let detail = |a: &Account| {
+            w.send(Request::Users { conn, request: UsersRequest::Detail(a.clone()) });
+            match wait_for(&w, |r| matches!(r, Response::Users { .. })) {
+                Response::Users { result: Ok(UsersReply::Detail(_, u)), .. } => *u,
+                Response::Users { result: Err(e), .. } => panic!("{e}"),
+                _ => unreachable!(),
+            }
+        };
+        let account = Account::new("dc_live'user", "%");
+        let _ = run(vec![users::drop_statement(Driver::MariaDb, &account)]);
+        let available = list();
+        assert!(available.accounts.iter().any(|a| a.account.name == var("DATACRAFT_MY_USER")));
+        assert!(available.global_privileges.iter().any(|p| p == "PROCESS"));
+
+        let mut new = UserState::new_user(Driver::MariaDb);
+        new.account = account.clone();
+        new.limits = [0, 0, 0, 3];
+        new.global.privs.insert("PROCESS".into());
+        new.grants.insert(PrivTarget::Database(db.clone()), PrivSet { privs: ["SELECT".into(), "INSERT".into()].into(), grant_option: false });
+        let statements = users::statements(Driver::MariaDb, None, &new, Some("pw'1"), true);
+        run(statements).expect("create");
+        assert!(list().accounts.iter().any(|a| a.account == account));
+        let loaded = detail(&account);
+        assert_eq!(loaded.limits, [0, 0, 0, 3]);
+        assert!(users::statements(Driver::MariaDb, Some(&loaded), &new, None, true).is_empty(), "{loaded:?}");
+
+        let mut edited = loaded.clone();
+        edited.locked = true;
+        edited.global = PrivSet { privs: ["RELOAD".into()].into(), grant_option: true };
+        edited.grants.insert(PrivTarget::Database(db.clone()), PrivSet { privs: ["SELECT".into(), "UPDATE".into()].into(), grant_option: false });
+        run(users::statements(Driver::MariaDb, Some(&loaded), &edited, Some("pw2"), true)).expect("alter");
+        let reloaded = detail(&account);
+        assert!(reloaded.locked);
+        assert!(users::statements(Driver::MariaDb, Some(&reloaded), &edited, None, true).is_empty(), "{reloaded:?}");
+
+        run(vec![users::drop_statement(Driver::MariaDb, &account)]).expect("drop");
+        assert!(!list().accounts.iter().any(|a| a.account == account));
+    }
+
     /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD` (see `db/mysql.rs`).
     #[test]
     #[ignore]
@@ -1277,7 +1438,47 @@ mod tests {
         let Response::DatabaseLoaded { result: Ok(schemas), .. } = r else { panic!("introspection failed") };
         let names: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["*", "dc:*"]);
+
+        // Grid edits on the `dc:*` group, as the data editor builds them.
+        let group = &schemas[0].tables[1];
+        let rs = first_rows(&w, 41, 4, &["SCAN 0 MATCH dc:* COUNT 1000"]).remove(0);
+        let target = crate::ui::editing::target_for(&rs.columns, "db5", group.kind, &group.name, &group.columns).unwrap();
+        let types: std::collections::HashMap<String, String> =
+            rs.rows.iter().map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap())).collect();
+        let row = |k: &str| crate::ui::editing::RowRef::Existing(rs.rows.iter().position(|r| r[0].as_deref() == Some(k)).unwrap());
+        let mut st = crate::ui::editing::EditState::default();
+        st.set_value(&rs, row("dc:greeting"), 3, Some("adiós \"mundo\"".into()));
+        st.set_value(&rs, row("dc:greeting"), 2, None);
+        let n = st.add_row(4);
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 0, Some("dc:new key".into()));
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 2, Some("100".into()));
+        st.set_value(&rs, crate::ui::editing::RowRef::New(n), 3, Some("x y".into()));
+        st.delete_rows(&rs, &target, &[row("dc:q")]);
+        let changes = st.build_changes(&rs, &target).unwrap();
+        let statements = crate::edit::change_statements(Driver::Redis, "db5", "dc:*", &changes, &types).unwrap();
+        assert_eq!(apply(&w, 41, 5, statements), Ok(4));
+        let rs = first_rows(&w, 41, 6, &["GET dc:greeting", "TTL dc:greeting", "GET \"dc:new key\"", "TTL \"dc:new key\"", "EXISTS dc:q"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("adiós \"mundo\""));
+        assert_eq!(rs[1].rows[0][0].as_deref(), Some("-1"));
+        assert_eq!(rs[2].rows[0][0].as_deref(), Some("x y"));
+        assert!(rs[3].rows[0][0].as_deref().is_some_and(|t| t.parse::<i64>().unwrap() > 0));
+        assert_eq!(rs[4].rows[0][0].as_deref(), Some("0"));
+        // A failed precondition (missing key, existing key) saves nothing.
+        let err = apply(&w, 41, 7, vec!["DEL dc:greeting".into(), "EXPIRE dc:missing 10".into()]).unwrap_err();
+        assert!(err.contains("EXPIRE dc:missing 10"), "{err}");
+        assert!(apply(&w, 41, 8, vec!["SET dc:greeting x NX".into()]).unwrap_err().contains("dc:greeting"));
+        assert!(apply(&w, 41, 9, vec!["SET dc:user:1 x XX KEEPTTL".into()]).unwrap_err().contains("hash"));
+        let rs = first_rows(&w, 41, 10, &["GET dc:greeting"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("adiós \"mundo\""));
         first_rows(&w, 41, 3, &["FLUSHDB"]);
+    }
+
+    /// Saves data editor statements through the worker.
+    fn apply(w: &Worker, conn: ConnId, console: ConsoleId, statements: Vec<String>) -> Result<u64, String> {
+        w.send(Request::ApplyChanges { conn, db: None, console, statements });
+        let r = wait_for(w, |r| matches!(r, Response::ChangesApplied { console: c, .. } if *c == console));
+        let Response::ChangesApplied { result, .. } = r else { unreachable!() };
+        result
     }
 
     /// Needs a MongoDB server: `DATACRAFT_MONGO_PORT` (on 127.0.0.1, no authentication).
@@ -1316,6 +1517,305 @@ mod tests {
         let users = schemas[0].tables.iter().find(|t| t.name == "users").expect("users");
         let cols: Vec<_> = users.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(cols, vec!["_id", "name", "tags", "at", "age"]);
+
+        // Grid edits on the collection, as the data editor builds them.
+        let rs = first_rows(&w, 42, 4, &[&crate::app::table_query(Driver::MongoDb, "dc_test", "users", "", "{_id: 1}", 100)]).remove(0);
+        let target = crate::ui::editing::document_target(&rs.columns, "dc_test", users.kind, &users.name, &users.columns).unwrap();
+        let types: std::collections::HashMap<String, String> = users.columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
+        let col = |n: &str| rs.columns.iter().position(|c| c == n).unwrap();
+        use crate::ui::editing::RowRef;
+        let mut st = crate::ui::editing::EditState::default();
+        st.set_value(&rs, RowRef::Existing(1), col("name"), Some("Luis \"M\"".into()));
+        st.set_value(&rs, RowRef::Existing(1), col("age"), Some("50".into()));
+        st.set_value(&rs, RowRef::Existing(0), col("tags"), Some(r#"["a",{"k":1}]"#.into()));
+        let n = st.add_row(rs.columns.len());
+        st.set_value(&rs, RowRef::New(n), col("_id"), Some("3".into()));
+        st.set_value(&rs, RowRef::New(n), col("name"), Some("Eva".into()));
+        st.set_value(&rs, RowRef::New(n), col("at"), Some("2026-03-04T05:06:07Z".into()));
+        st.delete_rows(&rs, &target, &[RowRef::Existing(0)]);
+        let changes = st.build_changes(&rs, &target).unwrap();
+        let statements = crate::edit::change_statements(Driver::MongoDb, "dc_test", "users", &changes, &types).unwrap();
+        assert_eq!(apply(&w, 42, 5, statements), Ok(3));
+        let rs = first_rows(&w, 42, 6, &["db.users.find({}).sort({_id: 1})", "db.users.find({at: {$type: 'date'}, _id: 3})", "db.users.find({age: {$type: 'int'}})"]);
+        let ids: Vec<_> = rs[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(ids, vec!["2", "3"]);
+        assert_eq!(rs[1].rows.len(), 1);
+        assert_eq!(rs[2].rows.len(), 1);
+        // A change that matches no document fails (and, on a replica set, rolls the rest back).
+        let err = apply(&w, 42, 7, vec![r#"db.getCollection("users").deleteOne({"_id": 99})"#.into()]).unwrap_err();
+        assert!(err.contains("deleteOne"), "{err}");
+        assert!(apply(&w, 42, 8, vec!["db.users.drop()".into()]).is_err());
         first_rows(&w, 42, 3, &["db.users.drop()"]);
+    }
+
+    /// SQLite → MongoDB (masking the names), MongoDB → MongoDB (again: duplicates skipped) and
+    /// MongoDB → SQLite (creating the table). Needs `DATACRAFT_MONGO_PORT` like the test above.
+    #[test]
+    #[ignore]
+    fn copies_between_sqlite_and_mongodb() {
+        use crate::db::copy::Mask;
+        let dir = std::env::temp_dir().join(format!("datacraft-copy-mongo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = people_db(&dir);
+        let target = dir.join("target.db");
+        rusqlite::Connection::open(&target).unwrap();
+        let mut cfg = ConnectionConfig::new(43, Driver::MongoDb);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27017);
+        cfg.database = "dc_test".into();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(sqlite_cfg(44, &source)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 44, .. }));
+        w.send(Request::Connect(sqlite_cfg(45, &target)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 45, .. }));
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 43, .. } | Response::ConnectFailed { conn: 43, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        first_rows(&w, 43, 1, &["db.dc_people.drop()", "db.dc_people2.drop()"]);
+
+        // SQLite → MongoDB: typed fields, fake names.
+        let mut req = copy_request("dc_test", "dc_people", "", 100, true, false);
+        req.masks[1] = Mask::Name;
+        assert_eq!(run_copy(&w, 44, 43, 1, req), Ok(40));
+        let rs = first_rows(&w, 43, 2, &[
+            "db.dc_people.countDocuments({id: {$type: 'int'}, ok: {$type: 'bool'}})",
+            "db.dc_people.countDocuments({ok: true})",
+            "db.dc_people.countDocuments({name: /^O'Brien/})",
+        ]);
+        let count = |i: usize| rs[i].rows[0][0].clone().unwrap();
+        assert_eq!((count(0), count(1), count(2)), ("40".into(), "20".into(), "0".into()));
+
+        // MongoDB → MongoDB, twice: the second time every `_id` is already there.
+        let col = |name: &str, ty: &str| crate::db::ColumnInfo { name: name.into(), data_type: ty.into(), nullable: name != "_id", primary_key: name == "_id" };
+        let columns = vec![col("_id", "objectId"), col("id", "int"), col("name", "string"), col("ok", "bool")];
+        let mongo_req = |target_table: &str, filter: &str, create: bool| crate::db::copy::CopyRequest {
+            source_db: "dc_test".into(),
+            source_schema: "dc_test".into(),
+            source_table: "dc_people".into(),
+            target_names: columns.iter().map(|c| c.name.clone()).collect(),
+            columns: columns.clone(),
+            filter: filter.into(),
+            percent: 100,
+            target_db: if target_table.starts_with("dc_") { "dc_test".into() } else { "main".into() },
+            target_schema: if target_table.starts_with("dc_") { "dc_test".into() } else { "main".into() },
+            target_table: target_table.into(),
+            create,
+            clear: false,
+            masks: vec![Mask::Keep; 4],
+            mask_key: "test-key".into(),
+            parents: false,
+            children: false,
+            mask_related: false,
+        };
+        assert_eq!(run_copy(&w, 43, 43, 2, mongo_req("dc_people2", "", true)), Ok(40));
+        assert_eq!(run_copy(&w, 43, 43, 3, mongo_req("dc_people2", "", false)), Ok(0));
+        let rs = first_rows(&w, 43, 3, &["db.dc_people2.countDocuments({_id: {$type: 'objectId'}, id: {$type: 'int'}})"]);
+        assert_eq!(rs[0].rows[0][0].as_deref(), Some("40"));
+
+        // MongoDB → SQLite with a filter (braces optional), creating the table.
+        assert_eq!(run_copy(&w, 43, 45, 4, mongo_req("from_mongo", "ok: true", true)), Ok(20));
+        let db = rusqlite::Connection::open(&target).unwrap();
+        let (n, ids, oks, keys, real): (i64, i64, i64, i64, i64) = db
+            .query_row(
+                "select count(*), sum(typeof(id) = 'integer'), sum(ok = 1), sum(length(_id) = 24), sum(name like 'O''Brien%') from from_mongo",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((n, ids, oks, keys, real), (20, 20, 20, 20, 0));
+        first_rows(&w, 43, 4, &["db.dc_people.drop()", "db.dc_people2.drop()"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ---- "Modify Table…" ------------------------------------------------------------------
+
+    fn table_details(w: &Worker, conn: ConnId, db: &str, schema: &str, table: &str, request_id: u64) -> crate::db::alter::TableDetails {
+        w.send(Request::TableDetails { conn, db: db.into(), schema: schema.into(), table: table.into(), request_id });
+        let r = wait_for(w, |r| matches!(r, Response::TableDetails { request_id: id, .. } if *id == request_id));
+        let Response::TableDetails { result, .. } = r else { unreachable!() };
+        *result.unwrap()
+    }
+
+    fn run_ddl(w: &Worker, conn: ConnId, statements: Vec<String>, transaction: bool) -> Result<(), String> {
+        w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction });
+        let Response::DdlDone { result, .. } = wait_for(w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        result
+    }
+
+    /// Renames, retypes, makes NOT NULL with a new default, drops and adds columns, changes the
+    /// primary key, drops and adds indexes and renames the table, then reads the structure back.
+    fn modify_table_roundtrip(cfg: ConnectionConfig, schema: &str, setup: &[&str]) {
+        use crate::db::alter::{self, EditColumn, EditIndex, TableEdit};
+        use crate::ui::create_dialog::NewColumn;
+        let (conn, driver, db) = (cfg.id, cfg.driver, cfg.database.clone());
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { .. } | Response::ConnectFailed { .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        let _ = run_ddl(&w, conn, vec!["drop table if exists dc_goods".into(), "drop table if exists dc_mod".into()], false);
+        run_ddl(&w, conn, setup.iter().map(|s| s.to_string()).collect(), false).unwrap();
+
+        let d = table_details(&w, conn, &db, schema, "dc_mod", 1);
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "price", "note"]);
+        assert_eq!(d.primary_key, ["id"]);
+        assert_eq!(d.indexes.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["dc_mod_name"]);
+        assert!(!d.columns[1].nullable && d.columns[2].nullable);
+        assert_eq!(d.columns[2].default.as_deref(), Some("0"));
+
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.name = "title".into();
+        cols[1].column.data_type = "varchar(100)".into();
+        cols[1].column.primary_key = true;
+        cols[2].column.not_null = true;
+        cols[2].column.default = "1".into();
+        cols.remove(3);
+        cols.push(EditColumn {
+            original: None,
+            column: NewColumn { name: "email".into(), data_type: "varchar(255)".into(), not_null: false, primary_key: false, default: String::new() },
+        });
+        let indexes = vec![EditIndex { original: None, name: "dc_goods_email".into(), columns: "email".into(), unique: true }];
+        let edit = TableEdit { schema, table: "dc_mod", new_name: "dc_goods", columns: &cols, indexes: &indexes };
+        let plan = alter::plan(driver, &d, &edit).unwrap();
+        run_ddl(&w, conn, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+
+        let d = table_details(&w, conn, &db, schema, "dc_goods", 2);
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "title", "price", "email"]);
+        assert_eq!(d.primary_key, ["id", "title"]);
+        assert_eq!(d.indexes.iter().map(|x| (x.name.as_str(), x.unique)).collect::<Vec<_>>(), [("dc_goods_email", true)]);
+        assert!(d.columns[1].data_type.contains("100"), "{}", d.columns[1].data_type);
+        assert!(!d.columns[2].nullable);
+        assert_eq!(d.columns[2].default.as_deref(), Some("1"));
+        // The rows survive, under the new names.
+        w.send(Request::Execute { conn, db: None, console: 5, statements: vec!["select id, title, price from dc_goods".into()], max_rows: 10 });
+        let Response::Executed { results, error, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 5, .. })) else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(results[0].rows, vec![vec![Some("1".into()), Some("pen".into()), Some("3".into())]]);
+
+        // A rename alone; then dropping the column an index uses also drops the index.
+        let mut cols = alter::initial_columns(&d);
+        cols[2].column.name = "cost".into();
+        cols.remove(3);
+        let indexes = alter::initial_indexes(&d);
+        let edit = TableEdit { schema, table: "dc_goods", new_name: "dc_goods", columns: &cols, indexes: &indexes };
+        let plan = alter::plan(driver, &d, &edit).unwrap();
+        run_ddl(&w, conn, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+        let d = table_details(&w, conn, &db, schema, "dc_goods", 3);
+        assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "title", "cost"]);
+        assert!(d.indexes.is_empty());
+        run_ddl(&w, conn, vec!["drop table dc_goods".into()], false).unwrap();
+    }
+
+    #[test]
+    fn sqlite_modify_table() {
+        let dir = std::env::temp_dir().join(format!("datacraft-modify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap();
+        let mut cfg = ConnectionConfig::new(14, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        modify_table_roundtrip(
+            cfg.clone(),
+            "main",
+            &[
+                "create table dc_mod (id integer primary key autoincrement, name varchar(50) not null, price integer default 0, note text)",
+                "create index dc_mod_name on dc_mod (name)",
+                "insert into dc_mod (name, price, note) values ('pen', 3, 'x')",
+            ],
+        );
+        // A rebuild keeps AUTOINCREMENT and works with a view on the table; a CHECK constraint
+        // refuses it.
+        use crate::db::alter::{self, TableEdit};
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        run_ddl(
+            &w,
+            14,
+            vec![
+                "create table dc_auto (id integer primary key autoincrement, n int)".into(),
+                "create view dc_view as select id, n from dc_auto".into(),
+                "insert into dc_auto (n) values (1)".into(),
+            ],
+            false,
+        )
+        .unwrap();
+        let d = table_details(&w, 14, "main", "main", "dc_auto", 4);
+        assert!(d.autoincrement && d.rebuild_blocker.is_none());
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.data_type = "bigint".into();
+        cols[1].column.not_null = true;
+        let plan = alter::plan(Driver::Sqlite, &d, &TableEdit { schema: "main", table: "dc_auto", new_name: "dc_auto", columns: &cols, indexes: &[] }).unwrap();
+        run_ddl(&w, 14, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+        let d = table_details(&w, 14, "main", "main", "dc_auto", 5);
+        assert!(d.autoincrement);
+        assert_eq!(d.columns[1].data_type, "bigint");
+        assert!(!d.columns[1].nullable);
+        w.send(Request::Execute { conn: 14, db: None, console: 6, statements: vec!["select n from dc_view".into()], max_rows: 10 });
+        let Response::Executed { results, error, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 6, .. })) else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(results[0].rows, vec![vec![Some("1".into())]]);
+        run_ddl(&w, 14, vec!["create table dc_check (id integer primary key, n int check (n > 0))".into()], false).unwrap();
+        let d = table_details(&w, 14, "main", "main", "dc_check", 6);
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.not_null = true;
+        assert!(alter::plan(Driver::Sqlite, &d, &TableEdit { schema: "main", table: "dc_check", new_name: "dc_check", columns: &cols, indexes: &[] }).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD/DB`.
+    #[test]
+    #[ignore]
+    fn mysql_modify_table() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(15, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let schema = cfg.database.clone();
+        modify_table_roundtrip(
+            cfg,
+            &schema,
+            &[
+                "create table dc_mod (id int auto_increment primary key, name varchar(50) not null, price int default 0, note text)",
+                "create index dc_mod_name on dc_mod (name)",
+                "insert into dc_mod (name, price, note) values ('pen', 3, 'x')",
+            ],
+        );
+    }
+
+    /// A grid save whose second change fails: on a replica set (`DATACRAFT_MONGO_RS=1`) nothing
+    /// is kept; on a standalone server the first change stays and the error says so.
+    #[test]
+    #[ignore]
+    fn mongodb_partial_save() {
+        let mut cfg = ConnectionConfig::new(46, Driver::MongoDb);
+        cfg.host = "127.0.0.1".into();
+        cfg.port = std::env::var("DATACRAFT_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27017);
+        cfg.database = "dc_test".into();
+        let replica_set = std::env::var("DATACRAFT_MONGO_RS").is_ok_and(|v| v == "1");
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { conn: 46, .. } | Response::ConnectFailed { conn: 46, .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        first_rows(&w, 46, 1, &["db.partial.drop()", "db.partial.insertOne({_id: 1, n: 1})"]);
+        let statements = vec![
+            "db.getCollection(\"partial\").updateOne({\"_id\": 1}, {\"$set\": {\"n\": 2}})".to_string(),
+            "db.getCollection(\"partial\").updateOne({\"_id\": 99}, {\"$set\": {\"n\": 3}})".to_string(),
+        ];
+        w.send(Request::ApplyChanges { conn: 46, db: None, console: 2, statements });
+        let r = wait_for(&w, |r| matches!(r, Response::ChangesApplied { console: 2, .. }));
+        let Response::ChangesApplied { result, .. } = r else { unreachable!() };
+        let error = result.expect_err("the second change matches no document");
+        let rs = first_rows(&w, 46, 3, &["db.partial.find({_id: 1})"]);
+        let n = rs[0].rows[0][1].clone();
+        if replica_set {
+            assert_eq!(n.as_deref(), Some("1"), "rolled back: {error}");
+        } else {
+            assert_eq!(n.as_deref(), Some("2"), "kept: {error}");
+        }
+        first_rows(&w, 46, 4, &["db.partial.drop()"]);
     }
 }

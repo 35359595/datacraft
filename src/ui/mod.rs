@@ -7,6 +7,7 @@ pub mod create_dialog;
 pub mod drop_dialog;
 pub mod import_dialog;
 pub mod mask_export_dialog;
+pub mod modify_table_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;
@@ -15,6 +16,8 @@ pub mod object_organization;
 pub mod results;
 pub mod schema_search;
 pub mod theme;
+pub mod view_dialog;
+pub mod user_dialog;
 
 use crate::db::Driver;
 

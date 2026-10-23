@@ -26,10 +26,16 @@
 //! `DATACRAFT_DEMO_MASK_EXPORT=1` opens "Export with Masking…" on the first table's data.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
+//! `DATACRAFT_DEMO_CREATE=database` opens "New Database" with its options;
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
 //! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
 //! rename (to `<name>_renamed`) the first table; with `-submit` (e.g. `rename-submit`) it also runs it.
+//! `DATACRAFT_DEMO_VIEW=new|edit` opens "New View" over the first table or "Edit View" on the first view.
+//! `DATACRAFT_DEMO_MODIFY=1` opens "Modify Table…" on the first table; `edit` also makes a few
+//! sample changes (shown in the preview, never run).
+//! `DATACRAFT_DEMO_USERS=1` expands the "Users" / "Roles" folder; `new|edit|drop` also opens that
+//! dialog (edit and drop on the first account that is not root).
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -43,6 +49,7 @@ use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
 use crate::ui::copy_dialog::{CopyAction, CopyDialog};
 use crate::ui::import_dialog::{ImportDialog, ImportResult};
 use crate::ui::mask_export_dialog::{MaskExportAction, MaskExportDialog};
+use crate::ui::modify_table_dialog::{ModifyResult, ModifyTableDialog};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -54,6 +61,8 @@ use egui::{FontId, Key, Margin, Modifiers, Rect, RichText, Sense, Ui, pos2, vec2
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+
+mod views;
 
 const STORAGE_KEY: &str = "datacraft_ui_state";
 const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -117,17 +126,20 @@ pub struct ConnState {
     pub loading: HashSet<String>,
     /// Last error loading each database.
     pub db_errors: HashMap<String, String>,
+    /// The "Users" / "Roles" folder.
+    pub users: crate::ui::user_dialog::UsersNode,
 }
 
 impl ConnState {
     pub fn new(cfg: ConnectionConfig) -> Self {
-        Self { cfg, status: ConnStatus::Disconnected, databases: Vec::new(), loading: HashSet::new(), db_errors: HashMap::new() }
+        Self { cfg, status: ConnStatus::Disconnected, databases: Vec::new(), loading: HashSet::new(), db_errors: HashMap::new(), users: Default::default() }
     }
 
     fn clear(&mut self) {
         self.databases.clear();
         self.loading.clear();
         self.db_errors.clear();
+        self.users = Default::default();
     }
 
     /// The connection's default database (if connected).
@@ -264,11 +276,17 @@ pub struct DataCraftApp {
     create: Option<CreateDialog>,
     /// Confirmation to drop a database, table or view.
     drop: Option<DropDialog>,
+    /// "New View" / "Edit View" dialog and pending view definitions.
+    views: views::ViewState,
     import: Option<ImportDialog>,
     /// "Copy Table To…".
     copy: Option<CopyDialog>,
     /// "Export with Masking…".
     mask_export: Option<MaskExportDialog>,
+    /// "Modify Table…".
+    modify: Option<ModifyTableDialog>,
+    /// "New User…" / "Edit User…" / "Drop User…" (and the PostgreSQL role ones).
+    user_dialog: Option<crate::ui::user_dialog::UserDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -343,9 +361,12 @@ impl DataCraftApp {
             confirm_delete: None,
             create: None,
             drop: None,
+            views: Default::default(),
             import: None,
             copy: None,
             mask_export: None,
+            modify: None,
+            user_dialog: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -588,6 +609,10 @@ impl DataCraftApp {
                     self.recheck_edit_targets(conn);
                     if self.demo_pending {
                         self.demo_pending = false;
+                        if std::env::var("DATACRAFT_DEMO_USERS").is_ok() {
+                            self.explorer.expanded.insert(format!("u:{conn}"));
+                            self.load_users(conn);
+                        }
                         let first = self.conn(conn).and_then(|c| {
                             let db = c.default_db()?.to_string();
                             c.schemas(None)?
@@ -649,7 +674,20 @@ impl DataCraftApp {
                                 }
                             }
                         }
+                        self.demo_view(conn);
+                        if matches!(std::env::var("DATACRAFT_DEMO_MODIFY").as_deref(), Ok("1" | "edit"))
+                            && let Some(t) = self.explorer.selected_table.clone()
+                        {
+                            self.open_modify_table(t);
+                        }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
+                        if demo_create == "database" && self.conn(conn).is_some_and(|c| c.cfg.driver.has_databases()) {
+                            self.create = Some(CreateDialog::database(conn, self.conn(conn).map_or(Driver::Postgres, |c| c.cfg.driver)));
+                            if let Some(d) = self.create.as_mut() {
+                                d.name = "inventory".into();
+                            }
+                            self.worker.send(Request::DatabaseChoices { conn });
+                        }
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
                         {
@@ -740,7 +778,22 @@ impl DataCraftApp {
                 Response::SchemaSearch { request_id, result } => self.object_browser.schema_search.receive(request_id, result),
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
+                Response::ViewDefinition { conn, request_id, result } => self.view_definition_received(conn, request_id, result),
+                Response::TableDetails { request_id, result } => self.modify_loaded(request_id, result.map(|d| *d)),
                 Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
+                Response::Users { conn, result } => self.users_response(conn, result),
+                Response::DatabaseChoices { conn, result } => {
+                    if let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && matches!(d.target, CreateTarget::Database)) {
+                        match result {
+                            Ok(choices) => d.set_choices(choices),
+                            // Without the lists the dialog still works with the server's defaults.
+                            Err(e) => {
+                                d.set_choices(Default::default());
+                                d.error = Some(e);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -799,12 +852,17 @@ impl DataCraftApp {
                 continue;
             }
             let read_only = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.read_only);
-            let nosql = c.conn.and_then(|id| self.conn(id)).is_some_and(|cs| cs.cfg.driver.is_nosql());
+            let driver = c.conn.and_then(|id| self.conn(id)).map(|cs| cs.cfg.driver);
+            let nosql = driver.is_some_and(|d| d.is_nosql());
             let target = match (c.conn, &c.table) {
                 (None, _) => Err(tr("No connection").to_string()),
-                _ if nosql => Err(tr("Editing is not available for this engine").to_string()),
                 _ if read_only => Err(tr("Read-only connection").to_string()),
+                // Redis and MongoDB: only a key group or a collection opened in the data editor.
+                (Some(_), None) if nosql => Err(tr("Only data opened from the explorer can be edited on this engine").to_string()),
                 (Some(conn), Some(t)) => match self.table_info(conn, c.db.as_deref(), &t.schema, &t.table) {
+                    Some(info) if driver == Some(Driver::MongoDb) => {
+                        editing::document_target(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns)
+                    }
                     Some(info) => editing::target_for(&v.rs.columns, &t.schema, info.kind, &info.name, &info.columns),
                     None => Err(tr("Table structure not loaded yet").to_string()),
                 },
@@ -900,13 +958,36 @@ impl DataCraftApp {
         let Some(c) = self.consoles.get_mut(idx) else { return false };
         let Some(v) = c.results.get_mut(view) else { return false };
         v.finish_inline_edit();
+        let c = &self.consoles[idx];
+        let v = &c.results[view];
         let Some(e) = v.edit.as_ref() else { return false };
         if !e.state.is_dirty() {
             return false;
         }
         let driver = c.conn.and_then(|id| self.conns.iter().find(|x| x.cfg.id == id)).map(|x| x.cfg.driver).unwrap_or(Driver::Postgres);
-        let (statements, error) = match e.state.build_changes(&v.rs, &e.target) {
-            Ok(changes) => (changes.iter().map(|ch| edit::change_sql(driver, &e.target.schema, &e.target.table, ch)).collect(), None),
+        // The NoSQL commands need types: each field's sampled type (MongoDB), each key's (Redis).
+        let types: HashMap<String, String> = match driver {
+            Driver::MongoDb => c
+                .conn
+                .and_then(|conn| self.table_columns(conn, c.db.as_deref(), &e.target.schema, &e.target.table))
+                .unwrap_or_default()
+                .iter()
+                .map(|col| (col.name.clone(), col.data_type.clone()))
+                .collect(),
+            Driver::Redis => {
+                let col = |name: &str| v.rs.columns.iter().position(|c| c == name);
+                match (col("key"), col("type")) {
+                    (Some(k), Some(t)) => v.rs.rows.iter().filter_map(|r| Some((r.get(k)?.clone()?, r.get(t)?.clone()?))).collect(),
+                    _ => HashMap::new(),
+                }
+            }
+            _ => HashMap::new(),
+        };
+        let built = e.state.build_changes(&v.rs, &e.target).and_then(|changes| {
+            edit::change_statements(driver, &e.target.schema, &e.target.table, &changes, &types)
+        });
+        let (statements, error) = match built {
+            Ok(statements) => (statements, None),
             Err(err) => (Vec::new(), Some(err)),
         };
         self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false, visible });
@@ -1205,6 +1286,10 @@ impl DataCraftApp {
     }
 
     fn generate(&mut self, ctx: &egui::Context, t: &TableRef, kind: Generate) {
+        // Views: their real definition, read from the server.
+        if kind == Generate::Ddl && self.request_view_ddl(t) {
+            return;
+        }
         let Some(c) = self.conn(t.conn) else { return };
         let driver = c.cfg.driver;
         let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table) else {
@@ -1244,18 +1329,24 @@ impl DataCraftApp {
             // SQL-only actions never reach Redis or MongoDB (other menus may still offer them).
             let sql_only = match &a {
                 ExplorerAction::NewDatabase(id) | ExplorerAction::DropDatabase(id, _) => Some(*id),
-                ExplorerAction::NewTable { conn, .. } => Some(*conn),
+                ExplorerAction::NewTable { conn, .. } | ExplorerAction::NewView { conn, .. } => Some(*conn),
                 ExplorerAction::DropObject(t, _)
                 | ExplorerAction::TruncateTable(t)
                 | ExplorerAction::ImportData(t)
-                | ExplorerAction::CopyTable(t)
                 | ExplorerAction::RenameTable(t)
+                | ExplorerAction::ModifyTable(t)
                 | ExplorerAction::GenerateSelect(t)
                 | ExplorerAction::GenerateInsert(t)
-                | ExplorerAction::GenerateDdl(t) => Some(t.conn),
+                | ExplorerAction::GenerateDdl(t)
+                | ExplorerAction::EditView(t) => Some(t.conn),
                 _ => None,
             };
-            if sql_only.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.driver.is_nosql()) {
+            // Copying works with MongoDB collections too, but not with Redis keys.
+            let redis = match &a {
+                ExplorerAction::CopyTable(t) => self.conn(t.conn).is_some_and(|c| c.cfg.driver == Driver::Redis),
+                _ => false,
+            };
+            if redis || sql_only.and_then(|id| self.conn(id)).is_some_and(|c| c.cfg.driver.is_nosql()) {
                 self.error(tr("Not available for this engine").to_string());
                 continue;
             }
@@ -1287,6 +1378,7 @@ impl DataCraftApp {
                     }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.create = Some(CreateDialog::database(id, c.cfg.driver));
+                        self.worker.send(Request::DatabaseChoices { conn: id });
                     }
                 }
                 ExplorerAction::NewTable { conn, db, schema } => {
@@ -1294,6 +1386,8 @@ impl DataCraftApp {
                         self.open_new_table(conn, db, schema);
                     }
                 }
+                ExplorerAction::NewView { conn, db, schema } => self.open_new_view(conn, db, schema),
+                ExplorerAction::EditView(t) => self.open_edit_view(t),
                 ExplorerAction::DropDatabase(id, db) => {
                     if self.refuse_read_only(id) {
                         continue;
@@ -1307,6 +1401,7 @@ impl DataCraftApp {
                 ExplorerAction::ImportData(t) => self.open_import(t),
                 ExplorerAction::CopyTable(t) => self.open_copy(t),
                 ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
+                ExplorerAction::ModifyTable(t) => self.open_modify_table(t),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1336,6 +1431,10 @@ impl DataCraftApp {
                 ExplorerAction::GenerateSelect(t) => self.generate(ctx, &t, Generate::Select),
                 ExplorerAction::GenerateInsert(t) => self.generate(ctx, &t, Generate::Insert),
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
+                ExplorerAction::LoadUsers(id) => self.load_users(id),
+                ExplorerAction::NewUser(id) => self.open_user_dialog(id, None, false),
+                ExplorerAction::EditUser(id, account) => self.open_user_dialog(id, Some(account), false),
+                ExplorerAction::DropUser(id, account) => self.open_user_dialog(id, Some(account), true),
                 ExplorerAction::Hide => self.show_explorer = false,
             }
         }
@@ -1436,10 +1535,17 @@ impl DataCraftApp {
     fn start_copy(&mut self, request: crate::db::copy::CopyRequest) {
         let Some(d) = self.copy.as_mut() else { return };
         let Some(driver) = self.conns.iter().find(|c| c.cfg.id == d.source).map(|c| c.cfg.driver) else { return };
-        let select = crate::db::copy::select_sql(driver, &request.source_schema, &request.source_table, &request.columns, &request.filter, None);
-        if request.filter.contains(';') || !is_query(&select) {
-            d.error = Some(tr("The WHERE condition can only read data").to_string());
-            return;
+        if driver == Driver::MongoDb {
+            if !crate::db::copy::is_read_filter(&request.filter) {
+                d.error = Some(tr("The filter must be one JSON document that only reads, e.g. {status: \"active\"}").to_string());
+                return;
+            }
+        } else {
+            let select = crate::db::copy::select_sql(driver, &request.source_schema, &request.source_table, &request.columns, &request.filter, None);
+            if request.filter.contains(';') || !is_query(&select) {
+                d.error = Some(tr("The WHERE condition can only read data").to_string());
+                return;
+            }
         }
         let mut request = request;
         if request.masks.iter().any(|m| *m != crate::db::copy::Mask::Keep) {
@@ -1568,8 +1674,235 @@ impl DataCraftApp {
         self.create = Some(CreateDialog::table(conn, driver, db, schema));
     }
 
+    /// "Modify Table…": opens the dialog and asks the worker for the table's full structure.
+    fn open_modify_table(&mut self, t: TableRef) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
+        let Some(driver) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected).map(|c| c.cfg.driver) else { return };
+        let d = ModifyTableDialog::new(t.conn, driver, t.db.clone(), t.schema.clone(), t.table.clone());
+        let request_id = d.request_id;
+        self.modify = Some(d);
+        self.worker.send(Request::TableDetails { conn: t.conn, db: t.db, schema: t.schema, table: t.table, request_id });
+    }
+
+    fn modify_loaded(&mut self, request_id: u64, result: Result<crate::db::alter::TableDetails, String>) {
+        let Some(d) = self.modify.as_mut().filter(|d| d.request_id == request_id) else { return };
+        d.loaded(result);
+        let demo = std::env::var("DATACRAFT_DEMO").is_ok_and(|v| !v.is_empty());
+        if demo && d.is_loaded() && std::env::var("DATACRAFT_DEMO_MODIFY").is_ok_and(|v| v == "edit") {
+            d.demo_edits();
+        }
+    }
+
+    /// Reply to "Modify Table…"'s statements: the table (maybe renamed) is reloaded.
+    fn modify_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.modify.as_mut() else { return };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            // Engines without transactional DDL may have applied part of it: show the current state.
+            let (conn, db) = (d.conn, d.db.clone());
+            if let Some(c) = self.conn_mut(conn) {
+                c.loading.remove(&db);
+            }
+            self.load_database(conn, db);
+            return;
+        }
+        let Some(d) = self.modify.take() else { return };
+        let conn = d.conn;
+        let new_name = d.final_name();
+        if new_name != d.table {
+            // Data editors of the old name have nothing to show any more.
+            let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+            let gone = |c: &Console| {
+                c.conn == Some(conn)
+                    && c.db.as_deref().or(default_db.as_deref()) == Some(d.db.as_str())
+                    && c.table.as_ref().is_some_and(|t| t.schema == d.schema && t.table == d.table)
+            };
+            while let Some(i) = self.consoles.iter().position(gone) {
+                self.close_console_now(i);
+            }
+            for org in self.object_browser.organizations.iter_mut().filter(|o| o.conn == conn && o.db == d.db) {
+                org.table_changed(&d.schema, &d.table, Some(&new_name));
+            }
+            let renamed = TableRef { conn, db: d.db.clone(), schema: d.schema.clone(), table: new_name.clone() };
+            self.explorer.selected = Some(explorer::table_key(&renamed));
+            self.explorer.selected_table = Some(renamed);
+        } else {
+            self.reload_table_editors(conn, &d.db, &d.schema, &d.table);
+        }
+        if let Some(c) = self.conn_mut(conn) {
+            c.loading.remove(&d.db);
+        }
+        self.load_database(conn, d.db.clone());
+        self.info(trf("Table “{name}” modified", &[("name", &new_name)]));
+    }
+
+    /// Loads (or reloads) the "Users" / "Roles" folder of a connection.
+    fn load_users(&mut self, conn: ConnId) {
+        let Some(c) = self.conn_mut(conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        if crate::db::users::UserModel::of(c.cfg.driver).is_none() {
+            return;
+        }
+        c.users.loading = true;
+        self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::List });
+    }
+
+    /// User editor: a new user (`account` None), an existing one, or the confirmation to drop it.
+    /// Read-only connections can open the editor to look, but not create or drop.
+    fn open_user_dialog(&mut self, conn: ConnId, account: Option<crate::db::users::Account>, drop: bool) {
+        use crate::ui::user_dialog::UserDialog;
+        if (drop || account.is_none()) && self.refuse_read_only(conn) {
+            return;
+        }
+        let Some(c) = self.conn(conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        let (driver, read_only) = (c.cfg.driver, c.cfg.read_only);
+        if crate::db::users::UserModel::of(driver).is_none() {
+            return;
+        }
+        if c.users.list.is_none() && !c.users.loading {
+            self.load_users(conn);
+        }
+        self.user_dialog = Some(match account {
+            None => UserDialog::new_user(conn, driver),
+            Some(a) if drop => UserDialog::drop(conn, driver, a),
+            Some(a) => {
+                self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::Detail(a.clone()) });
+                UserDialog::edit(conn, driver, a, read_only)
+            }
+        });
+    }
+
+    /// Demo mode: `DATACRAFT_DEMO_USERS=1` expands the "Users" / "Roles" folder; `new`, `edit` or
+    /// `drop` also opens that dialog (on the first account that is not root), once.
+    fn demo_users(&mut self, conn: ConnId, first: Option<crate::db::users::Account>) {
+        static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("DATACRAFT_DEMO").is_err() {
+            return;
+        }
+        let Ok(mode) = std::env::var("DATACRAFT_DEMO_USERS") else { return };
+        if OPENED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match mode.as_str() {
+            "new" => self.open_user_dialog(conn, None, false),
+            "edit" if first.is_some() => self.open_user_dialog(conn, first, false),
+            "drop" if first.is_some() => self.open_user_dialog(conn, first, true),
+            _ => {}
+        }
+    }
+
+    fn users_response(&mut self, conn: ConnId, result: Result<crate::db::users::UsersReply, String>) {
+        use crate::db::users::UsersReply;
+        match result {
+            Ok(UsersReply::List(list)) => {
+                let first = list.accounts.iter().find(|a| a.account.name != "root" && !a.account.name.is_empty()).map(|a| a.account.clone());
+                if let Some(c) = self.conn_mut(conn) {
+                    c.users = crate::ui::user_dialog::UsersNode { list: Some(list), loading: false, error: None };
+                }
+                self.demo_users(conn, first);
+            }
+            Ok(UsersReply::Detail(account, user)) => {
+                if let Some(d) = self.user_dialog.as_mut().filter(|d| d.conn == conn && d.pending.as_ref() == Some(&account)) {
+                    d.pending = None;
+                    let keep_edits = !d.loading;
+                    d.loaded(*user, keep_edits);
+                }
+            }
+            Err(e) => {
+                // A failed detail belongs to the dialog waiting for it, if any; otherwise to the list.
+                if let Some(d) = self.user_dialog.as_mut().filter(|d| d.conn == conn && d.pending.is_some()) {
+                    d.pending = None;
+                    if d.loading {
+                        d.load_failed(e);
+                    }
+                } else if let Some(c) = self.conn_mut(conn) {
+                    c.users.loading = false;
+                    c.users.error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// Reply to the user dialog's statements.
+    fn user_ddl_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.user_dialog.as_mut() else { return };
+        let conn = d.conn;
+        if let Err(e) = result {
+            d.set_error(&e);
+            // What ran before the error stays (account statements commit on their own): read the
+            // user again so the next Apply only sends what is still missing.
+            if !d.dropping {
+                let account = d.edited_account();
+                d.pending = Some(account.clone());
+                self.worker.send(Request::Users { conn, request: crate::db::users::UsersRequest::Detail(account) });
+            }
+            self.load_users(conn);
+            return;
+        }
+        let Some(d) = self.user_dialog.take() else { return };
+        let name = d.edited_account().label(d.driver);
+        let args: &[(&str, &dyn std::fmt::Display)] = &[("name", &name)];
+        let msg = match (d.driver == Driver::Postgres, d.dropping, d.original.is_some()) {
+            (false, true, _) => trf("User “{name}” dropped", args),
+            (false, false, true) => trf("User “{name}” saved", args),
+            (false, false, false) => trf("User “{name}” created", args),
+            (true, true, _) => trf("Role “{name}” dropped", args),
+            (true, false, true) => trf("Role “{name}” saved", args),
+            (true, false, false) => trf("Role “{name}” created", args),
+        };
+        self.info(msg);
+        self.explorer.expanded.insert(format!("u:{conn}"));
+        self.load_users(conn);
+    }
+
+    fn user_dialog_ui(&mut self, ctx: &egui::Context) {
+        use crate::db::users::PrivTarget;
+        use crate::ui::user_dialog::{UserContext, UserDialogResult};
+        let Some(d) = self.user_dialog.as_ref() else { return };
+        let conn = d.conn;
+        let Some(c) = self.conns.iter().find(|c| c.cfg.id == conn) else {
+            self.user_dialog = None;
+            return;
+        };
+        let mut uc = UserContext { databases: c.databases.iter().map(|d| d.name.clone()).collect(), objects: Vec::new(), list: c.users.list.as_ref() };
+        if c.cfg.driver == Driver::Postgres {
+            for s in c.schemas(None).unwrap_or_default() {
+                uc.objects.push(PrivTarget::Schema(s.name.clone()));
+                uc.objects.extend(s.tables.iter().map(|t| PrivTarget::Table(s.name.clone(), t.name.clone())));
+            }
+        }
+        let Some(d) = self.user_dialog.as_mut() else { return };
+        match d.show(ctx, &uc) {
+            Some(UserDialogResult::Apply(statements)) => {
+                // Read-only connections never get here (no Apply button), but check anyway.
+                if c.cfg.read_only {
+                    d.error = Some(tr("Read-only connection").into());
+                    return;
+                }
+                d.running = true;
+                d.error = None;
+                self.worker.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction: false });
+            }
+            Some(UserDialogResult::Cancel) => self.user_dialog = None,
+            None => {}
+        }
+    }
+
     /// Reply to the "New Database" / "New Table" dialog's statements.
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
+        if self.view_ddl_done(conn, &result) {
+            return;
+        }
+        if self.modify.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.modify_done(result);
+            return;
+        }
+        if self.user_dialog.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.user_ddl_done(result);
+            return;
+        }
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
             self.drop_done(result);
             return;
@@ -1919,10 +2252,12 @@ impl DataCraftApp {
         self.object_browser.schema_search.open || self.object_browser.has_dialog() || self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.create.is_some()
+            || self.views.dialog.is_some()
             || self.drop.is_some()
             || self.import.is_some()
             || self.copy.is_some()
             || self.mask_export.is_some()
+            || self.user_dialog.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2781,6 +3116,9 @@ impl DataCraftApp {
             }
         }
 
+        self.view_dialog(ctx);
+        self.user_dialog_ui(ctx);
+
         if let Some(d) = self.import.as_mut() {
             match d.show(ctx) {
                 Some(ImportResult::Import(statements)) => {
@@ -2806,6 +3144,19 @@ impl DataCraftApp {
                 Some(CopyAction::Start(request)) => self.start_copy(*request),
                 Some(CopyAction::Load(conn, db)) => self.ensure_db_loaded(conn, Some(&db)),
                 Some(CopyAction::Close) => self.copy = None,
+                None => {}
+            }
+        }
+
+        if let Some(d) = self.modify.as_mut() {
+            match d.show(ctx) {
+                Some(ModifyResult::Apply(plan)) => {
+                    d.running = true;
+                    d.error = None;
+                    let (conn, db) = (d.conn, Some(d.db.clone()));
+                    self.worker.send(Request::RunDdl { conn, db, statements: plan.statements, close_db: None, transaction: plan.transaction });
+                }
+                Some(ModifyResult::Cancel) => self.modify = None,
                 None => {}
             }
         }
@@ -2964,7 +3315,13 @@ impl DataCraftApp {
             .and_then(|v| v.edit.as_ref())
             .map(|e| format!("{}.{}", e.target.schema, e.target.table))
             .unwrap_or_default();
-        let sql_text = pv.statements.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
+        let driver = self
+            .consoles
+            .iter()
+            .find(|c| c.id == pv.console)
+            .and_then(|c| self.conn(c.conn?))
+            .map_or(Driver::Postgres, |c| c.cfg.driver);
+        let sql_text = preview_text(driver, &pv.statements);
         let dark = self.dark;
         let mut submit = false;
         let mut cancel = false;
@@ -2988,7 +3345,7 @@ impl DataCraftApp {
                     let max_h = (screen.height() * 0.5).clamp(120.0, 520.0);
                     egui::ScrollArea::both().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
-                            let mut job = sql::highlight(buf.as_str(), dark, FontId::monospace(12.5));
+                            let mut job = sql::highlight_for(buf.as_str(), driver, dark, FontId::monospace(12.5));
                             job.wrap.max_width = f32::INFINITY;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
@@ -3042,6 +3399,13 @@ impl DataCraftApp {
             self.submit_preview();
         }
     }
+}
+
+/// The preview window's text: one statement per line, ending in `;` except for Redis, whose
+/// command lines have no terminator.
+fn preview_text(driver: Driver, statements: &[String]) -> String {
+    let end = if driver == Driver::Redis { "" } else { ";" };
+    statements.iter().map(|s| format!("{s}{end}")).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3419,12 +3783,13 @@ mod tests {
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             save_on_row_change: false,
-            dialog: None, confirm_delete: None, create: None, drop: None, import: None, copy: None, mask_export: None, renaming: None,
+            dialog: None, confirm_delete: None, create: None, drop: None, views: Default::default(), import: None, copy: None, mask_export: None, user_dialog: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,
             zoom: 1.0, applied_zoom: None, preview: None, confirm_discard: None,
             demo_explorer_w: None, demo_window: None, lang: None,
+            modify: None,
         }
     }
 
@@ -3566,5 +3931,38 @@ mod tests {
             "SELECT * FROM (SELECT * FROM \"HR\".\"T\" ORDER BY ID) WHERE ROWNUM <= 5"
         );
         assert_eq!(table_query(Driver::MySql, "shop", "t", "", "", 5), "SELECT * FROM `shop`.`t` LIMIT 5");
+    }
+
+    #[test]
+    fn nosql_changes_preview_as_their_commands() {
+        use crate::edit::Change;
+        let kv = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+        let changes = vec![
+            Change::Update { key: vec![kv("_id", Some("1"))], set: vec![kv("name", Some("O'Brien \"x\""))] },
+            Change::Insert { values: vec![kv("name", Some("Ana")), kv("tags", Some("[1]"))] },
+            Change::Delete { key: vec![kv("_id", Some("2"))] },
+        ];
+        let types: HashMap<String, String> = [("_id", "int"), ("tags", "array")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let mongo = edit::change_statements(Driver::MongoDb, "shop", "users", &changes, &types).unwrap();
+        assert_eq!(mongo.len(), 3);
+        assert!(mongo[0].starts_with("db.getCollection(\"users\").updateOne({\"_id\": 1}"));
+        let text = preview_text(Driver::MongoDb, &mongo);
+        assert!(text.ends_with(';'));
+        let job = sql::highlight_for(&text, Driver::MongoDb, true, FontId::monospace(12.5));
+        assert_eq!(job.text, text);
+
+        let changes = vec![
+            Change::Update { key: vec![kv("key", Some("s"))], set: vec![kv("ttl", None), kv("value", Some("it's \"v\""))] },
+            Change::Delete { key: vec![kv("key", Some("h"))] },
+        ];
+        let types: HashMap<String, String> = [("s", "string"), ("h", "hash")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let redis = edit::change_statements(Driver::Redis, "db0", "*", &changes, &types).unwrap();
+        assert_eq!(redis, vec!["PERSIST s", r#"SET s "it's \"v\"" XX KEEPTTL"#, "DEL h"]);
+        let text = preview_text(Driver::Redis, &redis);
+        assert_eq!(text.lines().count(), 3);
+        assert!(!text.contains(';'));
+        let job = sql::highlight_for(&text, Driver::Redis, false, FontId::monospace(12.5));
+        assert_eq!(job.text, text);
+        assert_eq!(preview_text(Driver::Sqlite, &["DELETE FROM t".to_string()]), "DELETE FROM t;");
     }
 }

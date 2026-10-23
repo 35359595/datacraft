@@ -1,9 +1,11 @@
 //! Data editing in the grid: pending changes and the SQL that applies them.
 //!
 //! Values travel as text (just as they are read) and are written as string literals;
-//! all three engines implicitly convert `'42'` to the column type.
+//! all three engines implicitly convert `'42'` to the column type. Redis and MongoDB get
+//! their own commands instead (`change_statements`), with values converted to the field's type.
 
 use crate::db::{Cell, Driver, Session};
+use std::collections::HashMap;
 
 /// A pending change on a row. `key` identifies the row: the PK columns or, if the
 /// table has none, every column with its original value.
@@ -73,6 +75,27 @@ pub fn change_sql(driver: Driver, schema: &str, table: &str, change: &Change) ->
         }
         Change::Delete { key } => format!("DELETE FROM {target} WHERE {}", where_clause(driver, key)),
     }
+}
+
+/// Statements that save `changes` to `schema.table`: SQL, or the engine's own commands on
+/// Redis (one or more command lines per change) and MongoDB (one `mongosh` command per change).
+/// `types` only matters there: MongoDB, each field's sampled type; Redis, each key's type.
+pub fn change_statements(
+    driver: Driver,
+    schema: &str,
+    table: &str,
+    changes: &[Change],
+    types: &HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(changes.len());
+    for ch in changes {
+        match driver {
+            Driver::Redis => out.extend(crate::db::redis_db::change_commands(ch, types)?),
+            Driver::MongoDb => out.push(crate::db::mongo::change_command(table, ch, types)?),
+            _ => out.push(change_sql(driver, schema, table, ch)),
+        }
+    }
+    Ok(out)
 }
 
 /// true for values the grid shows truncated (BLOB/binary in hex with "…"): they can't

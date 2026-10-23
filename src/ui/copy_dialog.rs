@@ -141,12 +141,18 @@ impl CopyDialog {
 
     /// Source columns to copy and the target name of each: on an existing table, only those it
     /// has (matched ignoring case).
-    fn plan(&self, target: &Target) -> (Vec<ColumnInfo>, Vec<String>, Vec<Mask>) {
+    /// A MongoDB collection takes any field: an existing one keeps the spelling of the fields
+    /// its sample found.
+    fn plan(&self, target: &Target, to: Driver) -> (Vec<ColumnInfo>, Vec<String>, Vec<Mask>) {
         let mut plan = (Vec::new(), Vec::new(), Vec::new());
         for ((c, on), mask) in self.columns.iter().zip(&self.selected).zip(&self.masks) {
             let name = match target {
                 _ if !on => None,
-                Target::Existing(cols) => cols.iter().find(|t| t.name.eq_ignore_ascii_case(&c.name)).map(|t| t.name.clone()),
+                Target::Existing(cols) => match cols.iter().find(|t| t.name.eq_ignore_ascii_case(&c.name)) {
+                    Some(t) => Some(t.name.clone()),
+                    None if to == Driver::MongoDb => Some(c.name.clone()),
+                    None => None,
+                },
                 _ => Some(c.name.clone()),
             };
             if let Some(name) = name {
@@ -200,7 +206,10 @@ impl CopyDialog {
             result = Some(CopyAction::Load(self.target, self.target_db.clone()));
         }
         let to = self.target_driver(conns).unwrap_or(self.source_driver);
-        let (columns, names, masks) = self.plan(&target);
+        let (columns, names, masks) = self.plan(&target, to);
+        // MongoDB on either side: a JSON filter, no foreign keys to follow, no transaction.
+        let mongo_source = self.source_driver == Driver::MongoDb;
+        let mongo = mongo_source || to == Driver::MongoDb;
         let creating = matches!(target, Target::New);
         let running = self.running();
         let dark = ctx.global_style().visuals.dark_mode;
@@ -254,7 +263,7 @@ impl CopyDialog {
                             ui.end_row();
                         }
                     }
-                    ui.label(tr("Table:"));
+                    ui.label(if to == Driver::MongoDb { tr("Collection:") } else { tr("Table:") });
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.target_table).margin(vec2(8.0, 5.0)).desired_width(260.0));
                         let note = match target {
@@ -265,13 +274,14 @@ impl CopyDialog {
                         ui.label(RichText::new(note).small().color(p.muted));
                     });
                     ui.end_row();
-                    ui.label(tr("WHERE:"));
+                    ui.label(if mongo_source { tr("Filter:") } else { tr("WHERE:") });
+                    let hint = if mongo_source { tr("optional, e.g. {status: \"active\"}") } else { tr("optional, e.g. created_at > '2026-01-01'") };
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .margin(vec2(8.0, 5.0))
                             .desired_width(400.0)
                             .font(egui::TextStyle::Monospace)
-                            .hint_text(tr("optional, e.g. created_at > '2026-01-01'")),
+                            .hint_text(hint),
                     );
                     ui.end_row();
                     ui.label(tr("Rows:"));
@@ -285,8 +295,12 @@ impl CopyDialog {
                     ui.end_row();
                     if matches!(target, Target::Existing(_)) {
                         ui.label("");
-                        ui.checkbox(&mut self.clear, tr("Delete the target table's rows first"));
+                        let label = if to == Driver::MongoDb { tr("Delete the collection's documents first") } else { tr("Delete the target table's rows first") };
+                        ui.checkbox(&mut self.clear, label);
                         ui.end_row();
+                    }
+                    if mongo {
+                        return;
                     }
                     ui.label(tr("Related rows:"));
                     ui.vertical(|ui| {
@@ -313,8 +327,18 @@ impl CopyDialog {
                 self.columns_ui(ui, &target, to, &p);
             });
             ui.add_space(10.0);
-            let mut preview = copy::select_sql(self.source_driver, &self.schema, &self.table, &columns, &self.filter, None);
-            if creating && !self.target_table.trim().is_empty() {
+            let mut preview = if mongo_source {
+                copy::find_command(&self.table, &columns, &self.filter, None)
+            } else {
+                copy::select_sql(self.source_driver, &self.schema, &self.table, &columns, &self.filter, None)
+            };
+            if to == Driver::MongoDb && !self.target_table.trim().is_empty() {
+                let types: Vec<String> = columns.iter().map(|c| copy::target_type(self.source_driver, to, &c.data_type, c.primary_key)).collect();
+                let types: Vec<&str> = types.iter().map(String::as_str).collect();
+                let clear = self.clear && !creating;
+                preview.push_str(";\n\n");
+                preview.push_str(&copy::mongo_insert_preview(self.target_table.trim(), &names, &types, clear));
+            } else if creating && !self.target_table.trim().is_empty() {
                 let mut cols = columns.clone();
                 for (c, n) in cols.iter_mut().zip(&names) {
                     c.name.clone_from(n);
@@ -336,7 +360,12 @@ impl CopyDialog {
                     });
                 });
             ui.add_space(6.0);
-            ui.label(RichText::new(tr("Up to 1,000,000 rows, inserted in one transaction. Binary columns are not copied.")).small().color(p.muted));
+            let note = if to == Driver::MongoDb {
+                tr("Up to 1,000,000 documents, inserted in batches of 500 without a transaction (a standalone MongoDB server has none): an error or a stop keeps those already inserted. Documents whose _id is already in the collection are skipped. Binary fields are not copied.")
+            } else {
+                tr("Up to 1,000,000 rows, inserted in one transaction. Binary columns are not copied.")
+            };
+            ui.label(RichText::new(note).small().color(p.muted));
             if masks.iter().any(|m| *m != Mask::Keep) {
                 ui.label(
                     RichText::new(tr("Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain."))
@@ -381,9 +410,9 @@ impl CopyDialog {
                                 clear: self.clear && !creating,
                                 masks: masks.clone(),
                                 mask_key: String::new(),
-                                parents: self.parents || self.children,
-                                children: self.children,
-                                mask_related: self.mask_related && (self.parents || self.children),
+                                parents: !mongo && (self.parents || self.children),
+                                children: !mongo && self.children,
+                                mask_related: !mongo && self.mask_related && (self.parents || self.children),
                             })));
                         }
                     });
@@ -421,7 +450,7 @@ impl CopyDialog {
             egui::Grid::new("copy_columns_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
                 for (i, ((c, on), mask)) in self.columns.iter().zip(self.selected.iter_mut()).zip(self.masks.iter_mut()).enumerate() {
                     let binary = copy::is_binary(self.source_driver, &c.data_type);
-                    let missing = matches!(target, Target::Existing(cols) if !cols.iter().any(|t| t.name.eq_ignore_ascii_case(&c.name)));
+                    let missing = to != Driver::MongoDb && matches!(target, Target::Existing(cols) if !cols.iter().any(|t| t.name.eq_ignore_ascii_case(&c.name)));
                     ui.add_enabled_ui(!binary && !missing, |ui| {
                         ui.checkbox(on, &c.name);
                     });
@@ -429,7 +458,7 @@ impl CopyDialog {
                         tr("binary: not copied").to_string()
                     } else if missing {
                         tr("not in the target table").to_string()
-                    } else if matches!(target, Target::New) {
+                    } else if matches!(target, Target::New) || to == Driver::MongoDb {
                         let ty = copy::target_type(self.source_driver, to, &c.data_type, c.primary_key);
                         if ty == c.data_type { ty.to_lowercase() } else { format!("{} → {ty}", c.data_type.to_lowercase()) }
                     } else {
@@ -457,7 +486,8 @@ impl CopyDialog {
     }
 }
 
-/// Connections that can receive a copy: connected and not read-only.
+/// Connections that can receive a copy: connected, not read-only and not Redis (it has no
+/// tables or collections to copy into).
 fn writable(c: &ConnState) -> bool {
-    c.status == ConnStatus::Connected && !c.cfg.read_only
+    c.status == ConnStatus::Connected && !c.cfg.read_only && c.cfg.driver != Driver::Redis
 }

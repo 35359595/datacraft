@@ -8,6 +8,7 @@
 //! found in a sample of their documents as columns; documents show their top-level fields as
 //! columns and nested documents and arrays as JSON.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -17,6 +18,7 @@ use mongodb::options::ClientOptions;
 use mongodb::results::CollectionType;
 
 use super::{Cell, ColumnInfo, ConnectionConfig, ObjectKind, ResultSet, SchemaInfo, TableInfo};
+use crate::edit::Change;
 use crate::i18n::{tr, trf};
 
 /// Documents read per collection to guess its fields.
@@ -159,6 +161,98 @@ impl MongoSession {
         rs.statement = statement;
         rs.elapsed = start.elapsed();
         Ok(vec![rs])
+    }
+
+    /// Applies data editor commands (`updateOne` / `insertOne` / `deleteOne` from `change_command`);
+    /// each must match exactly one document. On a replica set or a sharded cluster they run in one
+    /// transaction. A standalone server has no transactions: they run in order, and on a failure
+    /// the earlier ones stay saved (the error says how many).
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        let mut ops = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            match parse_command(stmt.trim().trim_end_matches(';'))? {
+                Command::Collection { name, method, args, chain }
+                    if chain.is_empty() && matches!(method.as_str(), "updateOne" | "insertOne" | "deleteOne") =>
+                {
+                    ops.push((stmt, name, method, args))
+                }
+                _ => bail!(trf("Not a data editor change: {stmt}", &[("stmt", stmt)])),
+            }
+        }
+        let mut session = if self.supports_transactions().await {
+            let mut s = self.client.start_session().await.map_err(|e| self.fail(e))?;
+            s.start_transaction().await.map_err(|e| self.fail(e))?;
+            Some(s)
+        } else {
+            None
+        };
+        let db = self.client.database(&self.db);
+        for (i, (stmt, name, method, args)) in ops.iter().enumerate() {
+            let coll = db.collection::<Document>(name);
+            let doc_arg = |n: usize| match args.get(n) {
+                Some(Bson::Document(d)) => Ok(d.clone()),
+                other => Err(anyhow!(trf("Expected a document, found {value}", &[("value", &other.cloned().unwrap_or(Bson::Null))]))),
+            };
+            let result = match (method.as_str(), doc_arg(0), session.as_mut()) {
+                (_, Err(e), _) => Err(e),
+                ("updateOne", Ok(filter), s) => match doc_arg(1) {
+                    Err(e) => Err(e),
+                    Ok(update) => match s {
+                        Some(s) => coll.update_one(filter, update).session(s).await,
+                        None => coll.update_one(filter, update).await,
+                    }
+                    .map(|r| r.matched_count)
+                    .map_err(|e| self.fail(e)),
+                },
+                ("insertOne", Ok(d), s) => match s {
+                    Some(s) => coll.insert_one(d).session(s).await,
+                    None => coll.insert_one(d).await,
+                }
+                .map(|_| 1)
+                .map_err(|e| self.fail(e)),
+                (_, Ok(filter), s) => match s {
+                    Some(s) => coll.delete_one(filter).session(s).await,
+                    None => coll.delete_one(filter).await,
+                }
+                .map(|r| r.deleted_count)
+                .map_err(|e| self.fail(e)),
+            };
+            let partial = session.is_none() && i > 0;
+            let err = match result {
+                Ok(1) => continue,
+                Ok(n) if partial => anyhow!(trf("The statement affected {n} rows (expected 1):\n{stmt}", &[("n", &n), ("stmt", stmt)])),
+                Ok(n) => super::not_single_row(n, stmt),
+                Err(e) => e,
+            };
+            if let Some(s) = session.as_mut() {
+                let _ = s.abort_transaction().await;
+            } else if partial {
+                let note = trf(
+                    "The server does not support transactions (it is not a replica set): the {n} earlier changes were saved.",
+                    &[("n", &i)],
+                );
+                return Err(anyhow!("{err:#}\n{note}"));
+            }
+            return Err(err);
+        }
+        if let Some(s) = session.as_mut() {
+            s.commit_transaction().await.map_err(|e| self.fail(e))?;
+        }
+        Ok(ops.len() as u64)
+    }
+
+    /// true on a replica set member or a `mongos` router (transactions need one).
+    async fn supports_transactions(&mut self) -> bool {
+        let admin = self.client.database("admin");
+        let hello = match admin.run_command(doc! { "hello": 1 }).await {
+            Ok(h) => h,
+            // Servers before 4.4 only know the legacy name.
+            Err(_) => match admin.run_command(doc! { "isMaster": 1 }).await {
+                Ok(h) => h,
+                Err(_) => return false,
+            },
+        };
+        hello.contains_key("setName") || hello.get_str("msg").is_ok_and(|m| m == "isdbgrid")
     }
 
     async fn run(&mut self, cmd: Command, max_rows: usize) -> anyhow::Result<ResultSet> {
@@ -670,10 +764,7 @@ impl Parser<'_> {
                                 None => Ok(Bson::ObjectId(ObjectId::new())),
                             },
                             "ISODate" | "Date" => match arg {
-                                Some(s) => {
-                                    let s = if s.len() == 10 { format!("{s}T00:00:00Z") } else { s };
-                                    Ok(Bson::DateTime(mongodb::bson::DateTime::parse_rfc3339_str(&s).map_err(|e| anyhow!("{e}"))?))
-                                }
+                                Some(s) => Ok(Bson::DateTime(parse_date(&s).map_err(|e| anyhow!("{e}"))?)),
                                 None => Ok(Bson::DateTime(mongodb::bson::DateTime::now())),
                             },
                             "NumberLong" => Ok(Bson::Int64(arg.and_then(|s| s.parse().ok()).ok_or_else(|| self.err(tr("a number")))?)),
@@ -743,6 +834,150 @@ pub fn split_script(script: &str) -> Vec<(usize, usize)> {
     out
 }
 
+impl MongoSession {
+    /// "Copy Table To…" target: inserts the documents with one unordered `insertMany`, creating
+    /// the collection if needed. Documents whose `_id` is already there (duplicate key) are
+    /// skipped instead of failing the copy; any other error fails it. Returns (inserted, skipped).
+    pub async fn insert_skipping_duplicates(&mut self, collection: &str, docs: Vec<Document>) -> anyhow::Result<(u64, u64)> {
+        use mongodb::error::ErrorKind;
+        let n = docs.len() as u64;
+        if n == 0 {
+            return Ok((0, 0));
+        }
+        let coll = self.client.database(&self.db).collection::<Document>(collection);
+        match coll.insert_many(docs).ordered(false).await {
+            Ok(r) => Ok((r.inserted_ids.len() as u64, 0)),
+            Err(e) => {
+                if let ErrorKind::InsertMany(ref im) = *e.kind
+                    && im.write_concern_error.is_none()
+                    && let Some(errors) = &im.write_errors
+                    && errors.iter().all(|w| w.code == DUPLICATE_KEY)
+                {
+                    let skipped = errors.len() as u64;
+                    return Ok((n.saturating_sub(skipped), skipped));
+                }
+                Err(self.fail(e))
+            }
+        }
+    }
+}
+
+/// Server error code of a write that breaks a unique index (`_id` included).
+const DUPLICATE_KEY: i32 = 11000;
+
+/// `ISODate("…")` text: RFC 3339, or just a date (`2026-01-02`, midnight UTC).
+fn parse_date(s: &str) -> Result<mongodb::bson::DateTime, mongodb::bson::datetime::Error> {
+    let s = if s.len() == 10 { format!("{s}T00:00:00Z") } else { s.to_string() };
+    mongodb::bson::DateTime::parse_rfc3339_str(&s)
+}
+
+// ---------------------------------------------------------------- data editing
+
+/// A string as the console parser reads it (double quotes; `\n`, `\t`, `\r` and `\uXXXX` escapes).
+fn shell_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A BSON value in `mongosh` syntax, which `parse_command` reads back with the same type.
+fn to_shell(v: &Bson) -> Result<String, String> {
+    Ok(match v {
+        Bson::Null | Bson::Undefined => "null".into(),
+        Bson::String(s) => shell_str(s),
+        Bson::Boolean(b) => b.to_string(),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => format!("NumberLong(\"{n}\")"),
+        // `{:?}` keeps the decimal point (`1.0`), so the parser reads a double back.
+        Bson::Double(n) if n.is_finite() => format!("{n:?}"),
+        Bson::Decimal128(d) => format!("NumberDecimal({})", shell_str(&d.to_string())),
+        Bson::ObjectId(o) => format!("ObjectId(\"{}\")", o.to_hex()),
+        Bson::DateTime(d) => format!("ISODate({})", shell_str(&d.try_to_rfc3339_string().map_err(|e| e.to_string())?)),
+        Bson::RegularExpression(r) if !r.pattern.contains('/') => format!("/{}/{}", r.pattern, r.options),
+        Bson::Document(d) => {
+            let fields = d.iter().map(|(k, v)| Ok(format!("{}: {}", shell_str(k), to_shell(v)?))).collect::<Result<Vec<_>, String>>()?;
+            format!("{{{}}}", fields.join(", "))
+        }
+        Bson::Array(a) => format!("[{}]", a.iter().map(to_shell).collect::<Result<Vec<_>, String>>()?.join(", ")),
+        other => return Err(trf("Values of type {type} cannot be written from the grid", &[("type", &type_name(other))])),
+    })
+}
+
+/// A grid cell (text) as a `mongosh` value of the field's sampled type (`ColumnInfo::data_type`
+/// from `introspect`). NULL is `null`; strings and unknown types are written as strings.
+pub fn shell_value(value: &Cell, data_type: &str) -> Result<String, String> {
+    let Some(v) = value else { return Ok("null".into()) };
+    let bad = || trf("“{value}” is not a valid {type} value", &[("value", v), ("type", &data_type)]);
+    let t = v.trim();
+    Ok(match data_type {
+        "objectId" => format!("ObjectId(\"{}\")", ObjectId::parse_str(t).map_err(|_| bad())?.to_hex()),
+        "int" => match t.parse::<i32>() {
+            Ok(n) => n.to_string(),
+            Err(_) => format!("NumberLong(\"{}\")", t.parse::<i64>().map_err(|_| bad())?),
+        },
+        "long" => format!("NumberLong(\"{}\")", t.parse::<i64>().map_err(|_| bad())?),
+        "double" => format!("{:?}", t.parse::<f64>().ok().filter(|n| n.is_finite()).ok_or_else(bad)?),
+        "decimal" => format!("NumberDecimal({})", shell_str(&t.parse::<mongodb::bson::Decimal128>().map_err(|_| bad())?.to_string())),
+        "bool" => match t.to_ascii_lowercase().as_str() {
+            "true" => "true".into(),
+            "false" => "false".into(),
+            _ => return Err(bad()),
+        },
+        "date" => {
+            parse_date(t).map_err(|_| bad())?;
+            format!("ISODate({})", shell_str(t))
+        }
+        // The grid shows them as relaxed extended JSON (`{"$oid": …}`, `{"$date": …}`), read back here.
+        "object" | "array" => {
+            let json: serde_json::Value = serde_json::from_str(t).map_err(|_| bad())?;
+            to_shell(&Bson::try_from(json).map_err(|e| format!("{}: {e}", bad()))?)?
+        }
+        _ => shell_str(v),
+    })
+}
+
+/// The `mongosh` command that applies a data editor change to `collection`: `updateOne` with
+/// `$set`, `insertOne` or `deleteOne`, by `_id`. `types` maps each field to its sampled type.
+pub fn change_command(collection: &str, change: &Change, types: &HashMap<String, String>) -> Result<String, String> {
+    let ty = |c: &str| types.get(c).map_or("mixed", String::as_str);
+    let fields = |pairs: &[(String, Cell)]| -> Result<String, String> {
+        let parts = pairs
+            .iter()
+            .map(|(c, v)| Ok(format!("{}: {}", shell_str(c), shell_value(v, ty(c)).map_err(|e| format!("{c}: {e}"))?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(format!("{{{}}}", parts.join(", ")))
+    };
+    // The key falls back to a string when it doesn't fit the sampled type (a field may mix types).
+    let by_id = |key: &[(String, Cell)]| -> Result<String, String> {
+        let (_, id) = key.iter().find(|(c, _)| c == "_id").ok_or_else(|| tr("The documents have no _id to identify them").to_string())?;
+        let v = shell_value(id, ty("_id")).or_else(|_| shell_value(id, "string"))?;
+        Ok(format!("{{\"_id\": {v}}}"))
+    };
+    let coll = format!("db.getCollection({})", shell_str(collection));
+    match change {
+        Change::Update { key, set } => {
+            if set.iter().any(|(c, _)| c == "_id") {
+                return Err(tr("The _id of an existing document cannot be changed").into());
+            }
+            Ok(format!("{coll}.updateOne({}, {{\"$set\": {}}})", by_id(key)?, fields(set)?))
+        }
+        Change::Insert { values } => Ok(format!("{coll}.insertOne({})", fields(values)?)),
+        Change::Delete { key } => Ok(format!("{coll}.deleteOne({})", by_id(key)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +1007,77 @@ mod tests {
         assert!(parse_command("db.x.find({a: })").is_err());
         assert!(parse_command("select * from x").is_err());
         assert!(parse_command("db.x.find() junk").is_err());
+    }
+
+    #[test]
+    fn grid_values_keep_their_type() {
+        let v = |s: &str, ty: &str| shell_value(&Some(s.to_string()), ty);
+        assert_eq!(v("64B7F1F1F1F1F1F1F1F1F1F1", "objectId").unwrap(), r#"ObjectId("64b7f1f1f1f1f1f1f1f1f1f1")"#);
+        assert!(v("xyz", "objectId").is_err());
+        assert_eq!(v(" 42 ", "int").unwrap(), "42");
+        assert_eq!(v("9007199254740993", "int").unwrap(), r#"NumberLong("9007199254740993")"#);
+        assert_eq!(v("7", "long").unwrap(), r#"NumberLong("7")"#);
+        assert_eq!(v("3", "double").unwrap(), "3.0");
+        assert_eq!(v("2.5", "double").unwrap(), "2.5");
+        assert!(v("abc", "int").is_err() && v("NaN", "double").is_err() && v("1.5", "long").is_err());
+        assert_eq!(v("1.10", "decimal").unwrap(), r#"NumberDecimal("1.10")"#);
+        assert_eq!(v("TRUE", "bool").unwrap(), "true");
+        assert!(v("yes", "bool").is_err());
+        assert_eq!(v("2026-01-02T03:04:05Z", "date").unwrap(), r#"ISODate("2026-01-02T03:04:05Z")"#);
+        assert_eq!(v("2026-01-02", "date").unwrap(), r#"ISODate("2026-01-02")"#);
+        assert!(v("yesterday", "date").is_err());
+        assert_eq!(v(r#"say "hi" \ ok"#, "string").unwrap(), r#""say \"hi\" \\ ok""#);
+        assert_eq!(v("", "string").unwrap(), r#""""#);
+        assert_eq!(v("42", "mixed").unwrap(), r#""42""#);
+        assert_eq!(shell_value(&None, "int").unwrap(), "null");
+        // Objects and arrays come back from the grid's relaxed extended JSON.
+        assert_eq!(
+            v(r#"{"a":1,"b":[true,null],"id":{"$oid":"64b7f1f1f1f1f1f1f1f1f1f1"},"at":{"$date":"2026-01-02T00:00:00Z"},"x":1.0}"#, "object").unwrap(),
+            r#"{"a": 1, "b": [true, null], "id": ObjectId("64b7f1f1f1f1f1f1f1f1f1f1"), "at": ISODate("2026-01-02T00:00:00Z"), "x": 1.0}"#
+        );
+        assert_eq!(v("[]", "array").unwrap(), "[]");
+        assert!(v("{bad", "object").is_err());
+        assert!(v(r#"{"b":{"$binary":{"base64":"AA==","subType":"00"}}}"#, "object").is_err());
+    }
+
+    #[test]
+    fn grid_changes_become_commands_the_parser_reads() {
+        let types: HashMap<String, String> =
+            [("_id", "objectId"), ("n", "int"), ("name", "string"), ("tags", "array"), ("at", "date")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let kv = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+        let id = kv("_id", Some("64b7f1f1f1f1f1f1f1f1f1f1"));
+        let oid = ObjectId::parse_str("64b7f1f1f1f1f1f1f1f1f1f1").unwrap();
+
+        let up = Change::Update { key: vec![id.clone()], set: vec![kv("n", Some("5")), kv("name", None), kv("tags", Some(r#"["a",2]"#)), kv("note", Some(""))] };
+        let cmd = change_command("my \"coll\"", &up, &types).unwrap();
+        assert_eq!(
+            cmd,
+            r#"db.getCollection("my \"coll\"").updateOne({"_id": ObjectId("64b7f1f1f1f1f1f1f1f1f1f1")}, {"$set": {"n": 5, "name": null, "tags": ["a", 2], "note": ""}})"#
+        );
+        let Command::Collection { name, method, args, chain } = parse_command(&cmd).unwrap() else { panic!() };
+        assert_eq!((name.as_str(), method.as_str(), chain.len()), ("my \"coll\"", "updateOne", 0));
+        assert_eq!(args[0], Bson::Document(doc! { "_id": oid }));
+        assert_eq!(args[1], Bson::Document(doc! { "$set": { "n": 5, "name": Bson::Null, "tags": ["a", 2], "note": "" } }));
+
+        let ins = Change::Insert { values: vec![kv("name", Some("Ana\nP")), kv("at", Some("2026-01-02T03:04:05Z"))] };
+        let cmd = change_command("users", &ins, &types).unwrap();
+        let Command::Collection { method, args, .. } = parse_command(&cmd).unwrap() else { panic!() };
+        assert_eq!(method, "insertOne");
+        let d = args[0].as_document().unwrap();
+        assert_eq!(d.get_str("name").unwrap(), "Ana\nP");
+        assert_eq!(render(d.get("at").unwrap()).unwrap(), "2026-01-02T03:04:05Z");
+        assert_eq!(change_command("users", &Change::Insert { values: vec![] }, &types).unwrap(), r#"db.getCollection("users").insertOne({})"#);
+
+        let del = Change::Delete { key: vec![id] };
+        assert_eq!(change_command("users", &del, &types).unwrap(), r#"db.getCollection("users").deleteOne({"_id": ObjectId("64b7f1f1f1f1f1f1f1f1f1f1")})"#);
+        // An _id that doesn't fit the sampled type is looked up as a string.
+        let del = Change::Delete { key: vec![kv("_id", Some("legacy-1"))] };
+        assert_eq!(change_command("users", &del, &types).unwrap(), r#"db.getCollection("users").deleteOne({"_id": "legacy-1"})"#);
+
+        assert!(change_command("users", &Change::Update { key: vec![kv("_id", Some("1"))], set: vec![kv("_id", Some("2"))] }, &types).is_err());
+        let bad = Change::Update { key: vec![kv("_id", Some("1"))], set: vec![kv("n", Some("many"))] };
+        assert!(change_command("users", &bad, &types).unwrap_err().starts_with("n: "));
+        assert!(change_command("users", &Change::Delete { key: vec![kv("x", Some("1"))] }, &types).is_err());
     }
 
     #[test]

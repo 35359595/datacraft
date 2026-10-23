@@ -639,6 +639,27 @@ pub fn target_for(result_cols: &[String], schema: &str, kind: ObjectKind, table:
     Ok(EditTarget { schema: schema.to_string(), table: table.to_string(), col_names, key_cols, binary_cols, has_pk })
 }
 
+/// Edit target of a MongoDB collection opened in the data editor: documents are identified by
+/// `_id`, and fields missing from the sampled `columns` are still editable (as strings).
+pub fn document_target(result_cols: &[String], schema: &str, kind: ObjectKind, collection: &str, columns: &[ColumnInfo]) -> Result<EditTarget, String> {
+    if kind != ObjectKind::Table {
+        return Err(tr("Views are read-only").into());
+    }
+    let id = result_cols.iter().position(|c| c == "_id").ok_or_else(|| tr("The documents have no _id to identify them").to_string())?;
+    let binary_cols = result_cols
+        .iter()
+        .map(|rc| columns.iter().find(|c| c.name == *rc).is_some_and(|c| matches!(c.data_type.as_str(), "binData" | "timestamp")))
+        .collect();
+    Ok(EditTarget {
+        schema: schema.to_string(),
+        table: collection.to_string(),
+        col_names: result_cols.to_vec(),
+        key_cols: vec![id],
+        binary_cols,
+        has_pk: true,
+    })
+}
+
 /// Edit target of a console result, if the query is trivial over a table known in
 /// `schemas`.
 pub fn console_target(statement: &str, result_cols: &[String], schemas: &[SchemaInfo]) -> Result<EditTarget, String> {
@@ -689,6 +710,21 @@ mod tests {
         }
     }
     use crate::db::TableInfo;
+
+    #[test]
+    fn mongodb_documents_are_keyed_by_id() {
+        let cols = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let info = vec![
+            ColumnInfo { name: "_id".into(), data_type: "objectId".into(), nullable: false, primary_key: true },
+            ColumnInfo { name: "blob".into(), data_type: "binData".into(), nullable: true, primary_key: false },
+        ];
+        // `extra` was not in the sample: still editable.
+        let t = document_target(&cols(&["name", "_id", "blob", "extra"]), "shop", ObjectKind::Table, "users", &info).unwrap();
+        assert_eq!((t.key_cols.clone(), t.binary_cols.clone(), t.has_pk), (vec![1], vec![false, false, true, false], true));
+        assert_eq!(t.col_names, cols(&["name", "_id", "blob", "extra"]));
+        assert!(document_target(&cols(&["name"]), "shop", ObjectKind::Table, "users", &info).is_err());
+        assert!(document_target(&cols(&["_id"]), "shop", ObjectKind::View, "v", &info).is_err());
+    }
 
     fn col(name: &str, pk: bool) -> ColumnInfo {
         ColumnInfo { name: name.into(), data_type: "TEXT".into(), nullable: true, primary_key: pk }

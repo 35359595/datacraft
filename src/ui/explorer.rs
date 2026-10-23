@@ -49,6 +49,10 @@ pub enum ExplorerAction {
     NewDatabase(ConnId),
     /// "New Table" dialog in a database (and schema, if one was chosen).
     NewTable { conn: ConnId, db: String, schema: Option<String> },
+    /// "New View" dialog in a database (and schema, if one was chosen).
+    NewView { conn: ConnId, db: String, schema: Option<String> },
+    /// "Edit View" dialog, with the view's definition read from the server.
+    EditView(TableRef),
     /// Confirm and drop a database.
     DropDatabase(ConnId, String),
     /// Confirm and drop a table or view.
@@ -58,6 +62,8 @@ pub enum ExplorerAction {
     /// "Copy Table To…" another connection, database or schema.
     CopyTable(TableRef),
     RenameTable(TableRef),
+    /// "Modify Table…": columns, primary key, indexes and name.
+    ModifyTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     BrowseObjects(ObjectScope),
@@ -66,6 +72,11 @@ pub enum ExplorerAction {
     GenerateSelect(TableRef),
     GenerateInsert(TableRef),
     GenerateDdl(TableRef),
+    /// Load (or reload) the "Users" / "Roles" folder.
+    LoadUsers(ConnId),
+    NewUser(ConnId),
+    EditUser(ConnId, crate::db::users::Account),
+    DropUser(ConnId, crate::db::users::Account),
     Hide,
 }
 
@@ -268,6 +279,13 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
             {
                 let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
                 actions.push(ExplorerAction::NewTable { conn, db, schema });
+                ui.close();
+            }
+            if ui.add_enabled(connected && sql && sel_db.is_some(), egui::Button::new(tr("New View…"))).clicked()
+                && let (Some(conn), Some(db)) = (sel_conn, sel_db.clone())
+            {
+                let schema = table.as_ref().filter(|t| t.db == db).map(|t| t.schema.clone());
+                actions.push(ExplorerAction::NewView { conn, db, schema });
                 ui.close();
             }
         });
@@ -480,6 +498,99 @@ fn connection_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Exp
     for d in &c.databases {
         database_rows(ui, state, actions, c, d, filter, name_match);
     }
+    if !filtering && matches!(c.status, ConnStatus::Connected) && crate::db::users::UserModel::of(c.cfg.driver).is_some() {
+        users_rows(ui, state, actions, c);
+    }
+}
+
+/// "Users" (MySQL / MariaDB) or "Roles" (PostgreSQL) folder at server level, after the databases.
+fn users_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, c: &ConnState) {
+    let p = pal(ui);
+    let id = c.cfg.id;
+    let driver = c.cfg.driver;
+    let roles = driver == Driver::Postgres;
+    let ukey = format!("u:{id}");
+    let open = state.expanded.contains(&ukey);
+    let node = &c.users;
+    let badge = node.list.as_ref().map(|l| l.accounts.len().to_string());
+    let row = tree_row(
+        ui,
+        state,
+        RowSpec {
+            key: &ukey,
+            depth: 1,
+            expandable: true,
+            expanded: open,
+            icon: Ico::Folder,
+            label: if roles { tr("Roles") } else { tr("Users") },
+            badge: badge.as_deref(),
+            detail: node.loading.then(|| (tr("loading…"), p.muted)),
+            status: None,
+            label_color: None,
+        },
+    );
+    if row.toggled {
+        toggle(state, &ukey, open);
+    }
+    if (row.toggled && !open || row.resp.clicked()) && node.list.is_none() && !node.loading {
+        actions.push(ExplorerAction::LoadUsers(id));
+    }
+    let new_label = if roles { tr("New Role…") } else { tr("New User…") };
+    row.resp.context_menu(|ui| {
+        if ui.button(new_label).clicked() {
+            actions.push(ExplorerAction::NewUser(id));
+            ui.close();
+        }
+        if ui.add_enabled(!node.loading, egui::Button::new(tr("Refresh"))).clicked() {
+            actions.push(ExplorerAction::LoadUsers(id));
+            ui.close();
+        }
+    });
+    if !open {
+        return;
+    }
+    if let Some(e) = &node.error {
+        error_line(ui, 2, e);
+    }
+    let Some(list) = &node.list else { return };
+    for a in &list.accounts {
+        let label = if a.account.name.is_empty() { format!("{}{}", tr("(anonymous)"), a.account.label(driver)) } else { a.account.label(driver) };
+        let akey = format!("ua:{id}:{label}");
+        let row = tree_row(
+            ui,
+            state,
+            RowSpec {
+                key: &akey,
+                depth: 2,
+                expandable: false,
+                expanded: false,
+                icon: Ico::User,
+                label: &label,
+                badge: None,
+                detail: (roles && !a.can_login).then(|| (tr("no login"), p.muted)),
+                status: None,
+                label_color: None,
+            },
+        );
+        if row.resp.double_clicked() {
+            actions.push(ExplorerAction::EditUser(id, a.account.clone()));
+        }
+        row.resp.context_menu(|ui| {
+            if ui.button(if roles { tr("Edit Role…") } else { tr("Edit User…") }).clicked() {
+                actions.push(ExplorerAction::EditUser(id, a.account.clone()));
+                ui.close();
+            }
+            if ui.button(new_label).clicked() {
+                actions.push(ExplorerAction::NewUser(id));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button(RichText::new(if roles { tr("Drop Role…") } else { tr("Drop User…") }).color(p.error)).clicked() {
+                actions.push(ExplorerAction::DropUser(id, a.account.clone()));
+                ui.close();
+            }
+        });
+    }
 }
 
 /// Red error message below a node.
@@ -567,6 +678,10 @@ fn database_rows(
         let sql = !c.cfg.driver.is_nosql();
         if sql && ui.add_enabled(connected, egui::Button::new(tr("New Table…"))).clicked() {
             actions.push(ExplorerAction::NewTable { conn: id, db: db_name.clone(), schema: None });
+            ui.close();
+        }
+        if sql && ui.add_enabled(connected, egui::Button::new(tr("New View…"))).clicked() {
+            actions.push(ExplorerAction::NewView { conn: id, db: db_name.clone(), schema: None });
             ui.close();
         }
         if multi_db && sql && ui.add_enabled(connected, egui::Button::new(tr("New Database…"))).clicked() {
@@ -672,6 +787,10 @@ fn schema_rows(
             actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
             ui.close();
         }
+        if ui.button(tr("New View…")).clicked() {
+            actions.push(ExplorerAction::NewView { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+            ui.close();
+        }
         if ui.button(tr("Copy Name")).clicked() {
             ui.ctx().copy_text(s.name.clone());
             ui.close();
@@ -706,7 +825,7 @@ fn object_groups(
     s: &SchemaInfo,
     filter: &str,
     depth: usize,
-    // Redis and MongoDB: their own folder names, and no DDL, import or copy. Schema-level
+    // Redis and MongoDB: their own folder names, and no DDL or import (MongoDB can copy). Schema-level
     // callers (only SQL engines get there) pass any SQL driver.
     driver: Driver,
 ) {
@@ -758,6 +877,13 @@ fn object_groups(
                     ui.close();
                 }
             });
+        } else if sql {
+            row.resp.context_menu(|ui| {
+                if ui.button(tr("New View…")).clicked() {
+                    actions.push(ExplorerAction::NewView { conn, db: db.to_string(), schema: Some(s.name.clone()) });
+                    ui.close();
+                }
+            });
         }
         if row.toggled {
             let closed_key = format!("{gkey}:closed");
@@ -772,12 +898,13 @@ fn object_groups(
         }
         for t in tables {
             let tref = TableRef { conn, db: db.to_string(), schema: s.name.clone(), table: t.name.clone() };
-            table_rows(ui, state, actions, tref, t, depth + 1, sql);
+            table_rows(ui, state, actions, tref, t, depth + 1, sql, driver != Driver::Redis);
         }
     }
 }
 
-fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize, sql: bool) {
+#[allow(clippy::too_many_arguments)]
+fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, tref: TableRef, t: &TableInfo, depth: usize, sql: bool, copyable: bool) {
     let p = pal(ui);
     let tkey = table_key(&tref);
     let open = state.expanded.contains(&tkey);
@@ -816,8 +943,15 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             ui.ctx().copy_text(t.name.clone());
             ui.close();
         }
-        // Redis and MongoDB: no SQL generation, DDL, import or copy.
+        // Redis and MongoDB: no SQL generation, DDL or import; MongoDB collections can be copied.
         if !sql {
+            if copyable {
+                ui.separator();
+                if ui.button(tr("Copy Table To…")).clicked() {
+                    actions.push(ExplorerAction::CopyTable(tref.clone()));
+                    ui.close();
+                }
+            }
             return;
         }
         ui.separator();
@@ -834,8 +968,16 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
             ui.close();
         }
         ui.separator();
+        if t.kind == ObjectKind::View && ui.button(tr("Edit View…")).clicked() {
+            actions.push(ExplorerAction::EditView(tref.clone()));
+            ui.close();
+        }
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
+            ui.close();
+        }
+        if ui.button(tr("New View…")).clicked() {
+            actions.push(ExplorerAction::NewView { conn: tref.conn, db: tref.db.clone(), schema: Some(tref.schema.clone()) });
             ui.close();
         }
         if ui.button(tr("Copy Table To…")).clicked() {
@@ -845,6 +987,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         if t.kind == ObjectKind::Table {
             if ui.button(tr("Import Data from File…")).clicked() {
                 actions.push(ExplorerAction::ImportData(tref.clone()));
+                ui.close();
+            }
+            if ui.button(tr("Modify Table…")).clicked() {
+                actions.push(ExplorerAction::ModifyTable(tref.clone()));
                 ui.close();
             }
             if ui.button(tr("Rename…")).clicked() {

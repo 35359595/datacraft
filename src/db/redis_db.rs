@@ -5,6 +5,7 @@
 //! by prefix: `user:*` holds `user:1`, `user:2`… and `*` holds every key. Opening a group runs
 //! `SCAN 0 MATCH <pattern>`, whose rows show each key's type, TTL and a preview of its value.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -12,6 +13,7 @@ use redis::aio::MultiplexedConnection;
 use redis::{ConnectionAddr, IntoConnectionInfo, RedisConnectionInfo, Value};
 
 use super::{Cell, ColumnInfo, ConnectionConfig, ObjectKind, ResultSet, SchemaInfo, TableInfo};
+use crate::edit::Change;
 use crate::i18n::{tr, trf};
 
 /// Keys read to build the explorer's groups.
@@ -20,6 +22,8 @@ const INTROSPECT_KEYS: usize = 5000;
 const PREVIEW_ITEMS: isize = 100;
 /// Characters of a value preview.
 const PREVIEW_CHARS: usize = 2000;
+/// Characters of a string value shown whole (and editable) in the key grid.
+const EDITABLE_STRING_CHARS: usize = 1_000_000;
 
 pub struct RedisSession {
     conn: MultiplexedConnection,
@@ -210,6 +214,93 @@ impl RedisSession {
         Ok(out)
     }
 
+    /// Applies data editor commands (from `change_commands`) all or nothing: their keys are
+    /// WATCHed, each command's precondition is checked (the key exists; for `SET … XX` it is a
+    /// string; for `SET … NX` it is new) and then they run in one MULTI / EXEC, which the server
+    /// discards if a watched key changed in between.
+    pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
+        let mut cmds = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            let args = split_args(stmt)?;
+            let name = args.first().map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+            if !matches!(name.as_str(), "SET" | "EXPIRE" | "PERSIST" | "DEL") || args.len() < 2 {
+                anyhow::bail!(trf("Not a data editor change: {stmt}", &[("stmt", stmt)]));
+            }
+            cmds.push((stmt.as_str(), name, args));
+        }
+        if cmds.is_empty() {
+            return Ok(0);
+        }
+        let mut keys: Vec<&str> = cmds.iter().map(|(_, _, a)| a[1].as_str()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut watch = redis::cmd("WATCH");
+        for k in &keys {
+            watch.arg(*k);
+        }
+        self.run(watch).await?;
+        let result = self.apply_watched(&cmds).await;
+        if result.is_err() {
+            let _ = self.query(&["UNWATCH"]).await;
+        }
+        result
+    }
+
+    async fn apply_watched(&mut self, cmds: &[(&str, String, Vec<String>)]) -> anyhow::Result<u64> {
+        let mut p = redis::pipe();
+        for (_, _, args) in cmds {
+            p.cmd("TYPE").arg(&args[1]);
+        }
+        let types: Vec<Value> = p.query_async(&mut self.conn).await.map_err(|e| self.pipe_error(e))?;
+        for ((stmt, name, args), ty) in cmds.iter().zip(&types) {
+            // TYPE says "none" for a missing key.
+            let ty = text(ty).unwrap_or_default();
+            let nx = name == "SET" && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("NX"));
+            match name.as_str() {
+                "SET" if nx && ty != "none" => anyhow::bail!(trf("The key “{key}” already exists", &[("key", &args[1])])),
+                "SET" if !nx && ty != "string" && ty != "none" => {
+                    anyhow::bail!(trf("Only string values can be edited; “{key}” is a {type}", &[("key", &args[1]), ("type", &ty)]))
+                }
+                _ if !nx && ty == "none" => return Err(super::not_single_row(0, stmt)),
+                _ => {}
+            }
+        }
+        let mut p = redis::pipe();
+        p.atomic();
+        for (_, _, args) in cmds {
+            let mut c = redis::cmd(&args[0]);
+            for a in &args[1..] {
+                c.arg(a.as_str());
+            }
+            p.add_command(c);
+        }
+        let reply: Value = p.query_async(&mut self.conn).await.map_err(|e| self.pipe_error(e))?;
+        let Value::Array(items) = reply else {
+            // EXEC answers nil when a watched key changed: nothing ran.
+            anyhow::bail!(tr("The keys changed while saving; nothing was saved. Refresh and try again"));
+        };
+        for ((stmt, name, _), item) in cmds.iter().zip(&items) {
+            let n = match item {
+                Value::Okay | Value::SimpleString(_) => 1,
+                Value::Int(n) => *n,
+                Value::ServerError(e) => anyhow::bail!("{}\n{stmt}", e.details().map_or_else(|| format!("{e:?}"), |d| format!("{} {d}", e.code()))),
+                _ => 0,
+            };
+            // PERSIST answers 0 for a key that had no TTL.
+            if n != 1 && !(name == "PERSIST" && n == 0) {
+                anyhow::bail!(trf("The statement affected {n} rows (expected 1):\n{stmt}", &[("n", &n), ("stmt", stmt)]));
+            }
+        }
+        Ok(cmds.len() as u64)
+    }
+
+    fn pipe_error(&mut self, e: redis::RedisError) -> anyhow::Error {
+        if e.is_connection_dropped() || e.is_io_error() || e.is_unrecoverable_error() {
+            self.closed = true;
+        }
+        anyhow!("{e}")
+    }
+
     /// key / type / ttl / value rows for `keys`, read in pipelines.
     async fn describe_keys(&mut self, keys: &[String]) -> anyhow::Result<ResultSet> {
         let mut rows = Vec::with_capacity(keys.len());
@@ -251,7 +342,14 @@ impl RedisSession {
                     "stream" => text(&v).map(|n| trf("Stream entries: {n}", &[("n", &n)])),
                     _ => None,
                 };
-                rows.push(vec![Some(k.clone()), Some(ty), ttl, preview.map(|p| cut(&p))]);
+                // String values are shown whole so editing them saves exactly what the cell holds;
+                // only huge ones are cut, and then their type says so and the grid refuses to edit them.
+                let (ty, preview) = match (ty.as_str(), preview) {
+                    ("string", Some(p)) if p.chars().count() > EDITABLE_STRING_CHARS => (tr("string (truncated)").to_string(), Some(cut(&p))),
+                    ("string", p) => (ty, p),
+                    (_, p) => (ty, p.map(|p| cut(&p))),
+                };
+                rows.push(vec![Some(k.clone()), Some(ty), ttl, preview]);
             }
         }
         Ok(ResultSet { columns: ["key", "type", "ttl", "value"].map(String::from).to_vec(), rows, ..Default::default() })
@@ -439,6 +537,88 @@ pub fn split_args(line: &str) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
+// ---------------------------------------------------------------- data editing
+
+/// An argument quoted so `split_args` reads it back as is: bare when it is a plain word,
+/// otherwise in double quotes with `\"`, `\\`, `\n`, `\r`, `\t` and `\xHH` escapes.
+pub fn quote_arg(s: &str) -> String {
+    if !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\')) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `EXPIRE key n`, or `PERSIST key` for an empty TTL.
+fn ttl_command(key: &str, ttl: &Cell) -> Result<String, String> {
+    match ttl.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(format!("PERSIST {}", quote_arg(key))),
+        Some(t) => match t.parse::<i64>() {
+            Ok(n) if n > 0 => Ok(format!("EXPIRE {} {n}", quote_arg(key))),
+            _ => Err(trf("“{value}” is not a valid TTL (seconds)", &[("value", &t)])),
+        },
+    }
+}
+
+/// Commands that apply a change to a key group's grid (columns key / type / ttl / value).
+/// Only string values can be written (the others are JSON previews); the TTL can be set or
+/// removed, keys deleted and new string keys added. `types` maps each existing key to its type.
+pub fn change_commands(change: &Change, types: &HashMap<String, String>) -> Result<Vec<String>, String> {
+    let key_of = |key: &[(String, Cell)]| -> Result<String, String> {
+        key.iter().find(|(c, _)| c == "key").and_then(|(_, v)| v.clone()).ok_or_else(|| tr("Key column does not exist").to_string())
+    };
+    match change {
+        Change::Update { key, set } => {
+            let k = key_of(key)?;
+            let ty = types.get(&k).map_or("", String::as_str);
+            let mut out = Vec::new();
+            for (col, v) in set {
+                match (col.as_str(), v) {
+                    ("value", Some(v)) if ty == "string" => out.push(format!("SET {} {} XX KEEPTTL", quote_arg(&k), quote_arg(v))),
+                    ("value", None) if ty == "string" => return Err(tr("A Redis value cannot be NULL; delete the key instead").into()),
+                    ("value", _) => {
+                        return Err(trf("Only string values can be edited; “{key}” is a {type}", &[("key", &k), ("type", &ty)]));
+                    }
+                    ("ttl", ttl) => out.push(ttl_command(&k, ttl)?),
+                    ("key", _) => return Err(tr("Keys cannot be renamed from the grid").into()),
+                    ("type", _) => return Err(tr("The type of a key cannot be changed").into()),
+                    _ => return Err(tr("Column does not exist").into()),
+                }
+            }
+            Ok(out)
+        }
+        Change::Insert { values } => {
+            let get = |c: &str| values.iter().find(|(n, _)| n == c).and_then(|(_, v)| v.clone());
+            let k = get("key").filter(|k| !k.is_empty()).ok_or_else(|| tr("A new key needs a name").to_string())?;
+            if get("type").is_some_and(|t| !t.trim().is_empty() && t.trim() != "string") {
+                return Err(tr("New keys can only be strings").into());
+            }
+            let v = get("value").ok_or_else(|| tr("A new key needs a value").to_string())?;
+            let mut cmd = format!("SET {} {} NX", quote_arg(&k), quote_arg(&v));
+            if let Some(ttl) = get("ttl").filter(|t| !t.trim().is_empty()) {
+                // Same validation as an edited TTL.
+                ttl_command(&k, &Some(ttl.clone()))?;
+                cmd.push_str(&format!(" EX {}", ttl.trim()));
+            }
+            Ok(vec![cmd])
+        }
+        Change::Delete { key } => Ok(vec![format!("DEL {}", quote_arg(&key_of(key)?))]),
+    }
+}
+
 /// Commands that only read, allowed on read-only connections.
 pub fn is_read_command(line: &str) -> bool {
     let Ok(args) = split_args(line) else { return false };
@@ -472,6 +652,46 @@ mod tests {
         assert_eq!(split_args(r#"SET k "line\nnext \x41""#).unwrap(), vec!["SET", "k", "line\nnext A"]);
         assert!(split_args(r#"GET "open"#).is_err());
         assert!(split_args("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn quoted_args_split_back() {
+        for s in ["plain", "", "a b", "it's", r#"say "hi""#, "back\\slash", "line\nnext\ttab\r", "bell\u{7}", "ñandú 雪", "#not-a-comment"] {
+            let line = format!("SET {} {}", quote_arg(s), quote_arg("v"));
+            assert_eq!(split_args(&line).unwrap(), vec!["SET".to_string(), s.to_string(), "v".to_string()], "{line}");
+        }
+        assert_eq!(quote_arg("user:1"), "user:1");
+        assert_eq!(quote_arg("a b"), r#""a b""#);
+    }
+
+    #[test]
+    fn grid_changes_become_commands() {
+        let types: HashMap<String, String> = [("s", "string"), ("h", "hash")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let kv = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+        let up = |k: &str, set: Vec<(String, Cell)>| change_commands(&Change::Update { key: vec![kv("key", Some(k))], set }, &types);
+        assert_eq!(up("s", vec![kv("value", Some("hola mundo"))]).unwrap(), vec![r#"SET s "hola mundo" XX KEEPTTL"#]);
+        assert_eq!(up("s", vec![kv("value", Some(""))]).unwrap(), vec![r#"SET s "" XX KEEPTTL"#]);
+        assert_eq!(up("s", vec![kv("ttl", Some("60")), kv("value", Some("x"))]).unwrap(), vec!["EXPIRE s 60", "SET s x XX KEEPTTL"]);
+        assert_eq!(up("h", vec![kv("ttl", None)]).unwrap(), vec!["PERSIST h"]);
+        assert_eq!(up("h", vec![kv("ttl", Some(" "))]).unwrap(), vec!["PERSIST h"]);
+        assert!(up("h", vec![kv("value", Some("{}"))]).unwrap_err().contains("hash"));
+        assert!(up("s", vec![kv("value", None)]).is_err());
+        assert!(up("s", vec![kv("ttl", Some("0"))]).is_err());
+        assert!(up("s", vec![kv("ttl", Some("soon"))]).is_err());
+        assert!(up("s", vec![kv("key", Some("t"))]).is_err());
+        assert!(up("s", vec![kv("type", Some("hash"))]).is_err());
+
+        let ins = |values: Vec<(String, Cell)>| change_commands(&Change::Insert { values }, &types);
+        assert_eq!(ins(vec![kv("key", Some("new key")), kv("value", Some("1"))]).unwrap(), vec![r#"SET "new key" 1 NX"#]);
+        assert_eq!(ins(vec![kv("key", Some("k")), kv("type", Some("string")), kv("ttl", Some("30")), kv("value", Some("v"))]).unwrap(), vec!["SET k v NX EX 30"]);
+        assert!(ins(vec![kv("value", Some("v"))]).is_err());
+        assert!(ins(vec![kv("key", Some("k"))]).is_err());
+        assert!(ins(vec![kv("key", Some("k")), kv("type", Some("list")), kv("value", Some("v"))]).is_err());
+        assert!(ins(vec![kv("key", Some("k")), kv("ttl", Some("-5")), kv("value", Some("v"))]).is_err());
+
+        let del = change_commands(&Change::Delete { key: vec![kv("key", Some("a \"b\""))] }, &types).unwrap();
+        assert_eq!(del, vec![r#"DEL "a \"b\"""#]);
+        assert_eq!(split_args(&del[0]).unwrap(), vec!["DEL", "a \"b\""]);
     }
 
     #[test]

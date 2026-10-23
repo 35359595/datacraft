@@ -1,6 +1,9 @@
 //! "Copy Table To…" (DataGrip): copies a table's rows (all, a percentage or those matching a
 //! filter) to another connection, creating the target table when it doesn't exist. It runs on
 //! dedicated sessions, like the schema search, and inserts in one transaction (all or nothing).
+//! MongoDB collections can be the source (read with `find` and a JSON filter) or the target
+//! (written with `insertMany` in batches, without a transaction); values travel as text and
+//! get their BSON type back from the source column's type.
 
 use super::subset::{self, ForeignKey, TableRows};
 use super::{Cell, ColumnInfo, ConnectionConfig, Driver, SchemaInfo, Session};
@@ -14,6 +17,8 @@ use tokio::sync::Notify;
 pub const MAX_ROWS: usize = 1_000_000;
 /// Rows per multi-row INSERT (SQL Server allows at most 1000).
 const BATCH: usize = 100;
+/// Documents per `insertMany` on a MongoDB target.
+const MONGO_BATCH: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct CopyRequest {
@@ -94,6 +99,10 @@ impl Mask {
     /// write text (an empty text can't be a key either).
     pub fn allowed(self, driver: Driver, column: &ColumnInfo) -> bool {
         let text = matches!(classify(driver, &column.data_type), Kind::Varchar(_) | Kind::Text);
+        // MongoDB's `_id` must stay unique: only the hash keeps distinct values distinct.
+        if driver == Driver::MongoDb && column.name == "_id" {
+            return self == Mask::Keep || (self == Mask::Hash && text);
+        }
         match self {
             Mask::Keep => true,
             Mask::Null => column.nullable && !column.primary_key,
@@ -215,6 +224,21 @@ fn type_args(t: &str) -> Vec<u32> {
 }
 
 fn classify(driver: Driver, data_type: &str) -> Kind {
+    // MongoDB: the BSON type names `introspect` gives the sampled fields. Documents, arrays
+    // and fields of several types travel as text (JSON).
+    if driver == Driver::MongoDb {
+        return match data_type {
+            "int" => Kind::Int,
+            "long" => Kind::BigInt,
+            "double" => Kind::Float,
+            "decimal" => Kind::Decimal(None),
+            "bool" => Kind::Bool,
+            "date" => Kind::Timestamp,
+            "objectId" => Kind::Varchar(24),
+            "binData" => Kind::Binary,
+            _ => Kind::Text,
+        };
+    }
     let t = data_type.trim().to_ascii_lowercase();
     let base = t.split('(').next().unwrap_or("").trim();
     let args = type_args(&t);
@@ -270,6 +294,9 @@ pub fn target_type(from: Driver, to: Driver, data_type: &str, primary_key: bool)
     if family(from) == family(to) && !lower.ends_with("[]") {
         return data_type.to_string();
     }
+    if to == Driver::MongoDb {
+        return mongo_type(from, data_type).into();
+    }
     let kind = match classify(from, data_type) {
         // A key needs a bounded type on MySQL and Oracle.
         Kind::Text if primary_key && matches!(to, Driver::MySql | Driver::MariaDb | Driver::Oracle) => Kind::Varchar(255),
@@ -277,7 +304,7 @@ pub fn target_type(from: Driver, to: Driver, data_type: &str, primary_key: bool)
     };
     use Driver::*;
     match (kind, to) {
-        // Never a copy target (the dialog isn't offered for them).
+        // Never a copy target (the dialog isn't offered for it).
         (_, Redis | MongoDb) => "string".into(),
         (_, Sqlite) => match kind {
             Kind::SmallInt | Kind::Int | Kind::BigInt => "INTEGER".into(),
@@ -337,19 +364,155 @@ pub fn target_type(from: Driver, to: Driver, data_type: &str, primary_key: bool)
     }
 }
 
+/// BSON type a SQL column's values get in a MongoDB document (JSON columns become documents).
+fn mongo_type(from: Driver, data_type: &str) -> &'static str {
+    let base = data_type.trim().to_ascii_lowercase();
+    if from != Driver::MongoDb && matches!(base.as_str(), "json" | "jsonb") {
+        return "object";
+    }
+    match classify(from, data_type) {
+        Kind::SmallInt | Kind::Int => "int",
+        Kind::BigInt => "long",
+        Kind::Decimal(_) => "decimal",
+        Kind::Float => "double",
+        Kind::Bool => "bool",
+        Kind::Date | Kind::Timestamp | Kind::TimestampTz => "date",
+        Kind::Binary => "binData",
+        Kind::Varchar(24) if from == Driver::MongoDb => "objectId",
+        Kind::Time | Kind::Varchar(_) | Kind::Text => "string",
+    }
+}
+
+/// true for a SQL-style truth value (`t`, `true`, `1`, `yes`…); None if it isn't one.
+fn truth(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "t" | "true" | "1" | "y" | "yes" => Some(true),
+        "f" | "false" | "0" | "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// A date or timestamp read as text (`2026-01-02`, `2026-01-02 03:04:05.5`, `…+02`, RFC 3339)
+/// as a BSON date; values without a zone are taken as UTC.
+fn parse_date(v: &str) -> Option<mongodb::bson::DateTime> {
+    let v = v.trim();
+    let mut s = if v.len() == 10 { format!("{v}T00:00:00") } else { v.replacen(' ', "T", 1) };
+    s.retain(|c| c != ' ');
+    // `+02` / `-0530` (PostgreSQL, SQL Server) → `+02:00` / `-05:30`.
+    let tail = s.rfind(['+', '-']).filter(|&i| i > 10).map(|i| s[i + 1..].to_string());
+    match tail {
+        Some(t) if t.len() == 2 && t.bytes().all(|b| b.is_ascii_digit()) => s.push_str(":00"),
+        Some(t) if t.len() == 4 && t.bytes().all(|b| b.is_ascii_digit()) => s.insert(s.len() - 2, ':'),
+        Some(_) => {}
+        None if !s.ends_with(['Z', 'z']) => s.push('Z'),
+        None => {}
+    }
+    mongodb::bson::DateTime::parse_rfc3339_str(&s).ok()
+}
+
+/// A text cell as the BSON value of a field of `mongo_type` (see `target_type`). A value that
+/// doesn't fit its type (a sampled `int` field holding a word) is kept as a string.
+pub fn to_bson(mongo_type: &str, value: Cell) -> mongodb::bson::Bson {
+    use mongodb::bson::{Bson, oid::ObjectId};
+    let Some(v) = value else { return Bson::Null };
+    let t = v.trim();
+    let typed = match mongo_type {
+        "string" => None,
+        "int" => t.parse::<i32>().map(Bson::Int32).or_else(|_| t.parse::<i64>().map(Bson::Int64)).ok(),
+        "long" => t.parse::<i64>().map(Bson::Int64).ok(),
+        "double" => t.parse::<f64>().map(Bson::Double).ok(),
+        "decimal" => t.parse().map(Bson::Decimal128).ok(),
+        "bool" => truth(t).map(Bson::Boolean),
+        "date" => parse_date(t).map(Bson::DateTime),
+        "objectId" => ObjectId::parse_str(t).map(Bson::ObjectId).ok(),
+        // Documents, arrays and other types were rendered as (extended) JSON.
+        _ if t.starts_with(['{', '[']) => serde_json::from_str::<serde_json::Value>(t).ok().and_then(|j| Bson::try_from(j).ok()),
+        _ => None,
+    };
+    typed.unwrap_or(Bson::String(v))
+}
+
+/// One row as a document. A NULL `_id` is left out so MongoDB generates one.
+pub fn to_document(names: &[String], types: &[&str], row: Vec<Cell>) -> mongodb::bson::Document {
+    let mut d = mongodb::bson::Document::new();
+    for ((name, ty), cell) in names.iter().zip(types).zip(row) {
+        let v = to_bson(ty, cell);
+        if !(name == "_id" && v == mongodb::bson::Bson::Null) {
+            d.insert(name.clone(), v);
+        }
+    }
+    d
+}
+
+/// The dialog's filter as a `find` filter document: braces are optional (`status: "active"`).
+pub fn mongo_filter(filter: &str) -> String {
+    let f = filter.trim().trim_end_matches(';').trim();
+    if f.is_empty() {
+        "{}".into()
+    } else if f.starts_with('{') {
+        f.to_string()
+    } else {
+        format!("{{{f}}}")
+    }
+}
+
+fn mongo_collection(name: &str) -> String {
+    format!("db.getCollection({})", serde_json::to_string(name).unwrap_or_default())
+}
+
+/// `find` of the source documents with the selected fields; `limit` caps them.
+pub fn find_command(collection: &str, columns: &[ColumnInfo], filter: &str, limit: Option<u64>) -> String {
+    let mut fields: Vec<String> = columns.iter().map(|c| format!("{}: 1", serde_json::to_string(&c.name).unwrap_or_default())).collect();
+    if !columns.iter().any(|c| c.name == "_id") {
+        fields.push("\"_id\": 0".into());
+    }
+    let mut cmd = format!("{}.find({}, {{{}}})", mongo_collection(collection), mongo_filter(filter), fields.join(", "));
+    if let Some(n) = limit {
+        cmd.push_str(&format!(".limit({n})"));
+    }
+    cmd
+}
+
+/// `countDocuments` of the documents the filter selects (for a percentage).
+pub fn count_command(collection: &str, filter: &str) -> String {
+    format!("{}.countDocuments({})", mongo_collection(collection), mongo_filter(filter))
+}
+
+/// true if the filter is one document that only reads (no `$where` tricks past `find`).
+pub fn is_read_filter(filter: &str) -> bool {
+    let cmd = format!("{}.find({})", mongo_collection("x"), mongo_filter(filter));
+    super::mongo::is_read_command(&cmd)
+        && matches!(
+            super::mongo::parse_command(&cmd),
+            Ok(super::mongo::Command::Collection { args, chain, .. }) if args.len() == 1 && args[0].as_document().is_some() && chain.is_empty()
+        )
+}
+
+/// What the copy runs on a MongoDB target, for the dialog's preview.
+pub fn mongo_insert_preview(collection: &str, names: &[String], types: &[&str], clear: bool) -> String {
+    let coll = mongo_collection(collection);
+    let fields: Vec<String> = names.iter().zip(types).map(|(n, t)| format!("{}: <{t}>", serde_json::to_string(n).unwrap_or_default())).collect();
+    let insert = format!("{coll}.insertMany([{{{}}}, …])", fields.join(", "));
+    if clear { format!("{coll}.deleteMany({{}});\n\n{insert}") } else { insert }
+}
+
 /// Source value as the target expects it: booleans read as `t`/`true` become `1`/`0` on the
-/// engines that store them as numbers.
+/// engines that store them as numbers; MongoDB dates (`2026-01-02T03:04:05.123Z`) lose the
+/// `T` and the `Z` every engine doesn't accept.
 fn convert(from: Driver, to: Driver, data_type: &str, value: Cell) -> Cell {
     let v = value?;
-    if classify(from, data_type) != Kind::Bool {
+    let kind = classify(from, data_type);
+    if from == Driver::MongoDb && kind == Kind::Timestamp {
+        return Some(match v.strip_suffix('Z') {
+            Some(d) if d.len() >= 19 && d.as_bytes()[10] == b'T' => d.replacen('T', " ", 1),
+            _ => v,
+        });
+    }
+    if kind != Kind::Bool {
         return Some(v);
     }
-    let truth = match v.trim().to_ascii_lowercase().as_str() {
-        "t" | "true" | "1" | "y" | "yes" => true,
-        "f" | "false" | "0" | "n" | "no" => false,
-        _ => return Some(v),
-    };
-    Some(match (to, truth) {
+    let Some(t) = truth(&v) else { return Some(v) };
+    Some(match (to, t) {
         (Driver::Postgres | Driver::Snowflake, true) => "true".into(),
         (Driver::Postgres | Driver::Snowflake, false) => "false".into(),
         (_, true) => "1".into(),
@@ -462,6 +625,15 @@ struct Part {
 /// Rows read from the source: the copied table, plus the related ones (insert order) and their
 /// foreign keys when a subset was asked for.
 async fn read_source(s: &mut Session, from: Driver, req: &CopyRequest) -> anyhow::Result<(Vec<TableRows>, Vec<ForeignKey>)> {
+    if from == Driver::MongoDb {
+        let root = TableRows {
+            schema: req.source_schema.clone(),
+            table: req.source_table.clone(),
+            columns: req.columns.clone(),
+            rows: read_documents(s, req).await?,
+        };
+        return Ok((vec![root], Vec::new()));
+    }
     let limit = if req.percent >= 100 {
         None
     } else {
@@ -500,6 +672,51 @@ async fn read_source(s: &mut Session, from: Driver, req: &CopyRequest) -> anyhow
     Ok((tables, fks))
 }
 
+/// The source collection's documents as rows of the selected fields (missing fields are NULL).
+async fn read_documents(s: &mut Session, req: &CopyRequest) -> anyhow::Result<Vec<Vec<Cell>>> {
+    let first_cell = |rs: Vec<super::ResultSet>| rs.into_iter().next().and_then(|r| r.rows.into_iter().next()).and_then(|r| r.into_iter().next().flatten());
+    let limit = if req.percent >= 100 {
+        None
+    } else {
+        let rs = s.execute(&count_command(&req.source_table, &req.filter), 1).await?;
+        let total: u64 = first_cell(rs).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        Some((total * u64::from(req.percent)).div_ceil(100))
+    };
+    // `limit(0)` means no limit to MongoDB.
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let rs = s.execute(&find_command(&req.source_table, &req.columns, &req.filter, limit), MAX_ROWS).await?.into_iter().next().unwrap_or_default();
+    if rs.truncated {
+        anyhow::bail!(tr("The table has more than 1,000,000 rows: copy fewer with a filter or a percentage"));
+    }
+    // The result's columns are the fields the documents have, in their order.
+    let at: Vec<Option<usize>> = req.columns.iter().map(|c| rs.columns.iter().position(|n| *n == c.name)).collect();
+    Ok(rs.rows.into_iter().map(|mut r| at.iter().map(|i| i.and_then(|i| r.get_mut(i)?.take())).collect()).collect())
+}
+
+/// Writes the rows to a MongoDB collection (created when it doesn't exist) in unordered
+/// `insertMany` batches. There is no transaction (a standalone server has none): a failure or a
+/// cancel keeps the batches already inserted. Documents whose `_id` the collection already has
+/// are skipped. Returns the documents inserted.
+async fn write_documents(t: &mut Session, from: Driver, req: &CopyRequest, columns: &[ColumnInfo], rows: Vec<Vec<Cell>>) -> anyhow::Result<u64> {
+    let Session::MongoDb(m) = t else { anyhow::bail!(tr("Not available for this engine")) };
+    if req.clear {
+        m.execute(&format!("{}.deleteMany({{}})", mongo_collection(&req.target_table)), 0).await?;
+    }
+    let types: Vec<String> = columns.iter().map(|c| target_type(from, Driver::MongoDb, &c.data_type, c.primary_key)).collect();
+    let types: Vec<&str> = types.iter().map(String::as_str).collect();
+    let mut rows = rows.into_iter();
+    let mut inserted = 0;
+    loop {
+        let docs: Vec<_> = rows.by_ref().take(MONGO_BATCH).map(|r| to_document(&req.target_names, &types, r)).collect();
+        if docs.is_empty() {
+            return Ok(inserted);
+        }
+        inserted += m.insert_skipping_duplicates(&req.target_table, docs).await?.0;
+    }
+}
+
 /// Masks of each table: the dialog's for the copied one; for the others, those suggested by
 /// their column names (never on key columns) if asked; then made equal along foreign keys.
 fn table_masks(from: Driver, req: &CopyRequest, tables: &[TableRows], fks: &[ForeignKey]) -> Vec<Vec<Mask>> {
@@ -535,6 +752,12 @@ pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyR
     let (from, to) = (source.driver, target.driver);
     let mut source = source;
     source.read_only = true;
+    let mut req = req;
+    // MongoDB has no foreign keys to follow.
+    if from == Driver::MongoDb || to == Driver::MongoDb {
+        req.parents = false;
+        req.children = false;
+    }
     let related = req.parents || req.children;
     let cancelled = || anyhow::anyhow!(tr("Copy cancelled"));
 
@@ -549,6 +772,18 @@ pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyR
     let masks = table_masks(from, &req, &tables, &fks);
     for (t, m) in tables.iter_mut().zip(&masks) {
         mask_rows(from, &t.columns, m, &req.mask_key, &mut t.rows);
+    }
+
+    if to == Driver::MongoDb {
+        let rows = tables.into_iter().next().map(|t| t.rows).unwrap_or_default();
+        let write = async {
+            let mut t = open(target, &req.target_db).await?;
+            write_documents(&mut t, from, &req, &req.columns, rows).await
+        };
+        return tokio::select! {
+            _ = cancel.notified() => Err(cancelled()),
+            r = write => r.map(|n| vec![(req.target_table.clone(), n)]),
+        };
     }
 
     let schema = if to.flat_schema() && to != Driver::Sqlite { req.target_db.as_str() } else { req.target_schema.as_str() };
@@ -756,6 +991,96 @@ mod tests {
             "SELECT * FROM (SELECT \"id\", \"name\" FROM \"HR\".\"T\") WHERE ROWNUM <= 5"
         );
         assert_eq!(count_sql(Driver::Sqlite, "main", "t", " a = 1 "), "SELECT COUNT(*) FROM \"t\" WHERE a = 1");
+    }
+
+    #[test]
+    fn maps_mongodb_types() {
+        use Driver::*;
+        let to_pg = |t: &str| target_type(MongoDb, Postgres, t, false);
+        assert_eq!(
+            ["int", "long", "double", "decimal", "bool", "date", "objectId", "string", "object", "array", "mixed", "null"].map(to_pg),
+            ["integer", "bigint", "double precision", "numeric", "boolean", "timestamp", "varchar(24)", "text", "text", "text", "text", "text"]
+        );
+        assert_eq!(target_type(MongoDb, Sqlite, "objectId", true), "TEXT");
+        assert_eq!(target_type(MongoDb, MySql, "string", true), "varchar(255)");
+        assert_eq!(target_type(MongoDb, MongoDb, "object", false), "object");
+        assert!(is_binary(MongoDb, "binData"));
+        let sql_to_mongo = |t: &str| target_type(Postgres, MongoDb, t, false);
+        assert_eq!(
+            ["integer", "bigint", "numeric(10,2)", "double precision", "boolean", "date", "timestamptz", "varchar(20)", "jsonb", "bytea"].map(sql_to_mongo),
+            ["int", "long", "decimal", "double", "bool", "date", "date", "string", "object", "binData"]
+        );
+        let cols = [col("_id", "objectId", true), col("name", "string", false), col("n", "int", false)];
+        assert!(Mask::Name.allowed(MongoDb, &cols[1]) && Mask::Blank.allowed(MongoDb, &cols[1]));
+        assert!(Mask::Hash.allowed(MongoDb, &cols[0]) && !Mask::Email.allowed(MongoDb, &cols[0]) && !Mask::Null.allowed(MongoDb, &cols[0]));
+        assert!(!Mask::Hash.allowed(MongoDb, &cols[2]) && Mask::Null.allowed(MongoDb, &cols[2]));
+        // MongoDB dates go to SQL without the `T` and the `Z`; booleans as each engine wants them.
+        assert_eq!(convert(MongoDb, MySql, "date", Some("2026-01-02T03:04:05.120Z".into())), Some("2026-01-02 03:04:05.120".into()));
+        assert_eq!(convert(MongoDb, Sqlite, "bool", Some("true".into())), Some("1".into()));
+    }
+
+    #[test]
+    fn converts_text_to_bson() {
+        use mongodb::bson::{Bson, doc, oid::ObjectId};
+        assert_eq!(to_bson("int", Some("42".into())), Bson::Int32(42));
+        assert_eq!(to_bson("int", Some("9007199254740993".into())), Bson::Int64(9007199254740993));
+        assert_eq!(to_bson("long", Some("7".into())), Bson::Int64(7));
+        assert_eq!(to_bson("double", Some("1.5".into())), Bson::Double(1.5));
+        assert_eq!(to_bson("decimal", Some("10.20".into())), Bson::Decimal128("10.20".parse().unwrap()));
+        assert_eq!(to_bson("bool", Some("t".into())), Bson::Boolean(true));
+        assert_eq!(to_bson("bool", Some("0".into())), Bson::Boolean(false));
+        assert_eq!(to_bson("int", Some("abc".into())), Bson::String("abc".into()));
+        assert_eq!(to_bson("string", Some("{\"a\": 1}".into())), Bson::String("{\"a\": 1}".into()));
+        assert_eq!(to_bson("int", None), Bson::Null);
+        let date = |s: &str| match to_bson("date", Some(s.into())) {
+            Bson::DateTime(d) => d.try_to_rfc3339_string().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(date("2026-01-02"), "2026-01-02T00:00:00Z");
+        assert_eq!(date("2026-01-02 03:04:05.5"), "2026-01-02T03:04:05.5Z");
+        assert_eq!(date("2026-01-02 03:04:05+02"), "2026-01-02T01:04:05Z");
+        assert_eq!(date("2026-01-02 03:04:05 +0530").len(), 20);
+        assert_eq!(date("2026-01-02T03:04:05.123Z"), "2026-01-02T03:04:05.123Z");
+        let oid = "64b7f1f1f1f1f1f1f1f1f1f1";
+        assert_eq!(to_bson("objectId", Some(oid.into())), Bson::ObjectId(ObjectId::parse_str(oid).unwrap()));
+        // A hashed `_id` is no longer an ObjectId: it stays a string.
+        assert_eq!(to_bson("objectId", Some("0123abcd".into())), Bson::String("0123abcd".into()));
+        // Documents and arrays come back from the relaxed extended JSON `render` writes.
+        let nested = Bson::Document(doc! { "k": true, "at": mongodb::bson::DateTime::from_millis(0), "id": ObjectId::parse_str(oid).unwrap() });
+        let text = super::super::mongo::render(&nested);
+        assert_eq!(to_bson("object", text), nested);
+        assert_eq!(to_bson("array", Some("[1, \"a\"]".into())), Bson::Array(vec![Bson::Int32(1), Bson::String("a".into())]));
+        assert_eq!(to_bson("mixed", Some("plain".into())), Bson::String("plain".into()));
+
+        let names: Vec<String> = ["_id", "n", "tags"].map(String::from).to_vec();
+        let d = to_document(&names, &["objectId", "int", "array"], vec![None, Some("3".into()), None]);
+        assert_eq!(d, doc! { "n": 3, "tags": Bson::Null });
+    }
+
+    #[test]
+    fn builds_mongodb_commands() {
+        let cols = [col("_id", "objectId", true), col("first name", "string", false)];
+        assert_eq!(mongo_filter(""), "{}");
+        assert_eq!(mongo_filter(" status: \"active\"; "), "{status: \"active\"}");
+        assert_eq!(mongo_filter("{a: 1}"), "{a: 1}");
+        assert_eq!(
+            find_command("people", &cols, "age: {$gt: 30}", Some(5)),
+            "db.getCollection(\"people\").find({age: {$gt: 30}}, {\"_id\": 1, \"first name\": 1}).limit(5)"
+        );
+        assert_eq!(find_command("p", &cols[1..], "", None), "db.getCollection(\"p\").find({}, {\"first name\": 1, \"_id\": 0})");
+        assert_eq!(count_command("p", "a: 1"), "db.getCollection(\"p\").countDocuments({a: 1})");
+        for cmd in [find_command("people", &cols, "age: {$gt: 30}", Some(5)), count_command("p", "")] {
+            assert!(super::super::mongo::is_read_command(&cmd), "{cmd}");
+        }
+        assert!(is_read_filter("") && is_read_filter("status: 'a', n: {$in: [1, 2]}") && is_read_filter("{_id: ObjectId(\"64b7f1f1f1f1f1f1f1f1f1f1\")}"));
+        assert!(!is_read_filter("a: 1}).limit(1).sort({a: 1"));
+        assert!(!is_read_filter("a: 1}, {b: 1"));
+        assert!(!is_read_filter("a: "));
+        assert!(!is_read_filter("1"));
+        assert_eq!(
+            mongo_insert_preview("t", &["id".into(), "name".into()], &["int", "string"], true),
+            "db.getCollection(\"t\").deleteMany({});\n\ndb.getCollection(\"t\").insertMany([{\"id\": <int>, \"name\": <string>}, …])"
+        );
     }
 
     #[test]

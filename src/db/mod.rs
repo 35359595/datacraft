@@ -3,7 +3,9 @@
 //! Every driver converts values to text (`Cell`) so the UI doesn't need to
 //! know each engine's native types.
 
+pub mod alter;
 pub mod copy;
+pub mod create_db;
 pub mod mongo;
 pub mod mssql;
 pub mod object_info;
@@ -16,6 +18,8 @@ pub mod redis_db;
 pub mod snowflake;
 pub mod sqlite;
 pub mod url;
+pub mod views;
+pub mod users;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -472,7 +476,8 @@ impl Session {
     }
 
     /// Applies data editor changes in ONE transaction. Each statement must affect exactly
-    /// one row; if any fails or affects 0 or several, everything is rolled back.
+    /// one row; if any fails or affects 0 or several, everything is rolled back (MongoDB on a
+    /// standalone server has no transactions: see `MongoSession::apply_changes`).
     /// Returns the total number of modified rows.
     pub async fn apply_changes(&mut self, statements: &[String]) -> anyhow::Result<u64> {
         match self {
@@ -482,7 +487,9 @@ impl Session {
             Session::MySql(s) => s.apply_changes(statements).await,
             Session::Oracle(s) => s.apply_changes(statements).await,
             Session::Snowflake(s) => s.apply_changes(statements).await,
-            Session::Redis(_) | Session::MongoDb(_) => anyhow::bail!(crate::i18n::tr("Editing is not available for this engine")),
+            // Their commands (not SQL) come from `redis_db::change_commands` / `mongo::change_command`.
+            Session::Redis(s) => s.apply_changes(statements).await,
+            Session::MongoDb(s) => s.apply_changes(statements).await,
         }
     }
 
