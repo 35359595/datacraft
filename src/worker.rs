@@ -17,6 +17,8 @@ pub type ConnId = u64;
 pub type ConsoleId = u64;
 
 pub enum Request {
+    Backup { conn: ConnId, id: uuid::Uuid, request: Box<crate::db::backup::BackupRequest>, cancel: Arc<std::sync::atomic::AtomicBool> },
+    InspectTable { conn: ConnId, db: String, schema: String, table: String, console: ConsoleId, generation: u64, count_rows: bool, page_filter: Option<String> },
     SchemaSearch {
         conn: ConnId,
         request_id: u64,
@@ -92,6 +94,8 @@ pub enum Request {
 }
 
 pub enum Response {
+    Backup { conn: ConnId, id: uuid::Uuid, request: Box<crate::db::backup::BackupRequest>, result: Result<Option<u64>, String> },
+    InspectTable { console: ConsoleId, generation: u64, page_rows: Option<u64>, result: Result<Box<crate::db::object_info::ObjectInfo>, String> },
     SchemaSearch { request_id: u64, result: Result<crate::db::schema_search::SearchReport, String> },
     /// Result of `CopyTable`: rows copied to each target table.
     TableCopied { request_id: u64, result: Result<Vec<(String, u64)>, String> },
@@ -461,6 +465,52 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
             vec![Response::DatabaseChoices { conn, result }]
         }
         Request::Users { conn, request } => vec![Response::Users { conn, result: fetch_users(state, conn, &request).await }],
+        Request::Backup { conn, id, request, cancel } => {
+            let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
+            let result = match cfg {
+                Some(cfg) => {
+                    let password = cfg.password.clone();
+                    crate::db::backup::run(cfg, *request.clone(), cancel).await.map_err(|error| {
+                        let message = format!("{error:#}");
+                        if password.is_empty() { message } else { message.replace(&password, "[redacted]") }
+                    })
+                }
+                None => Err(tr("The connection is not open").into()),
+            };
+            vec![Response::Backup { conn, id, request, result }]
+        }
+        Request::InspectTable { conn, db, schema, table, console, generation, count_rows, page_filter } => {
+            let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
+            let result = match cfg {
+                Some(mut cfg) if !cfg.driver.is_nosql() => {
+                    if cfg.driver != Driver::Oracle { cfg.database.clone_from(&db); }
+                    let query = async {
+                        let mut session = Session::connect(&cfg).await?;
+                        session.use_database(&db).await?;
+                        let cancel = session.cancel_handle();
+                        let read = async {
+                            let info = session.object_info(cfg.driver, &schema, &table, count_rows && page_filter.is_none()).await?;
+                            let page_rows = if let Some(filter) = &page_filter { Some(session.table_row_count(cfg.driver, &schema, &table, filter).await?) } else { None };
+                            anyhow::Ok((info, page_rows))
+                        };
+                        match tokio::time::timeout(std::time::Duration::from_secs(15), read).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                if let Some(cancel) = cancel { let _ = tokio::time::timeout(std::time::Duration::from_secs(2), cancel.cancel()).await; }
+                                anyhow::bail!(tr("Object information request timed out"))
+                            }
+                        }
+                    };
+                    match tokio::time::timeout(std::time::Duration::from_secs(35), query).await {
+                        Ok(result) => result.map_err(|e| format!("{e:#}")),
+                        Err(_) => Err(tr("Object information request timed out").into()),
+                    }
+                }
+                _ => Err(tr("The connection is not open").into()),
+            };
+            let (result, page_rows) = match result { Ok((info, rows)) => (Ok(Box::new(info)), rows), Err(error) => (Err(error), None) };
+            vec![Response::InspectTable { console, generation, page_rows, result }]
+        }
         Request::SchemaSearch { conn, request_id, request, cancel } => {
             let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());
             let result = match cfg {

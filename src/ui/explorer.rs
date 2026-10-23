@@ -13,6 +13,7 @@ use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct ExplorerState {
+    pub backups: Vec<crate::db::backup::BackupRecord>,
     pub filter: String,
     pub show_filter: bool,
     pub expanded: HashSet<String>,
@@ -36,6 +37,7 @@ pub struct TableRef {
 }
 
 pub enum ExplorerAction {
+    Backup(ConnId, String),
     NewConnection,
     Connect(ConnId),
     Disconnect(ConnId),
@@ -119,6 +121,7 @@ fn tree_row(ui: &mut Ui, state: &mut ExplorerState, spec: RowSpec<'_>) -> RowOut
     state.widest_row = state.widest_row.max(needed);
     let width = state.row_width.max(needed);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, state.selected.as_deref() == Some(spec.key), spec.label));
     if !ui.is_rect_visible(rect) {
         let mut toggled = false;
         if resp.double_clicked() && spec.expandable {
@@ -670,6 +673,9 @@ fn database_rows(
         }
     }
     row.resp.context_menu(|ui| {
+        if !c.cfg.driver.is_nosql() && ui.add_enabled(c.status == ConnStatus::Connected, egui::Button::new(tr("Back up database…"))).clicked() {
+            actions.push(ExplorerAction::Backup(id, db_name.clone())); ui.close();
+        }
         if ui.button(tr("New Console")).clicked() {
             actions.push(ExplorerAction::NewConsole(id, Some(db_name.clone())));
             ui.close();
@@ -729,11 +735,14 @@ fn database_rows(
         if let Some(s) = schemas.first() {
             object_groups(ui, state, actions, id, &d.name, s, filter, 2, c.cfg.driver);
         }
+        if !c.cfg.driver.is_nosql() { backup_rows(ui, state, actions, id, &d.name, 2); }
         return;
     }
     for s in schemas {
         schema_rows(ui, state, actions, id, &d.name, schemas, s, filter, name_match);
     }
+    if !c.cfg.driver.is_nosql() { backup_rows(ui, state, actions, id, &d.name, 2); }
+
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -743,7 +752,7 @@ fn schema_rows(
     actions: &mut Vec<ExplorerAction>,
     conn: ConnId,
     db: &str,
-    all: &[SchemaInfo],
+    _all: &[SchemaInfo],
     s: &SchemaInfo,
     filter: &str,
     name_match: bool,
@@ -754,9 +763,7 @@ fn schema_rows(
     if filtering && !s_any && !name_match {
         return;
     }
-    let s_open = state.expanded.contains(&skey)
-        || (filtering && s_any)
-        || (all.len() == 1 && !state.expanded.contains(&format!("{skey}:closed")));
+    let s_open = state.expanded.contains(&skey) || (filtering && s_any);
     let n = s.tables.len().to_string();
     let row = tree_row(
         ui,
@@ -797,20 +804,30 @@ fn schema_rows(
         }
     });
     if row.toggled {
-        if all.len() == 1 {
-            let closed_key = format!("{skey}:closed");
-            if s_open {
-                state.expanded.insert(closed_key);
-                state.expanded.remove(&skey);
-            } else {
-                state.expanded.remove(&closed_key);
-            }
-        } else {
-            toggle(state, &skey, s_open);
-        }
+        toggle(state, &skey, s_open);
     }
     if s_open {
         object_groups(ui, state, actions, conn, db, s, filter, 3, Driver::Postgres);
+    }
+}
+
+fn backup_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<ExplorerAction>, conn: ConnId, db: &str, depth: usize) {
+    let records: Vec<_> = state.backups.iter().filter(|r| r.conn == conn && r.db == db).cloned().collect();
+    let key = format!("backups:{conn}:{db}");
+    let open = state.expanded.contains(&key);
+    let count = records.len().to_string();
+    let row = tree_row(ui, state, RowSpec { key: &key, depth, expandable: true, expanded: open, icon: Ico::History, label: tr("Backups"), badge: None, detail: Some((&count, pal(ui).muted)), status: None, label_color: None });
+    if row.toggled { toggle(state, &key, open); }
+    row.resp.context_menu(|ui| { if ui.button(tr("Back up database…")).clicked() { actions.push(ExplorerAction::Backup(conn, db.into())); ui.close(); } });
+    if open {
+        if records.is_empty() { ui.indent(&key, |ui| { ui.label(tr("No backups yet")); }); }
+        for (index, record) in records.iter().enumerate().rev() {
+            let label = format!("{} · {}", record.created, record.mode.label());
+            let row = tree_row(ui, state, RowSpec { key: &format!("{key}:{index}"), depth: depth + 1, expandable: false, expanded: false, icon: Ico::History, label: &label, badge: None, detail: None, status: None, label_color: None });
+            let response = row.resp.on_hover_text(&record.destination);
+            if response.double_clicked() { actions.push(ExplorerAction::Backup(conn, db.into())); }
+            response.context_menu(|ui| { if ui.button(tr("Copy path")).clicked() { ui.ctx().copy_text(record.destination.clone()); ui.close(); } });
+        }
     }
 }
 
@@ -835,7 +852,7 @@ fn object_groups(
     let groups: &[(ObjectKind, &str, &str)] = match driver {
         Driver::Redis => &[(ObjectKind::Table, tr("key groups"), "t")],
         Driver::MongoDb => &[(ObjectKind::Table, tr("collections"), "t"), (ObjectKind::View, tr("views"), "v")],
-        _ => &[(ObjectKind::Table, tr("tables"), "t"), (ObjectKind::View, tr("views"), "v")],
+        _ => &[(ObjectKind::Table, tr("Tables"), "t"), (ObjectKind::View, tr("Views"), "v")],
     };
     for &(kind, label, gk) in groups {
         let tables: Vec<&TableInfo> = s.tables.iter().filter(|t| t.kind == kind && table_matches(t, filter)).collect();
@@ -843,7 +860,7 @@ fn object_groups(
             continue;
         }
         let gkey = format!("g:{conn}:{db}:{}:{gk}", s.name);
-        let g_open = !state.expanded.contains(&format!("{gkey}:closed")) || filtering;
+        let g_open = state.expanded.contains(&gkey) || filtering;
         let n = tables.len().to_string();
         let row = tree_row(
             ui,
@@ -886,12 +903,7 @@ fn object_groups(
             });
         }
         if row.toggled {
-            let closed_key = format!("{gkey}:closed");
-            if g_open {
-                state.expanded.insert(closed_key);
-            } else {
-                state.expanded.remove(&closed_key);
-            }
+            toggle(state, &gkey, g_open);
         }
         if !g_open {
             continue;
@@ -1051,6 +1063,7 @@ pub fn db_key(conn: ConnId, db: &str) -> String {
     format!("d:{conn}:{db}")
 }
 
+
 fn conn_of_key(key: &str) -> Option<ConnId> {
     let rest = key.split_once(':')?.1;
     rest.split(':').next()?.parse().ok()
@@ -1061,5 +1074,37 @@ fn connection_summary(c: &ConnState) -> String {
     match cfg.driver {
         crate::db::Driver::Sqlite => format!("SQLite: {}", cfg.file_path),
         d => format!("{}: {}@{}:{}/{}", d.label(), cfg.user, cfg.host, cfg.port, cfg.database),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::ConnectionConfig;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn database_folders_start_collapsed_and_backup_targets_the_context_database() {
+        let mut connection = ConnState::new(ConnectionConfig::new(1, Driver::MariaDb));
+        connection.status = ConnStatus::Connected;
+        connection.databases.push(DatabaseInfo { name: "shop".into(), current: true, schemas: Some(vec![SchemaInfo { name: "shop".into(), tables: vec![TableInfo { name: "orders".into(), kind: ObjectKind::Table, columns: Vec::new() }] }]) });
+        let mut explorer = ExplorerState::default(); explorer.expanded.insert("c:1".into());
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 600.0)).build_ui_state(move |ui, state: &mut (ExplorerState, Option<String>)| {
+            if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); theme::apply(ui.ctx(), true); return; }
+            for action in show(ui, &mut state.0, std::slice::from_ref(&connection)) {
+                if let ExplorerAction::Backup(1, db) = action { state.1 = Some(db); }
+            }
+        }, (explorer, None));
+        h.run_steps(3);
+        assert!(h.query_by_label("Backups").is_none());
+        h.state_mut().0.expanded.insert("d:1:shop".into()); h.run_steps(2);
+        assert!(h.query_by_label("Tables").is_some());
+        assert!(h.query_by_label("Views").is_some());
+        assert!(h.query_by_label("Backups").is_some());
+        assert!(h.query_by_label("orders").is_none());
+        h.get_by_label("shop").click_secondary(); h.run_steps(2);
+        h.get_by_label("Back up database…").click(); h.run_steps(2);
+        assert_eq!(h.state().1.as_deref(), Some("shop"));
     }
 }

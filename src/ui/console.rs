@@ -165,6 +165,17 @@ enum EditCmd {
 
 /// State of a table data editor.
 pub struct TableTab {
+    pub view: TableViewOptions,
+    pub filter_sort: crate::ui::filter_sort::FilterSort,
+    pub offset: usize,
+    pub page_size: usize,
+    page_input: String,
+    pub counting_page: bool,
+    pub info_requested: bool,
+    pub info_generation: u64,
+    pub info_loading: bool,
+    pub info: Option<Result<crate::db::object_info::ObjectInfo, String>>,
+    inspector_column: bool,
     pub schema: String,
     pub table: String,
     pub where_clause: String,
@@ -175,8 +186,25 @@ pub struct TableTab {
     pub save_on_row_change: bool,
 }
 
+impl TableTab {
+    pub fn page_input_reset(&mut self) { self.page_input.clear(); }
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TableViewOptions { pub cell_editor: bool, pub filter_sort: bool, pub inspector: bool }
+impl Default for TableViewOptions {
+    fn default() -> Self { Self { cell_editor: false, filter_sort: false, inspector: true } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageMove { First, Previous, Next, Last, Number(usize), Size(usize) }
+
 /// Actions the console asks the app to perform.
 pub enum ConsoleAction {
+    ApplyFilter,
+    Page(PageMove),
+    Inspect(bool),
     Run,
     RunAll,
     /// Run these statements as they are (e.g. the explain plan of the current statement).
@@ -251,6 +279,8 @@ impl Console {
         let mut c = Self::new(id, table.clone(), String::new(), Some(conn));
         c.db = db;
         c.table = Some(TableTab {
+            view: TableViewOptions::default(), filter_sort: crate::ui::filter_sort::FilterSort::default(), offset: 0, page_size: 1000, page_input: String::new(),
+            counting_page: false, info_requested: false, info_generation: 0, info_loading: false, info: None, inspector_column: false,
             schema,
             table,
             where_clause: String::new(),
@@ -262,7 +292,7 @@ impl Console {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.running || self.pending.is_some()
+        self.running || self.pending.is_some() || self.table.as_ref().is_some_and(|t| t.counting_page)
     }
 
     /// Result whose changes are being edited: the last one in the data editor or the
@@ -844,10 +874,23 @@ impl Console {
     pub fn show_table(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>) -> Vec<ConsoleAction> {
         let mut actions = Vec::new();
         let p = pal(ui);
+        if self.table.as_ref().is_some_and(|t| t.view.inspector) {
+            egui::Panel::right(egui::Id::new(("table_inspector", self.id))).default_size(280.0).size_range(220.0..=460.0).resizable(true).show(ui, |ui| self.table_inspector(ui, cx, &mut actions));
+        }
+        egui::Panel::bottom(egui::Id::new(("table_footer", self.id))).resizable(false).show_separator_line(true).show(ui, |ui| self.table_footer(ui, cx, &mut actions));
+        if self.table.as_ref().is_some_and(|t| t.view.cell_editor) {
+            let busy = self.is_busy();
+            egui::Panel::bottom(egui::Id::new(("cell_editor", self.id))).default_size(180.0).size_range(100.0..=450.0).resizable(true).show(ui, |ui| {
+                ui.add_enabled_ui(!busy, |ui| { if let Some(view) = self.results.last_mut() { view.show_cell_editor(ui); } });
+            });
+        }
         self.table_toolbar(ui, cx, &mut actions);
         hline(ui);
-        self.filter_row(ui, &mut actions);
-        hline(ui);
+        if cx.driver.is_nosql() { self.filter_row(ui, &mut actions); hline(ui); }
+        else if let Some(t) = &mut self.table && t.view.filter_sort {
+            if ui.add_enabled_ui(!self.running, |ui| t.filter_sort.show(ui, cx.driver, cx.columns.unwrap_or(&[]))).inner { actions.push(ConsoleAction::ApplyFilter); }
+            hline(ui);
+        }
         if let Some(e) = self.log.last().filter(|e| e.is_error && self.result_tab == ResultTab::Output) {
             let msg = e.message.clone();
             egui::Frame::NONE
@@ -878,7 +921,7 @@ impl Console {
         if let Some(view) = self.results.last_mut() {
             let response = ui
                 .add_enabled_ui(!busy, |ui| {
-                    results::show_result(ui, view, copy_requested, cx.columns, save_on_row_change)
+                    results::show_result(ui, view, copy_requested, cx.columns, save_on_row_change, false)
                 })
                 .inner;
             if let Some(err) = response.error {
@@ -1023,45 +1066,12 @@ impl Console {
         toolbar_row(ui, |ui| {
             theme::split_row(ui, |ui, side| match side {
                 theme::Side::Left => {
-                    if theme::icon_button(ui, Ico::Refresh, !busy, tr("Reload page (⌘R)")).clicked()
-                    {
-                        actions.push(ConsoleAction::Reload);
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Ico::History,
-                        !self.log.is_empty(),
-                        tr("Copy the query log"),
-                    )
-                    .clicked()
-                    {
-                        let text = self
-                            .log
-                            .iter()
-                            .map(|e| format!("[{}] {} {}", e.time, e.statement, e.message))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ui.ctx().copy_text(text);
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Ico::Stop,
-                        self.running,
-                        tr("Cancel the running query"),
-                    )
-                    .clicked()
-                    {
-                        actions.push(ConsoleAction::Cancel);
-                    }
-                    theme::toolbar_separator(ui);
-                    let idx = self.results.len().checked_sub(1);
-                    if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy)
-                        && let Some(i) = idx
-                    {
-                        actions.push(edit_action(a, i));
-                    }
-                    if let Some(v) = self.results.last() {
-                        edit_status_icon(ui, v);
+                    if let Some(t) = &mut self.table {
+                        let was_open = t.view.cell_editor;
+                        ui.toggle_value(&mut t.view.cell_editor, tr("Cell Editor"));
+                        if was_open && !t.view.cell_editor && let Some(view) = self.results.last_mut() { view.finish_inline_edit(); }
+                        if !cx.driver.is_nosql() { ui.toggle_value(&mut t.view.filter_sort, tr("Filter & Sort")); }
+                        ui.toggle_value(&mut t.view.inspector, tr("Information"));
                     }
                     theme::toolbar_separator(ui);
                     self.tx_dropdown(ui);
@@ -1131,6 +1141,95 @@ impl Console {
                 });
                 }
             });
+        });
+    }
+
+    fn table_footer(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
+        let busy = self.is_busy();
+        toolbar_row(ui, |ui| {
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
+                    if let Some(a) = results::edit_buttons(ui, self.results.last_mut(), !busy) && let Some(i) = self.results.len().checked_sub(1) { actions.push(edit_action(a, i)); }
+                    if theme::icon_button(ui, Ico::Refresh, !busy, tr("Reload page (⌘R)")).clicked() { actions.push(ConsoleAction::Reload); }
+                    if theme::icon_button(ui, Ico::Stop, self.running, tr("Cancel the running query")).clicked() { actions.push(ConsoleAction::Cancel); }
+                    if let Some(view) = self.results.last() { edit_status_icon(ui, view); }
+                }
+                theme::Side::Right => {
+                    let Some(t) = &mut self.table else { return };
+                    let sql = !cx.driver.is_nosql();
+                    let page = t.offset / t.page_size.max(1) + 1;
+                    if t.page_input.is_empty() { t.page_input = page.to_string(); }
+                    // The parent lays out this group from right to left.
+                    let settings = theme::icon_button(ui, Ico::Gear, !busy && sql, tr("Page size"));
+                    egui::Popup::menu(&settings).show(|ui| { for size in [100, 500, 1000, 5000] {
+                        if ui.selectable_label(t.page_size == size, size.to_string()).clicked() { actions.push(ConsoleAction::Page(PageMove::Size(size))); ui.close(); }
+                    } });
+                    if ui.add_enabled(!busy && sql, egui::Button::new("›|")).on_hover_text(tr("Last page (counts rows)")).clicked() { actions.push(ConsoleAction::Page(PageMove::Last)); }
+                    let full = self.results.last().is_some_and(|v| v.rs.rows.len() >= t.page_size);
+                    if theme::icon_button(ui, Ico::ChevronRight, !busy && sql && full, tr("Next page")).clicked() { actions.push(ConsoleAction::Page(PageMove::Next)); }
+                    let response = ui.add_enabled(!busy && sql, egui::TextEdit::singleline(&mut t.page_input).desired_width(40.0));
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        match t.page_input.parse::<usize>() { Ok(n) if n > 0 => actions.push(ConsoleAction::Page(PageMove::Number(n))), _ => actions.push(ConsoleAction::Error(tr("Enter a positive page number").into())) }
+                    }
+                    if theme::icon_button(ui, Ico::ChevronLeft, !busy && sql && t.offset > 0, tr("Previous page")).clicked() { actions.push(ConsoleAction::Page(PageMove::Previous)); }
+                    if ui.add_enabled(!busy && sql && t.offset > 0, egui::Button::new("|‹")).on_hover_text(tr("First page")).clicked() { actions.push(ConsoleAction::Page(PageMove::First)); }
+                    if let Some(view) = self.results.last() { ui.label(trf("{n}{plus} rows", &[("n", &view.row_count()), ("plus", &if view.rs.truncated { "+" } else { "" })])); }
+
+                }
+            });
+        });
+        let p = pal(ui);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let statement = self.last_statements.last().map(String::as_str).unwrap_or("");
+            let caption = if let Some(view) = self.results.last() {
+                let page = self.table.as_ref().map_or(1, |t| t.offset / t.page_size.max(1) + 1);
+                match view.row_position() {
+                    Some((row, _)) => trf("Record {row} · page {page}", &[("row", &(self.table.as_ref().map_or(0, |t| t.offset) + row)), ("page", &page)]),
+                    None => trf("Page {page}", &[("page", &page)]),
+                }
+            } else { String::new() };
+            theme::split_row(ui, |ui, side| match side {
+                theme::Side::Left => {
+                    ui.add(egui::Label::new(RichText::new(statement).monospace().size(11.0).color(p.muted)).truncate()).on_hover_text(statement);
+                }
+                theme::Side::Right => {
+                    ui.label(RichText::new(&caption).small().color(p.muted));
+                    if let Some(log) = self.log.last() { ui.label(RichText::new(trf("Last refresh: {time}", &[("time", &log.time)])).small().color(p.muted)); }
+                }
+            });
+        });
+    }
+
+    fn table_inspector(&mut self, ui: &mut Ui, cx: &ConsoleCtx<'_>, actions: &mut Vec<ConsoleAction>) {
+        let Some(t) = &mut self.table else { return };
+        ui.set_min_width(210.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut t.inspector_column, false, tr("Table"));
+            ui.selectable_value(&mut t.inspector_column, true, tr("Column"));
+            if theme::icon_button(ui, Ico::Refresh, !t.info_loading && !cx.driver.is_nosql(), tr("Refresh information")).clicked() { actions.push(ConsoleAction::Inspect(false)); }
+        });
+        let connection = cx.connections.iter().find(|c| Some(c.id) == self.conn).map_or("", |c| c.name.as_str());
+        let db = self.db.as_deref().unwrap_or("");
+        egui::ScrollArea::vertical().id_salt(("inspector_fields", self.id)).auto_shrink([false, false]).show(ui, |ui| {
+            if t.inspector_column {
+                let selected = self.results.last().and_then(|v| v.selected_cell().map(|(_, c, _)| &v.rs.columns[c]));
+                if let Some(name) = selected {
+                    crate::ui::inspector::header(ui, name, tr("Column"), connection, db);
+                    let column = cx.columns.and_then(|cols| cols.iter().find(|c| c.name == *name));
+                    crate::ui::inspector::property(ui, tr("Type"), column.map(|c| c.data_type.as_str()));
+                    crate::ui::inspector::property(ui, tr("Not null"), column.map(|c| if c.nullable { tr("No") } else { tr("Yes") }));
+                    crate::ui::inspector::property(ui, tr("Primary key"), column.map(|c| if c.primary_key { tr("Yes") } else { tr("No") }));
+                    crate::ui::inspector::property(ui, tr("Default value"), None);
+                    crate::ui::inspector::property(ui, tr("Comment"), None);
+                } else { ui.label(tr("Select a cell to see column information")); }
+            } else {
+                crate::ui::inspector::header(ui, &t.table, tr("Table"), connection, db);
+                if t.info_loading { ui.spinner(); }
+                if let Some(Err(error)) = &t.info { ui.colored_label(ui.visuals().error_fg_color, error); }
+                let info = t.info.as_ref().and_then(|r| r.as_ref().ok());
+                crate::ui::inspector::table_fields(ui, info);
+                if ui.add_enabled(!t.info_loading && !cx.driver.is_nosql(), egui::Button::new(tr("Count rows exactly"))).clicked() { actions.push(ConsoleAction::Inspect(true)); }
+            }
         });
     }
 
@@ -1293,6 +1392,7 @@ impl Console {
                             copy_requested,
                             cx.columns,
                             false,
+                            true,
                         )
                     })
                     .inner;
@@ -2140,6 +2240,29 @@ mod tests {
     }
 
     #[test]
+    fn cell_editor_stages_the_same_pending_values_and_row_change_save_as_the_grid() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = table_harness();
+        h.state_mut().console.table.as_mut().unwrap().save_on_row_change = true;
+        h.get_by_label("Cell Editor").click(); h.run_steps(3);
+        h.get_all_by_value("First note").next().unwrap().click(); h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A); h.run_steps(1);
+        h.input_mut().events.push(Event::Text("Panel edit".into())); h.run_steps(2);
+        assert!(h.state().console.has_pending_edits());
+        h.get_by_label("Apply").click(); h.run_steps(2);
+        assert_eq!(h.state().console.results[0].edit.as_ref().unwrap().state.changes.get(&(0, 1)), Some(&Some("Panel edit".into())));
+        h.key_press(Key::ArrowDown); h.run_steps(3);
+        assert_eq!(h.state().submits, 1);
+    }
+
+    #[test]
+    fn table_view_toggles_roundtrip_and_inspector_is_available_without_editing() {
+        let view = TableViewOptions { cell_editor: true, filter_sort: true, inspector: false };
+        let view: TableViewOptions = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+        assert!(view.cell_editor && view.filter_sort && !view.inspector);
+    }
+
+    #[test]
     fn table_save_on_row_change_is_an_explicit_opt_in() {
         use egui_kittest::kittest::Queryable;
         let mut h = table_harness();
@@ -2157,6 +2280,58 @@ mod tests {
         h.run_steps(3);
         assert_eq!(h.state().submits, 1);
         assert!(h.state().console.results[0].is_dirty());
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders the database workspace using synthetic data"]
+    fn render_database_workspace() {
+        use crate::app::{ConnState, ConnStatus};
+        use crate::db::{ConnectionConfig, DatabaseInfo};
+        use crate::ui::explorer::{self, ExplorerState};
+        use crate::ui::filter_sort::{Condition, Node, Operator, SortRule};
+        use egui_kittest::kittest::Queryable;
+        let columns: Vec<_> = [("id", "int"), ("customer", "varchar(120)"), ("status", "varchar(20)"), ("total", "decimal(10,2)"), ("created_at", "datetime"), ("note", "text")]
+            .into_iter().map(|(name, ty)| ColumnInfo { name: name.into(), data_type: ty.into(), nullable: name == "note", primary_key: name == "id" }).collect();
+        let mut console = Console::new_table(1, 1, Some("shop".into()), "shop".into(), "orders".into());
+        let rows = (1..=48).map(|id| vec![Some(id.to_string()), Some(format!("Customer {id:02}")), Some(if id % 3 == 0 { "pending" } else { "paid" }.into()), Some(format!("{}.00", id * 25)), Some("2026-10-23 12:00:00".into()), Some("Delivery instructions\nLeave at reception.".into())]).collect();
+        let mut view = ResultView::new(crate::db::ResultSet { columns: columns.iter().map(|c| c.name.clone()).collect(), rows, ..Default::default() }, 42);
+        view.set_edit_target(Ok(crate::ui::editing::EditTarget { schema: "shop".into(), table: "orders".into(), col_names: view.rs.columns.clone(), key_cols: vec![0], binary_cols: vec![false; 6], has_pk: true }));
+        view.begin_edit(0, 5); view.finish_inline_edit();
+        console.results.push(view);
+        console.last_statements.push("SELECT * FROM `shop`.`orders` ORDER BY `id` LIMIT 1000".into());
+        let table = console.table.as_mut().unwrap();
+        table.loaded = true; table.save_on_row_change = true;
+        table.info = Some(Ok(crate::db::object_info::ObjectInfo { rows: Some(48), engine: Some("InnoDB".into()), auto_increment: Some(49), row_format: Some("Dynamic".into()), created: Some("2026-10-01 09:30:00".into()), modified: Some("2026-10-23 12:00:00".into()), data_bytes: Some(16384), index_bytes: Some(16384), collation: Some("utf8mb4_unicode_ci".into()), comment: Some("Customer orders".into()), ..Default::default() }));
+        table.filter_sort.filter.children = vec![Node::Condition(Condition { enabled: true, column: "status".into(), operator: Operator::Equal, value: "paid".into(), second: String::new() }), Node::Condition(Condition { enabled: true, column: "total".into(), operator: Operator::GreaterEqual, value: "100".into(), second: String::new() })];
+        table.filter_sort.sort.push(SortRule { enabled: true, column: "total".into(), descending: true });
+        let schemas = vec![SchemaInfo { name: "shop".into(), tables: ["customers", "orders", "products"].into_iter().map(|name| TableInfo { name: name.into(), kind: ObjectKind::Table, columns: columns.clone() }).collect() }];
+        let mut cfg = ConnectionConfig::new(1, Driver::MariaDb); cfg.name = "Development".into(); cfg.database = "shop".into();
+        let mut conn = ConnState::new(cfg); conn.status = ConnStatus::Connected;
+        conn.databases = vec![DatabaseInfo { name: "shop".into(), current: true, schemas: Some(schemas) }, DatabaseInfo { name: "analytics".into(), current: false, schemas: None }];
+        let connections = vec![ConnSummary { id: 1, name: "Development".into(), driver: Driver::MariaDb, status: ConnStatusKind::Connected, databases: vec!["shop".into()], default_db: Some("shop".into()) }];
+        let mut explorer = ExplorerState::default(); explorer.expanded.extend(["c:1".into(), "d:1:shop".into()]);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1050.0)).build_ui_state(move |ui, console: &mut Console| {
+            if std::mem::take(&mut first) { theme::install_fonts(ui.ctx()); theme::apply(ui.ctx(), true); return; }
+            egui::Panel::left("fixture_explorer").exact_size(250.0).show(ui, |ui| { explorer::show(ui, &mut explorer, std::slice::from_ref(&conn)); });
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| { ui.label("Objects"); ui.separator(); ui.strong("orders"); });
+                ui.separator();
+                console.show_table(ui, &ConsoleCtx { connections: &connections, schemas: conn.databases[0].schemas.as_deref(), driver: Driver::MariaDb, dark: true, font_size: 14.0, columns: Some(&columns) });
+            });
+        }, console);
+        h.run_steps(4);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/workspace-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(h.query_by_label("customers").is_none(), "table folders start collapsed");
+        assert!(h.query_by_label("Backups").is_some());
+        h.render().unwrap().save(dir.join("workspace.png")).unwrap();
+        h.get_by_label("Filter & Sort").click(); h.run_steps(4);
+        assert!(h.query_by_label("Sort By").is_some());
+        h.render().unwrap().save(dir.join("filter-sort.png")).unwrap();
+        h.get_by_label("Filter & Sort").click(); h.get_by_label("Cell Editor").click(); h.run_steps(4);
+        assert!(h.query_by_value("Delivery instructions\nLeave at reception.").is_some());
+        h.render().unwrap().save(dir.join("cell-editor.png")).unwrap();
     }
 
     #[test]

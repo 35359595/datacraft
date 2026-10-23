@@ -112,7 +112,18 @@ pub struct EditSession {
 }
 
 /// A result set with view state (order, selection and editing).
+struct CellEditor {
+    row: RowRef,
+    col: usize,
+    targets: Vec<(RowRef, usize)>,
+    buffer: String,
+    null: bool,
+    changed: bool,
+    hex: bool,
+}
+
 pub struct ResultView {
+    cell_editor: Option<CellEditor>,
     pub rs: ResultSet,
     pub title: String,
     /// Row permutation for the current order.
@@ -151,6 +162,57 @@ pub struct ResultView {
 }
 
 impl ResultView {
+    pub fn selected_cell(&self) -> Option<(usize, usize, Cell)> {
+        let (r, c) = self.selected?;
+        Some((r, c, self.display_value(self.row_ref(r)?, c).flatten()))
+    }
+
+    pub fn row_position(&self) -> Option<(usize, usize)> { self.selected.map(|(r, _)| (r + 1, self.n_view_rows())) }
+
+    fn commit_cell_editor(&mut self) {
+        if let Some(editor) = self.cell_editor.take().filter(|e| e.changed) {
+            let value = if editor.null { None } else { Some(editor.buffer) };
+            self.apply_cell_values(editor.targets.into_iter().map(|(r, c)| (r, c, value.clone())).collect());
+        }
+    }
+
+    pub fn show_cell_editor(&mut self, ui: &mut Ui) {
+        let Some((r, col, value)) = self.selected_cell() else { ui.label(tr("Select a cell to edit its value")); return; };
+        let Some(row) = self.row_ref(r) else { return; };
+        if self.cell_editor.as_ref().is_none_or(|e| e.row != row || e.col != col) {
+            self.commit_cell_editor();
+            self.cell_editor = Some(CellEditor { row, col, targets: self.selected_cell_refs(), buffer: value.clone().unwrap_or_default(), null: value.is_none(), changed: false, hex: false });
+        }
+        let targets = self.selected_cell_refs();
+        if let Some(editor) = &mut self.cell_editor && !editor.changed { editor.targets = targets; }
+        let editable = self.edit.as_ref().is_some_and(|e| e.state.cell_editable(&self.rs, &e.target, row, col));
+        let mut apply = false; let mut reset = false;
+        if let Some(editor) = self.cell_editor.as_mut() {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut editor.hex, false, tr("Text")); ui.selectable_value(&mut editor.hex, true, tr("Hex"));
+                ui.label(egui::RichText::new(&self.rs.columns[col]).strong());
+                if editable {
+                    editor.changed |= ui.checkbox(&mut editor.null, "NULL").changed();
+                    apply = ui.add_enabled(editor.changed, egui::Button::new(tr("Apply"))).clicked();
+                    reset = ui.button(tr("Reset")).clicked();
+                } else { ui.label(tr("Read-only")); }
+                if ui.button(tr("Copy value")).clicked() { ui.ctx().copy_text(editor.buffer.clone()); }
+            });
+            egui::ScrollArea::both().id_salt(("cell_editor_scroll", self.salt)).show(ui, |ui| {
+                if editor.hex {
+                    let hex = editor.buffer.as_bytes().chunks(16).map(|bytes| bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n");
+                    ui.label(tr("UTF-8 bytes")); ui.monospace(hex);
+                } else {
+                    ui.add_enabled_ui(editable && !editor.null, |ui| {
+                        editor.changed |= ui.add(egui::TextEdit::multiline(&mut editor.buffer).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(4)).changed();
+                    });
+                }
+            });
+        }
+        if apply { self.commit_cell_editor(); }
+        if reset { self.cell_editor = None; }
+    }
+
     pub fn open_find(&mut self) {
         self.find_open = true;
         self.find_focus = true;
@@ -200,6 +262,7 @@ impl ResultView {
         let title = statement_title(&rs.statement);
         let order = (0..rs.rows.len()).collect();
         Self {
+            cell_editor: None,
             rs,
             title,
             order,
@@ -241,17 +304,18 @@ impl ResultView {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.edit
+        self.cell_editor.as_ref().is_some_and(|e| e.changed) || self.edit
             .as_ref()
             .is_some_and(|e| e.state.is_dirty() || e.editing.as_ref().is_some_and(|ed| ed.changed))
     }
 
     pub fn can_undo(&self) -> bool {
-        self.edit.as_ref().is_some_and(|e| e.state.can_undo())
+        self.cell_editor.as_ref().is_some_and(|e| e.changed) || self.edit.as_ref().is_some_and(|e| e.state.can_undo())
     }
 
     /// Discards pending changes and any edit in progress.
     pub fn discard_edits(&mut self) {
+        self.cell_editor = None;
         self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.state.clear();
@@ -273,6 +337,7 @@ impl ResultView {
     }
 
     pub fn undo(&mut self) {
+        if self.cell_editor.take().is_some_and(|e| e.changed) { return; }
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             e.state.undo();
@@ -282,6 +347,7 @@ impl ResultView {
     }
 
     pub fn revert_all(&mut self) {
+        self.cell_editor = None;
         self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
@@ -428,6 +494,7 @@ impl ResultView {
 
     /// Commits the inline editor without changing the selected cell.
     fn commit_edit(&mut self) {
+        self.commit_cell_editor();
         let Some(ed) = self.edit.as_mut().and_then(|e| e.editing.take()) else {
             return;
         };
@@ -725,6 +792,7 @@ impl ResultView {
     }
 
     fn cancel_row(&mut self) {
+        self.cell_editor = None;
         let row = self.selected_row();
         if let Some(row) = row { self.edit_rows.remove(&row); }
         if let Some(e) = self.edit.as_mut() {
@@ -773,6 +841,7 @@ impl ResultView {
 
     /// Refresh data without resetting the grid's column widths, filters or cursor.
     pub fn refresh(&mut self, rs: ResultSet) {
+        self.cell_editor = None;
         let selection = self.selected.map(|(r, c)| {
             let keys = self
                 .edit
@@ -1106,6 +1175,7 @@ pub fn show_result(
     copy_requested: bool,
     columns_info: Option<&[ColumnInfo]>,
     save_on_row_change: bool,
+    floating_summary: bool,
 ) -> GridResponse {
     let p = pal(ui);
     let mut error = None;
@@ -1624,7 +1694,7 @@ pub fn show_result(
         e.editing = inline;
     }
 
-    if let Some(e) = row_count_pill(ui, view, area_rect) {
+    if floating_summary && let Some(e) = row_count_pill(ui, view, area_rect) {
         error = Some(e);
     }
     filter_popup_ui(ui, view);
@@ -2271,7 +2341,7 @@ mod keyboard_tests {
                     return;
                 }
                 let id = ui.make_persistent_id(egui::IdSalt::new(("result_h", state.0.salt)));
-                show_result(ui, &mut state.0, false, None, false);
+                show_result(ui, &mut state.0, false, None, false, true);
                 state.1 = egui::scroll_area::State::load(ui.ctx(), id).expect("horizontal scroll state").offset.x;
             }, (view, 0.0));
         h.run_steps(3);
@@ -2396,7 +2466,7 @@ mod keyboard_tests {
                     }
                     let response = ui
                         .add_enabled_ui(state.enabled, |ui| {
-                            show_result(ui, &mut state.view, false, None, state.auto_save)
+                            show_result(ui, &mut state.view, false, None, state.auto_save, true)
                         })
                         .inner;
                     assert!(response.error.is_none());

@@ -1,14 +1,17 @@
 //! User interface components.
 
 pub mod connection_dialog;
+pub mod backup_dialog;
 pub mod copy_dialog;
 pub mod console;
 pub mod create_dialog;
 pub mod drop_dialog;
 pub mod import_dialog;
+pub mod inspector;
 pub mod mask_export_dialog;
 pub mod modify_table_dialog;
 pub mod editing;
+pub mod filter_sort;
 pub mod explorer;
 pub mod icons;
 pub mod object_browser;

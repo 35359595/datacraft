@@ -1118,9 +1118,7 @@ impl ObjectBrowser {
             .find(|e| &e.reference == selected)
             .map(|e| e.info);
         egui::ScrollArea::vertical().id_salt("object_information_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(&selected.table).strong().size(17.0)).wrap());
-            ui.label(RichText::new(format!("{} / {}", selected.db, selected.schema)).color(p.muted));
-            ui.add_space(10.0);
+            crate::ui::inspector::header(ui, &selected.table, table.map(|t| object_kind(t.kind)).unwrap_or(tr("Table")), "", &format!("{} / {}", selected.db, selected.schema));
             ui.horizontal(|ui| {
                 if ui.add_enabled(connected, egui::Button::new(tr("Open data"))).clicked() {
                     actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(selected.clone())));
@@ -1141,40 +1139,11 @@ impl ObjectBrowser {
             }
             let info = self.info.as_ref().and_then(|result| result.as_ref().ok());
             ui.add_space(8.0);
-            let rows = info.and_then(|i| i.rows).map(|n| if info.is_some_and(|i| i.rows_exact) { n.to_string() } else { format!("≈ {n}") });
+            crate::ui::inspector::property(ui, tr("Type"), table.map(|t| object_kind(t.kind)));
             let columns = table.map(|t| t.columns.len().to_string());
-            let data = info.and_then(|i| i.data_bytes).map(format_bytes);
-            let indexes = info.and_then(|i| i.index_bytes).map(format_bytes);
-            let average = info.and_then(|i| i.average_row_bytes).map(format_bytes);
-            let max_data = info.and_then(|i| i.max_data_bytes).map(format_bytes);
-            let free = info.and_then(|i| i.free_bytes).map(format_bytes);
-            let auto_increment = info.and_then(|i| i.auto_increment).map(|n| n.to_string());
-            for (label, value) in [
-                (tr("Type"), table.map(|t| object_kind(t.kind))),
-                (tr("Columns"), columns.as_deref()),
-                (tr("Rows"), rows.as_deref()),
-                (tr("Data length"), data.as_deref()),
-                (tr("Engine"), info.and_then(|i| i.engine.as_deref())),
-                (tr("Created date"), info.and_then(|i| i.created.as_deref())),
-                (tr("Modified date"), info.and_then(|i| i.modified.as_deref())),
-                (tr("Collation"), info.and_then(|i| i.collation.as_deref())),
-                (tr("Row format"), info.and_then(|i| i.row_format.as_deref())),
-                (tr("Average row length"), average.as_deref()),
-                (tr("Max data length"), max_data.as_deref()),
-                (tr("Index length"), indexes.as_deref()),
-                (tr("Check time"), info.and_then(|i| i.checked.as_deref())),
-                (tr("Auto increment"), auto_increment.as_deref()),
-                (tr("Data free"), free.as_deref()),
-                (tr("Create options"), info.and_then(|i| i.create_options.as_deref())),
-            ] {
-                ui.label(RichText::new(label).small().color(p.muted));
-                ui.add(egui::Label::new(value.unwrap_or("—")).wrap()).on_hover_text(if value.is_none() { tr("Not available") } else { "" });
-                ui.add_space(5.0);
-            }
+            crate::ui::inspector::property(ui, tr("Columns"), columns.as_deref());
+            crate::ui::inspector::table_fields(ui, info);
             ui.label(RichText::new(tr("Row estimates and timestamps come from the engine; modified may refer to a definition change.")).small().color(p.muted));
-            if let Some(comment) = info.and_then(|i| i.comment.as_deref()) {
-                ui.separator(); ui.label(RichText::new(tr("Comment")).strong()); ui.add(egui::Label::new(comment).wrap());
-            }
             if let Some(table) = table {
                 ui.separator();
                 egui::CollapsingHeader::new(tr("Columns")).default_open(true).show(ui, |ui| {
