@@ -35,7 +35,8 @@ Get the latest version from [Releases](https://github.com/javy-fernandez/datacra
 - **macOS:** `DataCraft-<version>-universal.dmg` (Apple Silicon and Intel, macOS 11+). Open it and drag
   DataCraft to Applications. The app is not notarized: the first time, right-click DataCraft.app → **Open**,
   or run `xattr -dr com.apple.quarantine /Applications/DataCraft.app`.
-- **Windows:** `DataCraft-<version>-windows-x64.zip` (Windows 10/11, x64). Unzip it and run `DataCraft.exe`;
+- **Windows:** `DataCraft-<version>-windows-x64.zip` (Windows 10/11, x64) or `DataCraft-<version>-windows-arm64.zip`
+  (Windows on ARM: Snapdragon / Copilot+ PCs). Unzip it and run `DataCraft.exe`;
   no installer needed. The exe is not signed, so SmartScreen may warn the first time: **More info → Run anyway**.
 
 ## Build
@@ -45,6 +46,7 @@ cargo run                                  # development
 scripts/bundle.sh --install                # optimized DataCraft.app in /Applications
 scripts/bundle.sh --universal --dmg        # universal app + .dmg (needs: rustup target add x86_64-apple-darwin)
 cargo build --release --target x86_64-pc-windows-gnu   # Windows .exe from macOS (needs: rustup target add x86_64-pc-windows-gnu, brew install mingw-w64)
+cargo xwin build --release --target aarch64-pc-windows-msvc   # Windows ARM64 .exe (needs: rustup target add aarch64-pc-windows-msvc, cargo install cargo-xwin, brew install llvm lld; downloads the Windows SDK and accepts Microsoft's license)
 ```
 
 On Windows itself, `cargo build --release` produces `target\release\datacraft.exe`.
@@ -112,7 +114,8 @@ Descarga la última versión desde [Releases](https://github.com/javy-fernandez/
 - **macOS:** `DataCraft-<versión>-universal.dmg` (Apple Silicon e Intel, macOS 11+). Ábrelo y arrastra
   DataCraft a Aplicaciones. La app no está notarizada: la primera vez, clic derecho en DataCraft.app → **Abrir**,
   o ejecuta `xattr -dr com.apple.quarantine /Applications/DataCraft.app`.
-- **Windows:** `DataCraft-<versión>-windows-x64.zip` (Windows 10/11, x64). Descomprímelo y ejecuta `DataCraft.exe`;
+- **Windows:** `DataCraft-<versión>-windows-x64.zip` (Windows 10/11, x64) o `DataCraft-<versión>-windows-arm64.zip`
+  (Windows en ARM: Snapdragon / Copilot+ PC). Descomprímelo y ejecuta `DataCraft.exe`;
   no necesita instalación. El exe no está firmado y SmartScreen puede avisar la primera vez: **Más información → Ejecutar de todas formas**.
 
 ### Compilar
@@ -122,6 +125,7 @@ cargo run                                  # desarrollo
 scripts/bundle.sh --install                # DataCraft.app optimizada en /Applications
 scripts/bundle.sh --universal --dmg        # app universal + .dmg (requiere: rustup target add x86_64-apple-darwin)
 cargo build --release --target x86_64-pc-windows-gnu   # .exe de Windows desde macOS (requiere: rustup target add x86_64-pc-windows-gnu, brew install mingw-w64)
+cargo xwin build --release --target aarch64-pc-windows-msvc   # .exe de Windows ARM64 (requiere: rustup target add aarch64-pc-windows-msvc, cargo install cargo-xwin, brew install llvm lld; descarga el SDK de Windows y acepta la licencia de Microsoft)
 ```
 
 En el propio Windows, `cargo build --release` genera `target\release\datacraft.exe`.
