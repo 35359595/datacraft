@@ -18,7 +18,7 @@
 //! several queries, run with "Run all" (one result tab each).
 //! `DATACRAFT_DEMO_FILTER=<column>` opens that column's funnel with its first value unchecked;
 //! `<column>=<text>` types that text in its search box (which also filters the grid).
-//! `DATACRAFT_DEMO_LANG=en|es` forces the interface language.
+//! `DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja` forces the interface language.
 //! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
 //! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
@@ -300,12 +300,8 @@ impl DataCraftApp {
             cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default()
         };
         // Before any text is created (native menu, first console...).
-        // Demo mode can force the language: DATACRAFT_DEMO_LANG=en|es.
-        let demo_lang = demo.as_ref().and(std::env::var("DATACRAFT_DEMO_LANG").ok()).and_then(|l| match l.as_str() {
-            "es" => Some(Lang::Es),
-            "en" => Some(Lang::En),
-            _ => None,
-        });
+        // Demo mode can force the language: DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja.
+        let demo_lang = demo.as_ref().and(std::env::var("DATACRAFT_DEMO_LANG").ok()).map(|l| Lang::from_locale(&l));
         i18n::set_lang(demo_lang.or(persisted.lang).unwrap_or_else(Lang::system));
         let conns: Vec<ConnState> = if demo.is_some() {
             Vec::new()
@@ -1915,7 +1911,9 @@ impl DataCraftApp {
         ui.checkbox(&mut self.show_results, tr("Services (results)"));
         ui.separator();
         ui.menu_button(trf("IDE zoom ({zoom})", &[("zoom", &zoom_label(self.zoom))]), |ui| self.zoom_menu(ui));
-        ui.menu_button("Language / Idioma", |ui| {
+        // Also in English, so it can be found from a language the user can't read.
+        let language = if i18n::lang() == Lang::En { "Language".to_string() } else { format!("{} / Language", tr("Language")) };
+        ui.menu_button(language, |ui| {
             for lang in Lang::ALL {
                 if ui.radio(i18n::lang() == lang, lang.native_name()).clicked() {
                     self.set_language(lang);
