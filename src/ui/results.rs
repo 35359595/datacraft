@@ -920,7 +920,7 @@ impl ExportFormat {
             ExportFormat::Csv => "CSV",
             ExportFormat::Tsv => "TSV",
             ExportFormat::Json => "JSON",
-            ExportFormat::SqlInsert => "SQL Inserts",
+            ExportFormat::SqlInsert => tr("SQL Inserts"),
             ExportFormat::Markdown => "Markdown",
         }
     }
@@ -1552,7 +1552,7 @@ pub fn show_result(
                                     ui.close();
                                 }
                                 let is_null = matches!(value, Some(None));
-                                if ui.add_enabled(can_edit && !is_null, egui::Button::new("Set NULL")).clicked() {
+                                if ui.add_enabled(can_edit && !is_null, egui::Button::new(tr("Set NULL"))).clicked() {
                                     actions.push(GridAction::SetNull(rref, c));
                                     ui.close();
                                 }
@@ -1889,7 +1889,7 @@ pub fn edit_buttons(ui: &mut Ui, view: Option<&mut ResultView>, enabled: bool) -
     let undo = theme::icon_button(ui, Ico::Undo, can_undo, tr("Undo (⌘Z)"));
     let revert = theme::icon_button(ui, Ico::Revert, dirty, tr("Revert all changes"));
     let submit = theme::icon_button(ui, Ico::Submit, dirty, tr("Submit changes (⌘S)"));
-    let pv = theme::flat_button(ui, Some(Ico::Eye), "Preview", FontId::proportional(13.0), false, dirty)
+    let pv = theme::flat_button(ui, Some(Ico::Eye), tr("Preview"), FontId::proportional(13.0), false, dirty)
         .on_hover_text(tr("Preview the SQL of the pending changes"));
     if let Some(v) = view {
         if add.clicked() {
@@ -2087,9 +2087,9 @@ fn row_count_pill(ui: &Ui, view: &ResultView, area: Rect) -> Option<String> {
     let n = view.rs.rows.len();
     let plus = if view.rs.truncated { "+" } else { "" };
     let text = match (view.filtered_out(), n) {
-        (0, 1) => "1 row".to_string(),
-        (0, n) => format!("{n}{plus} rows"),
-        (_, n) => format!("{} of {n}{plus} rows", view.order.len()),
+        (0, 1) => tr("1 row").to_string(),
+        (0, n) => trf("{n}{plus} rows", &[("n", &n), ("plus", &plus)]),
+        (_, n) => trf("{shown} of {n}{plus} rows", &[("shown", &view.order.len()), ("n", &n), ("plus", &plus)]),
     };
     let font = FontId::proportional(12.5);
     let tw = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), p.text).size().x);

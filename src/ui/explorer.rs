@@ -207,7 +207,7 @@ fn header(ui: &mut Ui, state: &mut ExplorerState, conns: &[ConnState], actions: 
         ui.add_space(14.0);
         let title_w = (ui.available_width() - 66.0).max(0.0);
         ui.allocate_ui_with_layout(vec2(title_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.add(egui::Label::new(RichText::new("Database Explorer").font(theme::bold(13.5)).color(p.text)).truncate());
+            ui.add(egui::Label::new(RichText::new(tr("Database Explorer")).font(theme::bold(13.5)).color(p.text)).truncate());
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
@@ -705,7 +705,7 @@ fn object_groups(
 ) {
     let p = pal(ui);
     let filtering = !filter.is_empty();
-    for (kind, label, gk) in [(ObjectKind::Table, "tables", "t"), (ObjectKind::View, "views", "v")] {
+    for (kind, label, gk) in [(ObjectKind::Table, tr("tables"), "t"), (ObjectKind::View, tr("views"), "v")] {
         let tables: Vec<&TableInfo> = s.tables.iter().filter(|t| t.kind == kind && table_matches(t, filter)).collect();
         if filtering && tables.is_empty() {
             continue;

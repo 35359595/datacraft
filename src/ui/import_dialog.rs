@@ -37,7 +37,7 @@ impl Delimiter {
         match self {
             Delimiter::Comma => tr(", (comma)"),
             Delimiter::Semicolon => tr("; (semicolon)"),
-            Delimiter::Tab => "Tab",
+            Delimiter::Tab => tr("Tab"),
             Delimiter::Pipe => tr("| (pipe)"),
         }
     }
