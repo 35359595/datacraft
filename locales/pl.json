@@ -737,5 +737,17 @@
     "Select All": "Zaznacz wszystko",
     "Clear": "Wyczyść",
     "Applying…": "Stosowanie…"
+  },
+  "new_database": {
+    "Character set:": "Zestaw znaków:",
+    "Collation:": "Sortowanie:",
+    "Comment:": "Komentarz:",
+    "Data retention (days):": "Przechowywanie danych (dni):",
+    "Encoding:": "Kodowanie:",
+    "Filter": "Filtruj",
+    "Locale:": "Ustawienia regionalne:",
+    "Owner:": "Właściciel:",
+    "Template:": "Szablon:",
+    "Transient (no Fail-safe)": "Tymczasowa (bez Fail-safe)"
   }
 }

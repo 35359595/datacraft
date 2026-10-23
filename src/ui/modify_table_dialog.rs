@@ -223,16 +223,20 @@ impl ModifyTableDialog {
                     for (i, x) in self.indexes.iter_mut().enumerate() {
                         // Existing indexes can only be dropped.
                         let new = x.original.is_none();
-                        ui.add_enabled(new, egui::TextEdit::singleline(&mut x.name).id_salt(("index_name", i)).margin(vec2(6.0, 4.0)).desired_width(200.0));
-                        ui.add_enabled(
-                            new,
-                            egui::TextEdit::singleline(&mut x.columns)
-                                .id_salt(("index_columns", i))
-                                .hint_text(tr("column1, column2"))
-                                .font(egui::TextStyle::Monospace)
-                                .margin(vec2(6.0, 4.0))
-                                .desired_width(280.0),
-                        );
+                        // add_sized: a grid cell would otherwise shrink the fields to their text.
+                        ui.add_enabled_ui(new, |ui| {
+                            ui.add_sized([200.0, 24.0], egui::TextEdit::singleline(&mut x.name).id_salt(("index_name", i)).margin(vec2(6.0, 4.0)));
+                        });
+                        ui.add_enabled_ui(new, |ui| {
+                            ui.add_sized(
+                                [280.0, 24.0],
+                                egui::TextEdit::singleline(&mut x.columns)
+                                    .id_salt(("index_columns", i))
+                                    .hint_text(tr("column1, column2"))
+                                    .font(egui::TextStyle::Monospace)
+                                    .margin(vec2(6.0, 4.0)),
+                            );
+                        });
                         ui.add_enabled(new, egui::Checkbox::without_text(&mut x.unique));
                         if theme::icon_button(ui, Ico::Minus, true, tr("Remove index")).clicked() {
                             remove = Some(i);
@@ -257,4 +261,72 @@ impl ModifyTableDialog {
 /// The statements as a script, for the preview and "Copy SQL".
 pub fn script(plan: &Plan) -> String {
     plan.statements.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes previews of "Modify Table…" and "Edit View…" to target/dialog-snapshots, on a real
+    /// SQLite table and view.
+    #[test]
+    #[ignore = "Requires a GPU; writes dialog previews to target/dialog-snapshots"]
+    fn render_modify_table_and_view() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/dialog-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = std::env::temp_dir().join(format!("datacraft-render-{}.db", uuid::Uuid::new_v4()));
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "create table customers(id integer primary key, name varchar(80) not null, email text, created_at datetime default current_timestamp);
+                 create index ix_email on customers(email);
+                 create view active_customers as select id, name from customers where email is not null;",
+            )
+            .unwrap();
+        let mut cfg = crate::db::ConnectionConfig::new(1, Driver::Sqlite);
+        cfg.file_path = db.display().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (details, view) = rt.block_on(async {
+            let mut s = crate::db::Session::connect(&cfg).await.unwrap();
+            let details = alter::load_details(&mut s, Driver::Sqlite, "main", "customers").await.unwrap();
+            let view = s.view_definition(Driver::Sqlite, "main", "main", "active_customers").await.unwrap();
+            (details, view)
+        });
+        let _ = std::fs::remove_file(&db);
+
+        let mut d = ModifyTableDialog::new(1, Driver::Sqlite, "main".into(), "main".into(), "customers".into());
+        d.loaded(Ok(details));
+        d.demo_edits();
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 860.0)).build_ui_state(
+            move |ui, d: &mut ModifyTableDialog| {
+                if std::mem::take(&mut first) {
+                    theme::install_fonts(ui.ctx());
+                    theme::apply(ui.ctx(), false);
+                    return;
+                }
+                d.show(ui.ctx());
+            },
+            d,
+        );
+        h.run_steps(4);
+        h.render().unwrap().save(dir.join("modify-table.png")).unwrap();
+
+        let mut v = crate::ui::view_dialog::ViewDialog::edit_view(1, Driver::Sqlite, "main".into(), "main".into(), "active_customers".into(), 1);
+        v.definition_loaded(Ok(view));
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 760.0)).build_ui_state(
+            move |ui, v: &mut crate::ui::view_dialog::ViewDialog| {
+                if std::mem::take(&mut first) {
+                    theme::install_fonts(ui.ctx());
+                    theme::apply(ui.ctx(), false);
+                    return;
+                }
+                v.show(ui.ctx(), &[]);
+            },
+            v,
+        );
+        h.run_steps(4);
+        h.render().unwrap().save(dir.join("edit-view.png")).unwrap();
+    }
 }

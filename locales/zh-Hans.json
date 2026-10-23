@@ -737,5 +737,17 @@
     "Select All": "全选",
     "Clear": "清除",
     "Applying…": "正在应用…"
+  },
+  "new_database": {
+    "Character set:": "字符集：",
+    "Collation:": "排序规则：",
+    "Comment:": "注释：",
+    "Data retention (days):": "数据保留（天）：",
+    "Encoding:": "编码：",
+    "Filter": "筛选",
+    "Locale:": "区域设置：",
+    "Owner:": "所有者：",
+    "Template:": "模板：",
+    "Transient (no Fail-safe)": "临时（无 Fail-safe）"
   }
 }

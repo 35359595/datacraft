@@ -737,5 +737,17 @@
     "Select All": "すべて選択",
     "Clear": "クリア",
     "Applying…": "適用中…"
+  },
+  "new_database": {
+    "Character set:": "文字セット:",
+    "Collation:": "照合順序:",
+    "Comment:": "コメント:",
+    "Data retention (days):": "データ保持 (日):",
+    "Encoding:": "エンコーディング:",
+    "Filter": "絞り込み",
+    "Locale:": "ロケール:",
+    "Owner:": "所有者:",
+    "Template:": "テンプレート:",
+    "Transient (no Fail-safe)": "一時的 (Fail-safe なし)"
   }
 }

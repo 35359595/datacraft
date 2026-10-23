@@ -737,5 +737,17 @@
     "Select All": "Seleccionar todo",
     "Clear": "Limpiar",
     "Applying…": "Aplicando…"
+  },
+  "new_database": {
+    "Character set:": "Juego de caracteres:",
+    "Collation:": "Collation:",
+    "Comment:": "Comentario:",
+    "Data retention (days):": "Retención de datos (días):",
+    "Encoding:": "Codificación:",
+    "Filter": "Filtrar",
+    "Locale:": "Locale:",
+    "Owner:": "Propietario:",
+    "Template:": "Plantilla:",
+    "Transient (no Fail-safe)": "Transitoria (sin Fail-safe)"
   }
 }

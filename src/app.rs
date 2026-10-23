@@ -26,6 +26,7 @@
 //! `DATACRAFT_DEMO_MASK_EXPORT=1` opens "Export with Masking…" on the first table's data.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
+//! `DATACRAFT_DEMO_CREATE=database` opens "New Database" with its options;
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
 //! `table-submit` also creates that table in the demo database.
 //! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
@@ -680,6 +681,13 @@ impl DataCraftApp {
                             self.open_modify_table(t);
                         }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
+                        if demo_create == "database" && self.conn(conn).is_some_and(|c| c.cfg.driver.has_databases()) {
+                            self.create = Some(CreateDialog::database(conn, self.conn(conn).map_or(Driver::Postgres, |c| c.cfg.driver)));
+                            if let Some(d) = self.create.as_mut() {
+                                d.name = "inventory".into();
+                            }
+                            self.worker.send(Request::DatabaseChoices { conn });
+                        }
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
                         {
@@ -774,6 +782,18 @@ impl DataCraftApp {
                 Response::TableDetails { request_id, result } => self.modify_loaded(request_id, result.map(|d| *d)),
                 Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
                 Response::Users { conn, result } => self.users_response(conn, result),
+                Response::DatabaseChoices { conn, result } => {
+                    if let Some(d) = self.create.as_mut().filter(|d| d.conn == conn && matches!(d.target, CreateTarget::Database)) {
+                        match result {
+                            Ok(choices) => d.set_choices(choices),
+                            // Without the lists the dialog still works with the server's defaults.
+                            Err(e) => {
+                                d.set_choices(Default::default());
+                                d.error = Some(e);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1358,6 +1378,7 @@ impl DataCraftApp {
                     }
                     if let Some(c) = self.conn(id).filter(|c| c.status == ConnStatus::Connected) {
                         self.create = Some(CreateDialog::database(id, c.cfg.driver));
+                        self.worker.send(Request::DatabaseChoices { conn: id });
                     }
                 }
                 ExplorerAction::NewTable { conn, db, schema } => {

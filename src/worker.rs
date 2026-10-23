@@ -59,6 +59,8 @@ pub enum Request {
     },
     /// The real definition of a view (for "Edit View…" and "Generate DDL").
     ViewDefinition { conn: ConnId, db: String, schema: String, view: String, request_id: u64 },
+    /// "New Database": the server's character sets, collations, roles… for the dialog.
+    DatabaseChoices { conn: ConnId },
     /// "Modify Table…": the table's full structure (defaults, primary key, indexes).
     TableDetails { conn: ConnId, db: String, schema: String, table: String, request_id: u64 },
     /// Runs statements in order; stops at the first error.
@@ -132,6 +134,7 @@ pub enum Response {
     /// Result of `RunDdl`.
     DdlDone { conn: ConnId, result: Result<(), String> },
     TableDetails { request_id: u64, result: Result<Box<crate::db::alter::TableDetails>, String> },
+    DatabaseChoices { conn: ConnId, result: Result<crate::db::create_db::DatabaseChoices, String> },
     /// Result of `Users`.
     Users { conn: ConnId, result: Result<crate::db::users::UsersReply, String> },
 }
@@ -446,6 +449,17 @@ async fn fetch_users(state: &State, conn: ConnId, request: &crate::db::users::Us
 
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
+        Request::DatabaseChoices { conn } => {
+            let result = async {
+                let driver = state.live.lock().await.get(&conn).map(|l| l.cfg.driver).ok_or_else(|| anyhow::anyhow!(tr("Connection lost")))?;
+                let (session, _) = state.meta_session_for(conn, "").await?;
+                let mut s = session.lock().await;
+                s.database_choices(driver).await
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            vec![Response::DatabaseChoices { conn, result }]
+        }
         Request::Users { conn, request } => vec![Response::Users { conn, result: fetch_users(state, conn, &request).await }],
         Request::SchemaSearch { conn, request_id, request, cancel } => {
             let cfg = state.live.lock().await.get(&conn).map(|l| l.cfg.clone());

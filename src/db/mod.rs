@@ -5,6 +5,7 @@
 
 pub mod alter;
 pub mod copy;
+pub mod create_db;
 pub mod mongo;
 pub mod mssql;
 pub mod object_info;
