@@ -21,7 +21,8 @@
 //! `DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja` forces the interface language.
 //! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
 //! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
-//! `DATACRAFT_DEMO_COPY=1` opens "Copy Table To…" on the first table, into `<name>_copy`.
+//! `DATACRAFT_DEMO_COPY=1` opens "Copy Table To…" on the first table, into `<name>_copy`;
+//! `mask` also applies "Suggest masking".
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
@@ -626,12 +627,16 @@ impl DataCraftApp {
                                 self.submit_import();
                             }
                         }
-                        if std::env::var("DATACRAFT_DEMO_COPY").is_ok_and(|v| v == "1")
+                        let demo_copy = std::env::var("DATACRAFT_DEMO_COPY").unwrap_or_default();
+                        if matches!(demo_copy.as_str(), "1" | "mask")
                             && let Some(t) = self.explorer.selected_table.clone()
                         {
                             self.open_copy(t);
                             if let Some(d) = self.copy.as_mut() {
                                 d.target_table.push_str("_copy");
+                                if demo_copy == "mask" {
+                                    d.suggest_masks();
+                                }
                             }
                         }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
@@ -1397,6 +1402,10 @@ impl DataCraftApp {
         if request.filter.contains(';') || !is_query(&select) {
             d.error = Some(tr("The WHERE condition can only read data").to_string());
             return;
+        }
+        let mut request = request;
+        if request.masks.iter().any(|m| *m != crate::db::copy::Mask::Keep) {
+            request.mask_key = config::masking_key();
         }
         let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
         d.started(cancel.clone());
@@ -2709,7 +2718,7 @@ impl DataCraftApp {
 
         if let Some(d) = self.copy.as_mut() {
             match d.show(ctx, &self.conns) {
-                Some(CopyAction::Start(request)) => self.start_copy(request),
+                Some(CopyAction::Start(request)) => self.start_copy(*request),
                 Some(CopyAction::Load(conn, db)) => self.ensure_db_loaded(conn, Some(&db)),
                 Some(CopyAction::Close) => self.copy = None,
                 None => {}

@@ -984,6 +984,8 @@ mod tests {
             target_table: target_table.into(),
             create,
             clear,
+            masks: vec![crate::db::copy::Mask::Keep; 3],
+            mask_key: "test-key".into(),
         }
     }
 
@@ -1028,7 +1030,22 @@ mod tests {
         // A filter that writes is refused by the read-only source session.
         assert!(run_copy(&w, 21, 22, 3, copy_request("main", "people_copy", "1=1; delete from people", 100, false, false)).is_err());
 
+        // Masked names: fake and the same for the same value on every copy.
+        let mut masked = copy_request("main", "people_masked", "id <= 2", 100, true, false);
+        masked.masks[1] = crate::db::copy::Mask::Name;
+        assert_eq!(run_copy(&w, 21, 22, 4, masked.clone()), Ok(2));
+        masked.target_table = "people_masked2".into();
+        assert_eq!(run_copy(&w, 21, 22, 5, masked), Ok(2));
+
         let db = rusqlite::Connection::open(&target).unwrap();
+        let (fakes, same): (i64, i64) = db
+            .query_row(
+                "select count(*), sum(a.name = b.name) from people_masked a join people_masked2 b using (id) where a.name not like 'O''Brien%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((fakes, same), (2, 2));
         let (n, name): (i64, String) =
             db.query_row("select count(*), max(name) from people_copy where ok = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((n, name.as_str()), (20, "O'Brien 9"));

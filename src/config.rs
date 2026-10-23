@@ -103,6 +103,21 @@ fn store(entry: Option<keyring::Entry>, value: &str) {
     }
 }
 
+/// Key of the deterministic copy masks, created on first use and kept in the keychain (anyone
+/// with it could tell which real value a masked one came from, by trying candidates).
+pub fn masking_key() -> String {
+    if std::env::var("DATACRAFT_DEMO").is_ok_and(|v| !v.is_empty()) {
+        return "datacraft-demo".into();
+    }
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, "masking-key").ok();
+    if let Some(key) = entry.as_ref().and_then(|e| e.get_password().ok()).filter(|k| !k.is_empty()) {
+        return key;
+    }
+    let key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    store(entry, &key);
+    key
+}
+
 pub fn delete_secrets(id: u64) {
     for entry in [keychain_entry(id), properties_entry(id)].into_iter().flatten() {
         let _ = entry.delete_credential();
