@@ -85,8 +85,8 @@ pub enum Request {
 
 pub enum Response {
     SchemaSearch { request_id: u64, result: Result<crate::db::schema_search::SearchReport, String> },
-    /// Result of `CopyTable`: rows copied.
-    TableCopied { request_id: u64, result: Result<u64, String> },
+    /// Result of `CopyTable`: rows copied to each target table.
+    TableCopied { request_id: u64, result: Result<Vec<(String, u64)>, String> },
     /// `databases` in order; the default one has `current = true` and its schema loaded.
     Connected { conn: ConnId, databases: Vec<DatabaseInfo> },
     ConnectFailed { conn: ConnId, error: String },
@@ -986,10 +986,17 @@ mod tests {
             clear,
             masks: vec![crate::db::copy::Mask::Keep; 3],
             mask_key: "test-key".into(),
+            parents: false,
+            children: false,
+            mask_related: false,
         }
     }
 
     fn run_copy(w: &Worker, source: ConnId, target: ConnId, request_id: u64, request: crate::db::copy::CopyRequest) -> Result<u64, String> {
+        copy_report(w, source, target, request_id, request).map(|r| r.iter().map(|(_, n)| n).sum())
+    }
+
+    fn copy_report(w: &Worker, source: ConnId, target: ConnId, request_id: u64, request: crate::db::copy::CopyRequest) -> Result<Vec<(String, u64)>, String> {
         let cancel = Arc::new(tokio::sync::Notify::new());
         w.send(Request::CopyTable { source, target, request_id, request, cancel });
         let r = wait_for(w, |r| matches!(r, Response::TableCopied { request_id: id, .. } if *id == request_id));
@@ -1093,6 +1100,143 @@ mod tests {
         let name: String = rusqlite::Connection::open(&back).unwrap().query_row("select name from people where id = 3", [], |r| r.get(0)).unwrap();
         assert_eq!(name, "O'Brien 3");
         w.send(Request::RunDdl { conn: 23, db: None, statements: vec!["drop table dc_people".into()], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// customers ← orders ← lines → products, and customers → staff (whose boss is staff).
+    const SHOP: &str = "create table staff(id integer primary key, name text, boss integer references staff(id));
+        create table customers(id integer primary key, name text, email text, manager_id integer references staff(id));
+        create table products(id integer primary key, title text);
+        create table orders(id integer primary key, customer_id integer references customers(id), note text);
+        create table lines(id integer primary key, order_id integer references orders(id), product_id integer references products(id), qty integer);
+        insert into staff values (1, 'Big Boss', null), (2, 'Middle', 1), (3, 'Ann Staff', 2), (4, 'Other', null);
+        insert into customers values (1, 'Ana Real', 'ana@corp.com', 3), (2, 'Luis', 'luis@corp.com', null), (3, 'Eva', 'eva@corp.com', 4);
+        insert into products values (1, 'Pen'), (2, 'Ink'), (3, 'Pad'), (4, 'Box');
+        insert into orders values (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, 3, 'd');
+        insert into lines values (1, 1, 1, 5), (2, 1, 2, 1), (3, 3, 3, 2);";
+
+    fn customers_request(target_db: &str) -> crate::db::copy::CopyRequest {
+        let col = |name: &str, ty: &str, pk: bool| crate::db::ColumnInfo { name: name.into(), data_type: ty.into(), nullable: !pk, primary_key: pk };
+        let columns = vec![col("id", "integer", true), col("name", "text", false), col("email", "text", false), col("manager_id", "integer", false)];
+        crate::db::copy::CopyRequest {
+            source_db: "main".into(),
+            source_schema: "main".into(),
+            source_table: "customers".into(),
+            target_names: columns.iter().map(|c| c.name.clone()).collect(),
+            masks: vec![crate::db::copy::Mask::Keep, crate::db::copy::Mask::Name, crate::db::copy::Mask::Email, crate::db::copy::Mask::Keep],
+            columns,
+            filter: "id = 1".into(),
+            percent: 100,
+            target_db: target_db.into(),
+            target_schema: target_db.into(),
+            target_table: "customers".into(),
+            create: true,
+            clear: false,
+            mask_key: "test-key".into(),
+            parents: true,
+            children: true,
+            mask_related: true,
+        }
+    }
+
+    /// A customer with its orders, their lines and products, and its manager's chain of bosses.
+    #[test]
+    fn copies_a_subset_that_keeps_foreign_keys() {
+        let dir = std::env::temp_dir().join(format!("datacraft-subset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (source, target) = (dir.join("shop.db"), dir.join("dev.db"));
+        rusqlite::Connection::open(&source).unwrap().execute_batch(SHOP).unwrap();
+        rusqlite::Connection::open(&target).unwrap();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(sqlite_cfg(31, &source)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 31, .. }));
+        w.send(Request::Connect(sqlite_cfg(32, &target)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 32, .. }));
+
+        let mut report = copy_report(&w, 31, 32, 1, customers_request("main")).unwrap();
+        report.sort();
+        let expect = [("customers", 1), ("lines", 2), ("orders", 2), ("products", 2), ("staff", 3)];
+        assert_eq!(report, expect.map(|(t, n)| (t.to_string(), n)).to_vec());
+
+        let db = rusqlite::Connection::open(&target).unwrap();
+        let q = |sql: &str| db.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(q("select group_concat(id) from (select id from staff order by rowid)"), "1,2,3");
+        assert_eq!(q("select group_concat(title) from (select title from products order by id)"), "Pen,Ink");
+        // The customer's name and email are masked; the related staff names too (by column name).
+        assert_ne!(q("select name from customers"), "Ana Real");
+        assert!(q("select email from customers").ends_with("@example.com"));
+        assert_ne!(q("select name from staff where id = 3"), "Ann Staff");
+        assert_eq!(q("select cast(sum(qty) as text) from lines"), "6");
+
+        // Again: what is already there is skipped, so nothing new is added.
+        let mut again = customers_request("main");
+        again.create = false;
+        let report = copy_report(&w, 31, 32, 2, again).unwrap();
+        assert!(report.iter().all(|(_, n)| *n == 0), "{report:?}");
+
+        // Without the key column the foreign keys need, it refuses.
+        let mut narrow = customers_request("main");
+        narrow.columns.truncate(3);
+        narrow.target_names.truncate(3);
+        narrow.masks.truncate(3);
+        narrow.create = false;
+        assert!(run_copy(&w, 31, 32, 3, narrow).unwrap_err().contains("manager_id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQLite → MariaDB into tables with enforced foreign keys: the insert order must be right.
+    #[test]
+    #[ignore]
+    fn copies_a_subset_into_mariadb_with_foreign_keys() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut my = ConnectionConfig::new(33, Driver::MariaDb);
+        my.host = var("DATACRAFT_MY_HOST");
+        my.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        my.user = var("DATACRAFT_MY_USER");
+        my.password = var("DATACRAFT_MY_PASSWORD");
+        my.database = var("DATACRAFT_MY_DB");
+        let db = my.database.clone();
+        let dir = std::env::temp_dir().join(format!("datacraft-subset-my-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("shop.db");
+        rusqlite::Connection::open(&source).unwrap().execute_batch(SHOP).unwrap();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(sqlite_cfg(34, &source)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 34, .. }));
+        w.send(Request::Connect(my));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 33, .. }));
+        let ddl = [
+            "drop table if exists `lines`, orders, products, customers, staff",
+            "create table staff(id int primary key, name varchar(50), boss int, foreign key (boss) references staff(id))",
+            "create table customers(id int primary key, name varchar(50), email varchar(80), manager_id int, foreign key (manager_id) references staff(id))",
+            "create table products(id int primary key, title varchar(50))",
+            "create table orders(id int primary key, customer_id int, note varchar(10), foreign key (customer_id) references customers(id))",
+            "create table `lines`(id int primary key, order_id int, product_id int, qty int, foreign key (order_id) references orders(id), foreign key (product_id) references products(id))",
+        ];
+        w.send(Request::RunDdl { conn: 33, db: None, statements: ddl.map(String::from).to_vec(), close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { result: Ok(_), .. }));
+
+        let mut req = customers_request(&db);
+        req.create = false;
+        assert_eq!(run_copy(&w, 34, 33, 1, req.clone()), Ok(10));
+        assert_eq!(run_copy(&w, 34, 33, 2, req), Ok(0));
+
+        // And back: MariaDB's foreign keys are read from information_schema.
+        let back = dir.join("back.db");
+        rusqlite::Connection::open(&back).unwrap();
+        w.send(Request::Connect(sqlite_cfg(35, &back)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 35, .. }));
+        let mut back_req = customers_request("main");
+        back_req.source_db.clone_from(&db);
+        back_req.source_schema.clone_from(&db);
+        back_req.filter.clear();
+        back_req.masks = vec![crate::db::copy::Mask::Keep; 4];
+        back_req.mask_related = false;
+        let mut report = copy_report(&w, 33, 35, 3, back_req).unwrap();
+        report.sort();
+        assert_eq!(report, [("customers", 1), ("lines", 2), ("orders", 2), ("products", 2), ("staff", 3)].map(|(t, n)| (t.to_string(), n)).to_vec());
+        w.send(Request::RunDdl { conn: 33, db: None, statements: vec![ddl[0].into()], close_db: None, transaction: false });
         wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
         let _ = std::fs::remove_dir_all(&dir);
     }

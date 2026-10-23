@@ -24,10 +24,11 @@ pub enum Lang {
     De,
     Zh,
     Ja,
+    Pl,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 7] = [Lang::En, Lang::Es, Lang::Fr, Lang::Pt, Lang::De, Lang::Zh, Lang::Ja];
+    pub const ALL: [Lang; 8] = [Lang::En, Lang::Es, Lang::Fr, Lang::Pt, Lang::De, Lang::Pl, Lang::Zh, Lang::Ja];
 
     /// Name of the language written in that language (for the selector).
     pub fn native_name(self) -> &'static str {
@@ -39,6 +40,7 @@ impl Lang {
             Lang::De => "Deutsch",
             Lang::Zh => "简体中文",
             Lang::Ja => "日本語",
+            Lang::Pl => "Polski",
         }
     }
 
@@ -52,6 +54,7 @@ impl Lang {
             Lang::De => Some(include_str!("../../locales/de.json")),
             Lang::Zh => Some(include_str!("../../locales/zh-Hans.json")),
             Lang::Ja => Some(include_str!("../../locales/ja.json")),
+            Lang::Pl => Some(include_str!("../../locales/pl.json")),
         }
     }
 
@@ -70,6 +73,7 @@ impl Lang {
             "de" => Lang::De,
             "zh" => Lang::Zh,
             "ja" => Lang::Ja,
+            "pl" => Lang::Pl,
             _ => Lang::En,
         }
     }
@@ -296,6 +300,7 @@ mod tests {
             ("zh-Hans-CN", Lang::Zh),
             ("zh-TW", Lang::Zh),
             ("ja-JP", Lang::Ja),
+            ("pl-PL", Lang::Pl),
             ("en-US", Lang::En),
             ("ko-KR", Lang::En),
             ("", Lang::En),

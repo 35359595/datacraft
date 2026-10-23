@@ -365,7 +365,15 @@
     "Fake name": "ダミーの名前",
     "Fake phone": "ダミーの電話番号",
     "Suggest masking": "マスキングを提案",
-    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "マスキングは決定的です: 同じ値は常に同じマスク値になります。キーはこのコンピューターのキーチェーンに保存されます。"
+    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "マスキングは決定的です: 同じ値は常に同じマスク値になります。キーはこのコンピューターのキーチェーンに保存されます。",
+    "{n} rows copied to {tables} tables": "{n} 行を {tables} 個のテーブルにコピーしました",
+    "Select the key columns the foreign keys need: {columns}": "外部キーに必要なキー列を選択してください: {columns}",
+    "Table {table} not found": "テーブル {table} が見つかりません",
+    "Mask related tables by column name (email, phone, name…)": "関連テーブルを列名でマスクする (メール、電話、名前…)",
+    "Related rows:": "関連する行:",
+    "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "関連テーブルは同じコピー先スキーマに元の名前で入ります。既にある行 (同じ主キー) はスキップされます。",
+    "Rows that reference them (e.g. their orders and order lines)": "それらを参照する行 (例: 注文と注文明細)",
+    "Rows they reference (needed by the foreign keys)": "それらが参照する行 (外部キーに必要)"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "ステートメントが {n} 行に影響しました (想定は 1 行)。何も保存されていません:\n{stmt}",
