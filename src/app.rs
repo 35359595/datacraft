@@ -1414,13 +1414,13 @@ impl DataCraftApp {
     }
 
     /// Reply to a copy: on success the dialog closes and the target is reloaded.
-    fn copy_done(&mut self, request_id: u64, result: Result<u64, String>) {
+    fn copy_done(&mut self, request_id: u64, result: Result<Vec<(String, u64)>, String>) {
         let Some(d) = self.copy.as_mut() else { return };
         if !d.finished(request_id) {
             return;
         }
-        let n = match result {
-            Ok(n) => n,
+        let report = match result {
+            Ok(r) => r,
             Err(e) => {
                 d.error = Some(e);
                 return;
@@ -1429,7 +1429,13 @@ impl DataCraftApp {
         let Some(d) = self.copy.take() else { return };
         self.load_database(d.target, d.target_db.clone());
         self.reload_table_editors(d.target, &d.target_db, &d.target_schema, &d.target_table);
-        self.info(trf("{n} rows copied to “{table}”", &[("n", &n), ("table", &d.target_table)]));
+        let n: u64 = report.iter().map(|(_, n)| n).sum();
+        let msg = if report.len() > 1 {
+            trf("{n} rows copied to {tables} tables", &[("n", &n), ("tables", &report.len())])
+        } else {
+            trf("{n} rows copied to “{table}”", &[("n", &n), ("table", &d.target_table)])
+        };
+        self.info(msg);
     }
 
     /// Demo mode: runs the import as if "Import" had been clicked.

@@ -365,7 +365,15 @@
     "Fake name": "Nome falso",
     "Fake phone": "Telefone falso",
     "Suggest masking": "Sugerir mascaramento",
-    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "O mascaramento é determinístico: o mesmo valor sempre gera o mesmo valor mascarado, com uma chave guardada no chaveiro deste computador."
+    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "O mascaramento é determinístico: o mesmo valor sempre gera o mesmo valor mascarado, com uma chave guardada no chaveiro deste computador.",
+    "{n} rows copied to {tables} tables": "{n} linhas copiadas para {tables} tabelas",
+    "Select the key columns the foreign keys need: {columns}": "Selecione as colunas-chave de que as chaves estrangeiras precisam: {columns}",
+    "Table {table} not found": "Tabela {table} não encontrada",
+    "Mask related tables by column name (email, phone, name…)": "Mascarar as tabelas relacionadas pelo nome da coluna (e-mail, telefone, nome…)",
+    "Related rows:": "Linhas relacionadas:",
+    "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "As tabelas relacionadas vão para o mesmo esquema de destino com o próprio nome; linhas que já existem (mesma chave primária) são ignoradas.",
+    "Rows that reference them (e.g. their orders and order lines)": "Linhas que as referenciam (ex.: seus pedidos e itens de pedido)",
+    "Rows they reference (needed by the foreign keys)": "Linhas que elas referenciam (necessárias para as chaves estrangeiras)"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "A instrução afetou {n} linhas (esperada 1); nada foi salvo:\n{stmt}",

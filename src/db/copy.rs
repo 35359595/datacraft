@@ -2,9 +2,10 @@
 //! filter) to another connection, creating the target table when it doesn't exist. It runs on
 //! dedicated sessions, like the schema search, and inserts in one transaction (all or nothing).
 
-use super::{Cell, ColumnInfo, ConnectionConfig, Driver, Session};
+use super::subset::{self, ForeignKey, TableRows};
+use super::{Cell, ColumnInfo, ConnectionConfig, Driver, SchemaInfo, Session};
 use crate::edit::literal;
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::ui::create_dialog::{NewColumn, create_table_sql};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -38,6 +39,13 @@ pub struct CopyRequest {
     pub masks: Vec<Mask>,
     /// Secret for the deterministic masks (Hash, Email, Name, Phone).
     pub mask_key: String,
+    /// Also copy the rows the copied ones reference through foreign keys (and so on).
+    pub parents: bool,
+    /// Also copy the rows that reference the copied ones (their orders, the orders' lines…);
+    /// implies `parents`.
+    pub children: bool,
+    /// Related tables get the masks suggested by their column names.
+    pub mask_related: bool,
 }
 
 /// Masking rule for a column. Every rule is deterministic: with the same key, the same value
@@ -437,63 +445,187 @@ async fn open(mut cfg: ConnectionConfig, db: &str) -> anyhow::Result<Session> {
 }
 
 /// Runs the copy and returns the rows inserted. A cancel stops it and rolls the target back.
-pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyRequest, cancel: Arc<Notify>) -> anyhow::Result<u64> {
+/// One table to write: the source rows and where they go.
+struct Part {
+    columns: Vec<ColumnInfo>,
+    names: Vec<String>,
+    rows: Vec<Vec<Cell>>,
+    target_table: String,
+    create: bool,
+    clear: bool,
+    /// Leave out the rows whose primary key is already in the target.
+    skip_existing: bool,
+}
+
+/// Rows read from the source: the copied table, plus the related ones (insert order) and their
+/// foreign keys when a subset was asked for.
+async fn read_source(s: &mut Session, from: Driver, req: &CopyRequest) -> anyhow::Result<(Vec<TableRows>, Vec<ForeignKey>)> {
+    let limit = if req.percent >= 100 {
+        None
+    } else {
+        let rs = s.execute(&count_sql(from, &req.source_schema, &req.source_table, &req.filter), 1).await?;
+        let total: u64 = rs
+            .first()
+            .and_then(|r| r.rows.first())
+            .and_then(|r| r.first().cloned().flatten())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        Some((total * u64::from(req.percent)).div_ceil(100))
+    };
+    let sql = select_sql(from, &req.source_schema, &req.source_table, &req.columns, &req.filter, limit);
+    let rs = s.execute(&sql, MAX_ROWS).await?.into_iter().next().unwrap_or_default();
+    if rs.truncated {
+        anyhow::bail!(tr("The table has more than 1,000,000 rows: copy fewer with a filter or a percentage"));
+    }
+    let root = TableRows {
+        schema: req.source_schema.clone(),
+        table: req.source_table.clone(),
+        columns: req.columns.clone(),
+        rows: rs.rows,
+    };
+    if !(req.parents || req.children) {
+        return Ok((vec![root], Vec::new()));
+    }
+    let catalog = s.introspect_database(&req.source_db).await?;
+    let fk_rows = s.execute(&subset::fk_sql(from, &req.source_db, &req.source_schema), MAX_ROWS).await?;
+    let fks = subset::parse_fks(from, &fk_rows.into_iter().next().unwrap_or_default(), &catalog);
+    let missing = subset::missing_key_columns(&fks, &req.source_schema, &req.source_table, &req.columns);
+    if !missing.is_empty() {
+        anyhow::bail!(trf("Select the key columns the foreign keys need: {columns}", &[("columns", &missing.join(", "))]));
+    }
+    let mut tables = subset::collect(s, from, &catalog, &fks, root, req.children).await?;
+    subset::insert_order(&mut tables, &fks);
+    Ok((tables, fks))
+}
+
+/// Masks of each table: the dialog's for the copied one; for the others, those suggested by
+/// their column names (never on key columns) if asked; then made equal along foreign keys.
+fn table_masks(from: Driver, req: &CopyRequest, tables: &[TableRows], fks: &[ForeignKey]) -> Vec<Vec<Mask>> {
+    let mut masks: Vec<Vec<Mask>> = tables
+        .iter()
+        .map(|t| {
+            if t.schema == req.source_schema && t.table == req.source_table {
+                return req.masks.clone();
+            }
+            t.columns
+                .iter()
+                .map(|c| {
+                    let key = c.primary_key || fks.iter().any(|fk| fk.schema == t.schema && fk.table == t.table && fk.columns.contains(&c.name));
+                    let m = Mask::suggest(&c.name);
+                    if req.mask_related && !key && m.allowed(from, c) { m } else { Mask::Keep }
+                })
+                .collect()
+        })
+        .collect();
+    subset::propagate_masks(tables, &mut masks, fks);
+    masks
+}
+
+/// Target tables, by name ignoring case, when the subset needs to know which exist.
+fn find_target<'a>(catalog: &'a [SchemaInfo], schema: &str, table: &str) -> Option<&'a [ColumnInfo]> {
+    let s = catalog.iter().find(|s| s.name.eq_ignore_ascii_case(schema)).or_else(|| (catalog.len() == 1).then(|| &catalog[0]))?;
+    s.tables.iter().find(|t| t.name.eq_ignore_ascii_case(table)).map(|t| t.columns.as_slice())
+}
+
+/// Runs the copy and returns the rows inserted per target table. A cancel stops it and rolls
+/// the target back.
+pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyRequest, cancel: Arc<Notify>) -> anyhow::Result<Vec<(String, u64)>> {
     let (from, to) = (source.driver, target.driver);
     let mut source = source;
     source.read_only = true;
+    let related = req.parents || req.children;
     let cancelled = || anyhow::anyhow!(tr("Copy cancelled"));
 
     let read = async {
         let mut s = open(source, &req.source_db).await?;
-        let limit = if req.percent >= 100 {
-            None
-        } else {
-            let rs = s.execute(&count_sql(from, &req.source_schema, &req.source_table, &req.filter), 1).await?;
-            let total: u64 = rs
-                .first()
-                .and_then(|r| r.rows.first())
-                .and_then(|r| r.first().cloned().flatten())
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-            Some((total * u64::from(req.percent)).div_ceil(100))
-        };
-        let sql = select_sql(from, &req.source_schema, &req.source_table, &req.columns, &req.filter, limit);
-        let rs = s.execute(&sql, MAX_ROWS).await?.into_iter().next().unwrap_or_default();
-        if rs.truncated {
-            anyhow::bail!(tr("The table has more than 1,000,000 rows: copy fewer with a filter or a percentage"));
-        }
-        anyhow::Ok(rs.rows)
+        read_source(&mut s, from, &req).await
     };
-    let rows = tokio::select! {
+    let (mut tables, fks) = tokio::select! {
         _ = cancel.notified() => return Err(cancelled()),
-        rows = read => rows?,
+        r = read => r?,
+    };
+    let masks = table_masks(from, &req, &tables, &fks);
+    for (t, m) in tables.iter_mut().zip(&masks) {
+        mask_rows(from, &t.columns, m, &req.mask_key, &mut t.rows);
+    }
+
+    let schema = if to.flat_schema() && to != Driver::Sqlite { req.target_db.as_str() } else { req.target_schema.as_str() };
+    let prepare = async {
+        let mut t = open(target, &req.target_db).await?;
+        let catalog = if related { t.introspect_database(&req.target_db).await? } else { Vec::new() };
+        let mut parts = Vec::new();
+        for tr in tables {
+            let root = tr.schema == req.source_schema && tr.table == req.source_table;
+            let mut part = if root {
+                Part {
+                    columns: tr.columns,
+                    names: req.target_names.clone(),
+                    rows: tr.rows,
+                    target_table: req.target_table.clone(),
+                    create: req.create,
+                    clear: req.clear,
+                    skip_existing: related && !req.create && !req.clear,
+                }
+            } else {
+                match find_target(&catalog, &req.target_schema, &tr.table) {
+                    // Existing table: only the columns it has, by name.
+                    Some(existing) => {
+                        let keep: Vec<(usize, String)> = tr
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, c)| existing.iter().find(|e| e.name.eq_ignore_ascii_case(&c.name)).map(|e| (i, e.name.clone())))
+                            .collect();
+                        Part {
+                            columns: keep.iter().map(|(i, _)| tr.columns[*i].clone()).collect(),
+                            names: keep.iter().map(|(_, n)| n.clone()).collect(),
+                            rows: tr.rows.iter().map(|r| keep.iter().map(|(i, _)| r[*i].clone()).collect()).collect(),
+                            target_table: tr.table.clone(),
+                            create: false,
+                            clear: false,
+                            skip_existing: true,
+                        }
+                    }
+                    None => Part {
+                        names: tr.columns.iter().map(|c| c.name.clone()).collect(),
+                        columns: tr.columns,
+                        rows: tr.rows,
+                        target_table: tr.table,
+                        create: true,
+                        clear: false,
+                        skip_existing: false,
+                    },
+                }
+            };
+            if part.skip_existing {
+                skip_existing_rows(&mut t, to, schema, &mut part).await?;
+            }
+            parts.push(part);
+        }
+        for p in parts.iter().filter(|p| p.create) {
+            let mut cols = p.columns.clone();
+            for (c, n) in cols.iter_mut().zip(&p.names) {
+                c.name.clone_from(n);
+            }
+            t.execute(&create_sql(from, to, &req.target_schema, &p.target_table, &cols), 0).await?;
+        }
+        anyhow::Ok((t, parts))
+    };
+    let (mut t, parts) = tokio::select! {
+        _ = cancel.notified() => return Err(cancelled()),
+        r = prepare => r?,
     };
 
-    let mut t = tokio::select! {
-        _ = cancel.notified() => return Err(cancelled()),
-        s = open(target, &req.target_db) => s?,
-    };
-    if req.create {
-        let mut cols = req.columns.clone();
-        for (c, n) in cols.iter_mut().zip(&req.target_names) {
-            c.name.clone_from(n);
-        }
-        let ddl = create_sql(from, to, &req.target_schema, &req.target_table, &cols);
-        tokio::select! {
-            _ = cancel.notified() => return Err(cancelled()),
-            r = t.execute(&ddl, 0) => { r?; }
-        }
-    }
-    let schema = if to.flat_schema() && to != Driver::Sqlite { req.target_db.as_str() } else { req.target_schema.as_str() };
-    let table = Session::quote_table(to, schema, &req.target_table);
     let mut statements = Vec::new();
-    if req.clear {
-        statements.push(format!("DELETE FROM {table}"));
+    let mut report = Vec::new();
+    for p in parts {
+        let table = Session::quote_table(to, schema, &p.target_table);
+        if p.clear {
+            statements.push(format!("DELETE FROM {table}"));
+        }
+        report.push((p.target_table, p.rows.len() as u64));
+        statements.extend(insert_sql(from, to, &table, &p.columns, &p.names, p.rows));
     }
-    let mut rows = rows;
-    mask_rows(from, &req.columns, &req.masks, &req.mask_key, &mut rows);
-    let n = rows.len() as u64;
-    statements.extend(insert_sql(from, to, &table, &req.columns, &req.target_names, rows));
     let handle = t.cancel_handle();
     // Dropping the session on a cancel closes it, so the open transaction is rolled back.
     tokio::select! {
@@ -503,8 +635,35 @@ pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyR
             }
             Err(cancelled())
         }
-        r = t.run_transaction(&statements) => r.map(|_| n),
+        r = t.run_transaction(&statements) => r.map(|_| report),
     }
+}
+
+/// Leaves out the rows whose primary key the target table already has (a related customer
+/// copied before, say), so copying again adds what is missing instead of failing.
+async fn skip_existing_rows(t: &mut Session, to: Driver, schema: &str, part: &mut Part) -> anyhow::Result<()> {
+    let pk: Vec<usize> = part.columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(i, _)| i).collect();
+    if pk.is_empty() || part.rows.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = pk.iter().map(|&i| part.names[i].clone()).collect();
+    let keys: Vec<Vec<String>> = part
+        .rows
+        .iter()
+        .filter_map(|r| pk.iter().map(|&i| r[i].clone()).collect::<Option<Vec<_>>>())
+        .collect();
+    let table = Session::quote_table(to, schema, &part.target_table);
+    let mut found = std::collections::HashSet::new();
+    for chunk in subset::key_chunks(&keys) {
+        let rs = t.execute(&subset::existing_key_sql(to, &table, &names, chunk), MAX_ROWS).await?;
+        for row in rs.into_iter().flat_map(|r| r.rows) {
+            found.insert(subset::normalize_key(&row));
+        }
+    }
+    if !found.is_empty() {
+        part.rows.retain(|r| !found.contains(&subset::normalize_key(&pk.iter().map(|&i| r[i].clone()).collect::<Vec<_>>())));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

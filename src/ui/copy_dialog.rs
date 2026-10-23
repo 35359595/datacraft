@@ -31,6 +31,10 @@ pub struct CopyDialog {
     filter: String,
     percent: u8,
     clear: bool,
+    /// Subset: also the rows they reference / the rows that reference them.
+    parents: bool,
+    children: bool,
+    mask_related: bool,
     pub request_id: u64,
     cancel: Option<Arc<Notify>>,
     pub error: Option<String>,
@@ -79,6 +83,9 @@ impl CopyDialog {
             filter: String::new(),
             percent: 100,
             clear: false,
+            parents: false,
+            children: false,
+            mask_related: true,
             request_id: 0,
             cancel: None,
             error: None,
@@ -281,6 +288,26 @@ impl CopyDialog {
                         ui.checkbox(&mut self.clear, tr("Delete the target table's rows first"));
                         ui.end_row();
                     }
+                    ui.label(tr("Related rows:"));
+                    ui.vertical(|ui| {
+                        // The rows that reference them need the ones they reference too.
+                        ui.add_enabled_ui(!self.children, |ui| {
+                            let mut parents = self.parents || self.children;
+                            if ui.checkbox(&mut parents, tr("Rows they reference (needed by the foreign keys)")).changed() {
+                                self.parents = parents;
+                            }
+                        });
+                        ui.checkbox(&mut self.children, tr("Rows that reference them (e.g. their orders and order lines)"));
+                        if self.parents || self.children {
+                            ui.checkbox(&mut self.mask_related, tr("Mask related tables by column name (email, phone, name…)"));
+                            ui.label(
+                                RichText::new(tr("Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped."))
+                                    .small()
+                                    .color(p.muted),
+                            );
+                        }
+                    });
+                    ui.end_row();
                 });
                 ui.add_space(10.0);
                 self.columns_ui(ui, &target, to, &p);
@@ -354,6 +381,9 @@ impl CopyDialog {
                                 clear: self.clear && !creating,
                                 masks: masks.clone(),
                                 mask_key: String::new(),
+                                parents: self.parents || self.children,
+                                children: self.children,
+                                mask_related: self.mask_related && (self.parents || self.children),
                             })));
                         }
                     });

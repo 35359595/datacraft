@@ -365,7 +365,15 @@
     "Fake name": "虚构姓名",
     "Fake phone": "虚构电话",
     "Suggest masking": "建议脱敏",
-    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "脱敏是确定性的：相同的值总是得到相同的脱敏值，使用保存在本机钥匙串中的密钥。"
+    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "脱敏是确定性的：相同的值总是得到相同的脱敏值，使用保存在本机钥匙串中的密钥。",
+    "{n} rows copied to {tables} tables": "已将 {n} 行复制到 {tables} 个表",
+    "Select the key columns the foreign keys need: {columns}": "请选择外键需要的键列：{columns}",
+    "Table {table} not found": "找不到表 {table}",
+    "Mask related tables by column name (email, phone, name…)": "按列名对关联表脱敏（邮箱、电话、姓名…）",
+    "Related rows:": "关联行：",
+    "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "关联表以原名放入同一个目标架构；已存在的行（主键相同）会被跳过。",
+    "Rows that reference them (e.g. their orders and order lines)": "引用它们的行（例如它们的订单和订单明细）",
+    "Rows they reference (needed by the foreign keys)": "它们引用的行（外键所需）"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "该语句影响了 {n} 行（预期为 1 行）；未保存任何内容：\n{stmt}",
