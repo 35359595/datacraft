@@ -887,17 +887,27 @@ pub fn csv_escape(value: &str) -> String {
 }
 
 pub fn to_csv(view: &ResultView) -> String {
+    let rows: Vec<&Vec<Cell>> = view.order.iter().filter_map(|&r| view.rs.rows.get(r)).collect();
+    csv_text(&view.rs.columns, &rows)
+}
+
+fn csv_text(columns: &[String], rows: &[&Vec<Cell>]) -> String {
     let mut out = String::new();
-    out.push_str(&view.rs.columns.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(","));
+    out.push_str(&columns.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(","));
     out.push_str("\r\n");
-    for &r in &view.order {
-        if let Some(row) = view.rs.rows.get(r) {
-            let line: Vec<String> = row.iter().map(|c| c.as_deref().map(csv_escape).unwrap_or_default()).collect();
-            out.push_str(&line.join(","));
-            out.push_str("\r\n");
-        }
+    for row in rows {
+        let line: Vec<String> = row.iter().map(|c| c.as_deref().map(csv_escape).unwrap_or_default()).collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
     }
     out
+}
+
+/// Masking for an export: one rule per result column, and the key of the deterministic ones.
+#[derive(Clone, Copy)]
+pub struct ExportMasks<'a> {
+    pub masks: &'a [crate::db::copy::Mask],
+    pub key: &'a str,
 }
 
 /// Extraction formats (DataGrip's "CSV ⌄" selector).
@@ -957,10 +967,23 @@ fn json_string(v: &str) -> String {
 /// Visible rows (current filter and order) as text in `fmt`. `insert_target` is the already
 /// quoted table for "SQL Inserts".
 pub fn format_rows(view: &ResultView, fmt: ExportFormat, insert_target: &str) -> String {
+    format_rows_masked(view, fmt, insert_target, None)
+}
+
+/// `format_rows` with each column's mask applied to the values (never to the grid).
+pub fn format_rows_masked(view: &ResultView, fmt: ExportFormat, insert_target: &str, masks: Option<ExportMasks>) -> String {
     let cols = &view.rs.columns;
-    let rows: Vec<&Vec<Cell>> = view.order.iter().filter_map(|&r| view.rs.rows.get(r)).collect();
+    let mut owned: Vec<Vec<Cell>> = view.order.iter().filter_map(|&r| view.rs.rows.get(r).cloned()).collect();
+    if let Some(m) = masks {
+        for row in &mut owned {
+            for (cell, mask) in row.iter_mut().zip(m.masks) {
+                *cell = mask.apply(m.key.as_bytes(), cell.take(), None);
+            }
+        }
+    }
+    let rows: Vec<&Vec<Cell>> = owned.iter().collect();
     match fmt {
-        ExportFormat::Csv => to_csv(view),
+        ExportFormat::Csv => csv_text(cols, &rows),
         ExportFormat::Tsv => {
             let clean = |v: &str| v.replace(['\t', '\n', '\r'], " ");
             let mut out = cols.iter().map(|c| clean(c)).collect::<Vec<_>>().join("\t");
@@ -1011,7 +1034,7 @@ pub fn format_rows(view: &ResultView, fmt: ExportFormat, insert_target: &str) ->
 }
 
 /// Saves the visible rows to a file chosen by the user. Ok(false) if cancelled.
-pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str, base_name: &str) -> Result<bool, String> {
+pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str, base_name: &str, masks: Option<ExportMasks>) -> Result<bool, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title(trf("Export to {format}", &[("format", &fmt.label())]))
         .add_filter(fmt.label(), &[fmt.extension()])
@@ -1020,7 +1043,7 @@ pub fn export_to_file(view: &ResultView, fmt: ExportFormat, insert_target: &str,
     else {
         return Ok(false);
     };
-    std::fs::write(&path, format_rows(view, fmt, insert_target)).map(|_| true).map_err(|e| e.to_string())
+    std::fs::write(&path, format_rows_masked(view, fmt, insert_target, masks)).map(|_| true).map_err(|e| e.to_string())
 }
 
 pub fn export_csv(view: &ResultView) -> Result<bool, String> {
@@ -3064,6 +3087,22 @@ mod export_tests {
             ..Default::default()
         };
         ResultView::new(rs, 1)
+    }
+
+    #[test]
+    fn masked_exports_leave_the_grid_alone() {
+        use crate::db::copy::Mask;
+        let v = view();
+        let masks = [Mask::Keep, Mask::Email];
+        let m = Some(ExportMasks { masks: &masks, key: "k" });
+        let csv = format_rows_masked(&v, ExportFormat::Csv, "", m);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "id,note");
+        assert!(lines[1].starts_with("1,user_") && lines[1].ends_with("@example.com"), "{csv}");
+        assert_eq!(lines[2], "2,");
+        assert_eq!(format_rows_masked(&v, ExportFormat::Csv, "", m), csv);
+        assert_eq!(v.rs.rows[0][1].as_deref(), Some("a \"b\"\tc|d"));
+        assert_eq!(format_rows_masked(&v, ExportFormat::Tsv, "", None), format_rows(&v, ExportFormat::Tsv, ""));
     }
 
     #[test]

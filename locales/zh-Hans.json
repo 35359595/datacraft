@@ -373,7 +373,14 @@
     "Related rows:": "关联行：",
     "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "关联表以原名放入同一个目标架构；已存在的行（主键相同）会被跳过。",
     "Rows that reference them (e.g. their orders and order lines)": "引用它们的行（例如它们的订单和订单明细）",
-    "Rows they reference (needed by the foreign keys)": "它们引用的行（外键所需）"
+    "Rows they reference (needed by the foreign keys)": "它们引用的行（外键所需）",
+    "Masked export saved": "已保存脱敏导出",
+    "Masked rows copied to the clipboard": "已将脱敏后的行复制到剪贴板",
+    "Export with Masking…": "脱敏导出…",
+    "Export with Masking": "脱敏导出",
+    "Format:": "格式：",
+    "Masked columns: {n}": "脱敏列：{n}",
+    "The grid keeps the real values; only the exported text is masked.": "网格保留真实值；只对导出的文本脱敏。"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "该语句影响了 {n} 行（预期为 1 行）；未保存任何内容：\n{stmt}",

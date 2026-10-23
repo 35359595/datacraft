@@ -373,7 +373,14 @@
     "Related rows:": "関連する行:",
     "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "関連テーブルは同じコピー先スキーマに元の名前で入ります。既にある行 (同じ主キー) はスキップされます。",
     "Rows that reference them (e.g. their orders and order lines)": "それらを参照する行 (例: 注文と注文明細)",
-    "Rows they reference (needed by the foreign keys)": "それらが参照する行 (外部キーに必要)"
+    "Rows they reference (needed by the foreign keys)": "それらが参照する行 (外部キーに必要)",
+    "Masked export saved": "マスクしたエクスポートを保存しました",
+    "Masked rows copied to the clipboard": "マスクした行をクリップボードにコピーしました",
+    "Export with Masking…": "マスキングしてエクスポート…",
+    "Export with Masking": "マスキングしてエクスポート",
+    "Format:": "形式:",
+    "Masked columns: {n}": "マスクする列: {n}",
+    "The grid keeps the real values; only the exported text is masked.": "グリッドは実際の値のままです。マスクされるのはエクスポートしたテキストだけです。"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "ステートメントが {n} 行に影響しました (想定は 1 行)。何も保存されていません:\n{stmt}",
