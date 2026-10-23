@@ -10,12 +10,14 @@ DataGrip-style database client for macOS and Windows (Islands theme), written in
   `private_key_file` driver property, as in DataGrip), OAuth or programmatic access token authentication,
   with role, database, schema and warehouse per data source.
 - **Database Explorer:** every database on the server (loaded on expand), schemas, tables, views, columns and primary keys.
+- **Object browser:** click a database, schema, tables or views folder to browse its objects in a [list or grid](docs/object-browser.md), with a selection information pane on the right.
 Shortcuts are written with ⌘ / ⌥ (macOS); on Windows use Ctrl / Alt.
 
 - **SQL consoles:** highlighting, autocompletion, ⌘↩ (statement under the cursor or selection) and ⌘⇧↩ (everything; `GO` batches on SQL Server). Each console runs against the database you pick.
   Reformat code (⌥⌘L), comment lines (⌘/), duplicate / delete line, find and replace, query history (⌥⌘E),
   explain plan (⇧⌘E) and cancel the running query.
 - **Table data editor:** WHERE / ORDER BY filters, per-column value and text filters, in-place editing (update, insert, delete, clone rows) with a preview of the generated SQL, saved in a single transaction. Record view (⇧↩).
+  [Keyboard navigation and multi-cell editing](docs/table-editor.md) include arrow keys, Shift/Ctrl selections, column selection, clipboard matrices, Tab, Ctrl+Enter, Ctrl+N and Ctrl+Delete, with optional **Save on row change** (off by default).
 - **Database objects:** create, rename, truncate and drop databases and tables; import CSV / TSV files into a table.
 - **Read-only data sources:** only queries run; editing and DDL are disabled.
 - **Export:** results to CSV, TSV, JSON, SQL `INSERT`s or Markdown, to the clipboard or a file.
@@ -86,12 +88,14 @@ Cliente de bases de datos para macOS y Windows al estilo de DataGrip (tema Islan
   claves (la propiedad `private_key_file` del controlador, como en DataGrip), OAuth o token de acceso
   programático, con rol, base de datos, esquema y almacén por fuente de datos.
 - **Database Explorer:** todas las bases del servidor (se cargan al expandirlas), esquemas, tablas, vistas, columnas y claves primarias.
+- **Explorador de objetos:** haz clic en una base, esquema o carpeta de tablas/vistas para ver sus objetos en [lista o cuadrícula](docs/object-browser.md), con información de la selección a la derecha.
 Los atajos se indican con ⌘ / ⌥ (macOS); en Windows son Ctrl / Alt.
 
 - **Consolas SQL:** resaltado, autocompletado, ⌘↩ (sentencia bajo el cursor o selección) y ⌘⇧↩ (todo; lotes `GO` en SQL Server). Cada consola ejecuta en la base que elijas.
   Formatear código (⌥⌘L), comentar líneas (⌘/), duplicar / borrar línea, buscar y reemplazar, historial de consultas (⌥⌘E),
   plan de ejecución (⇧⌘E) y cancelar la consulta en curso.
 - **Editor de datos de tabla:** filtros WHERE / ORDER BY, filtros de valores y de texto por columna, edición en el sitio (modificar, insertar, borrar y clonar filas) con vista previa del SQL generado, que se guarda en una sola transacción. Vista de registro (⇧↩).
+  La [navegación y edición de varias celdas](docs/table-editor.md) incluye flechas, selecciones con Shift/Ctrl, selección de columnas, matrices del portapapeles, Tab, Ctrl+Enter, Ctrl+N y Ctrl+Supr, con **Guardar al cambiar de fila** opcional (desactivado por defecto).
 - **Objetos de la base:** crear, renombrar, vaciar y eliminar bases de datos y tablas; importar ficheros CSV / TSV a una tabla.
 - **Data sources de solo lectura:** solo se ejecutan consultas; la edición y el DDL quedan desactivados.
 - **Exportación:** resultados a CSV, TSV, JSON, `INSERT`s SQL o Markdown, al portapapeles o a un fichero.

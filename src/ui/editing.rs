@@ -112,6 +112,29 @@ impl EditState {
         *self = Self::default();
     }
 
+    /// Discard just the active record, leaving other pending edits intact.
+    pub fn revert_row(&mut self, row: RowRef) {
+        let changed = match row {
+            RowRef::Existing(r) => {
+                self.deleted.contains(&r) || self.changes.keys().any(|(i, _)| *i == r)
+            }
+            RowRef::New(i) => i < self.inserted.len(),
+        };
+        if !changed {
+            return;
+        }
+        self.checkpoint();
+        match row {
+            RowRef::Existing(r) => {
+                self.changes.retain(|(i, _), _| *i != r);
+                self.deleted.remove(&r);
+            }
+            RowRef::New(i) => {
+                self.inserted.remove(i);
+            }
+        }
+    }
+
     /// Current value of a cell. `None` = untouched cell of a new row (DEFAULT).
     pub fn current(&self, rs: &ResultSet, row: RowRef, col: usize) -> Option<Cell> {
         match row {
@@ -162,14 +185,53 @@ impl EditState {
     /// Sets a value. If it matches the original, the cell is no longer modified.
     /// Returns true if anything changed.
     pub fn set_value(&mut self, rs: &ResultSet, row: RowRef, col: usize, value: Cell) -> bool {
+        self.set_value_recorded(rs, row, col, value, true)
+    }
+
+    /// A multi-cell edit is one undoable action, with the usual per-cell guards.
+    pub fn set_values(
+        &mut self,
+        rs: &ResultSet,
+        target: &EditTarget,
+        values: Vec<(RowRef, usize, Cell)>,
+    ) -> bool {
+        let values: Vec<_> = values
+            .into_iter()
+            .filter(|(row, col, value)| {
+                self.cell_editable(rs, target, *row, *col)
+                    && self.current(rs, *row, *col) != Some(value.clone())
+            })
+            .collect();
+        if values.is_empty() {
+            return false;
+        }
+        self.checkpoint();
+        for (row, col, value) in values {
+            self.set_value_recorded(rs, row, col, value, false);
+        }
+        true
+    }
+
+    fn set_value_recorded(
+        &mut self,
+        rs: &ResultSet,
+        row: RowRef,
+        col: usize,
+        value: Cell,
+        record: bool,
+    ) -> bool {
         match row {
             RowRef::Existing(r) => {
-                let Some(original) = rs.rows.get(r).and_then(|x| x.get(col)) else { return false };
+                let Some(original) = rs.rows.get(r).and_then(|x| x.get(col)) else {
+                    return false;
+                };
                 let current = self.changes.get(&(r, col)).unwrap_or(original);
                 if *current == value {
                     return false;
                 }
-                self.checkpoint();
+                if record {
+                    self.checkpoint();
+                }
                 if *original == value {
                     self.changes.remove(&(r, col));
                 } else {
@@ -178,11 +240,15 @@ impl EditState {
                 true
             }
             RowRef::New(i) => {
-                let Some(slot) = self.inserted.get(i).and_then(|x| x.get(col)) else { return false };
+                let Some(slot) = self.inserted.get(i).and_then(|x| x.get(col)) else {
+                    return false;
+                };
                 if slot.as_ref() == Some(&value) {
                     return false;
                 }
-                self.checkpoint();
+                if record {
+                    self.checkpoint();
+                }
                 if let Some(slot) = self.inserted.get_mut(i).and_then(|x| x.get_mut(col)) {
                     *slot = Some(value);
                 }

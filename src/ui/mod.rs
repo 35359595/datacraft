@@ -8,6 +8,7 @@ pub mod import_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;
+pub mod object_browser;
 pub mod results;
 pub mod theme;
 

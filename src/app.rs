@@ -244,6 +244,7 @@ pub struct DataCraftApp {
     console_counter: u64,
     result_salt: u64,
     explorer: ExplorerState,
+    object_browser: crate::ui::object_browser::ObjectBrowser,
     dialog: Option<ConnectionDialog>,
     confirm_delete: Option<ConnId>,
     /// "New Database" / "New Table" dialog.
@@ -318,6 +319,7 @@ impl DataCraftApp {
             console_counter: persisted.console_counter,
             result_salt: 0,
             explorer: ExplorerState::default(),
+            object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             dialog: None,
             confirm_delete: None,
             create: None,
@@ -426,6 +428,7 @@ impl DataCraftApp {
 
     /// Creates a console and activates it. Returns its index.
     fn new_console(&mut self, conn: Option<ConnId>, title: Option<String>, text: String) -> usize {
+        self.object_browser.active = false;
         let id = self.alloc_console_id();
         let title = title.unwrap_or_else(|| {
             self.console_counter += 1;
@@ -674,6 +677,12 @@ impl DataCraftApp {
                         }
                     }
                     self.recheck_edit_targets(conn);
+                    if self.object_browser.active && let Some(t) = self.object_browser.selected.clone().filter(|t| t.conn == conn && t.db == db) {
+                        self.inspect_object(t, false);
+                    }
+                    if self.object_browser.active && self.object_browser.scope.as_ref().is_some_and(|scope| scope.conn == conn && scope.db == db) {
+                        self.load_object_catalog();
+                    }
                 }
                 Response::Executed { console, results, error, elapsed } => {
                     self.result_salt += 1;
@@ -684,6 +693,8 @@ impl DataCraftApp {
                     self.attach_edit_targets(console);
                     self.apply_demo_edit(console);
                 }
+                Response::ObjectInfo { conn, request_id, result } => self.object_browser.receive(conn, request_id, result.map(|info| *info)),
+                Response::ObjectCatalog { conn, request_id, result } => self.object_browser.receive_catalog(conn, request_id, result),
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
             }
@@ -806,7 +817,7 @@ impl DataCraftApp {
 
     /// Saves the pending changes without showing the SQL (that's what Preview is for).
     fn submit_now(&mut self, idx: usize, view: usize) {
-        self.prepare_changes(idx, view, false);
+        if !self.prepare_changes(idx, view, false) { return; }
         match self.preview.as_ref() {
             Some(pv) if !pv.visible => match pv.error.clone() {
                 Some(err) => {
@@ -827,13 +838,17 @@ impl DataCraftApp {
         }
     }
 
-    fn prepare_changes(&mut self, idx: usize, view: usize, visible: bool) {
-        let Some(c) = self.consoles.get_mut(idx) else { return };
-        let Some(v) = c.results.get_mut(view) else { return };
+    fn prepare_changes(&mut self, idx: usize, view: usize, visible: bool) -> bool {
+        if self.preview.as_ref().is_some_and(|p| p.applying) {
+            self.error(tr("Another save is in progress; try again when it finishes"));
+            return false;
+        }
+        let Some(c) = self.consoles.get_mut(idx) else { return false };
+        let Some(v) = c.results.get_mut(view) else { return false };
         v.finish_inline_edit();
-        let Some(e) = v.edit.as_ref() else { return };
+        let Some(e) = v.edit.as_ref() else { return false };
         if !e.state.is_dirty() {
-            return;
+            return false;
         }
         let driver = c.conn.and_then(|id| self.conns.iter().find(|x| x.cfg.id == id)).map(|x| x.cfg.driver).unwrap_or(Driver::Postgres);
         let (statements, error) = match e.state.build_changes(&v.rs, &e.target) {
@@ -841,6 +856,7 @@ impl DataCraftApp {
             Err(err) => (Vec::new(), Some(err)),
         };
         self.preview = Some(PreviewState { console: c.id, view, statements, error, applying: false, visible });
+        true
     }
 
     /// Sends the preview's changes in a transaction.
@@ -892,12 +908,13 @@ impl DataCraftApp {
                 c.log.push(OutputEntry { time: now(), statement: String::new(), message: msg.clone(), is_error: false });
                 let vi = preview_view.or_else(|| c.edit_view_index());
                 if let Some(v) = vi.and_then(|i| c.results.get_mut(i)) {
-                    v.discard_edits();
+                    v.mark_saved();
                 }
                 self.info(msg);
                 // Reloads that tab's data.
                 let c = &mut self.consoles[idx];
                 if c.table.is_some() {
+                    c.replace_view = vi;
                     self.reload_table(idx);
                 } else if let Some(i) = vi
                     && let Some(stmt) = c.results.get(i).map(|v| v.rs.statement.clone())
@@ -1087,6 +1104,7 @@ impl DataCraftApp {
 
     /// Opens (or activates) a table's data editor.
     fn open_table(&mut self, t: &TableRef) {
+        self.object_browser.active = false;
         let default_db = self.conn(t.conn).and_then(|c| c.default_db()).map(str::to_string);
         if let Some(i) = self.consoles.iter().position(|c| {
             c.conn == Some(t.conn)
@@ -1209,12 +1227,77 @@ impl DataCraftApp {
                         self.connect(id);
                     }
                 }
+                ExplorerAction::BrowseObjects(scope) => {
+                    self.explorer.selected_table = None;
+                    if self.object_browser.open(scope) { self.load_object_catalog(); }
+                }
+                ExplorerAction::InspectObject(t, kind) => {
+                    let changed = self.object_browser.open(crate::ui::object_browser::ObjectScope {
+                        conn: t.conn, db: t.db.clone(), schema: Some(t.schema.clone()), kind: Some(kind),
+                    });
+                    if changed { self.load_object_catalog(); }
+                    self.inspect_object(t, false);
+                }
                 ExplorerAction::OpenTable(t) => self.open_table(&t),
                 ExplorerAction::GenerateSelect(t) => self.generate(ctx, &t, Generate::Select),
                 ExplorerAction::GenerateInsert(t) => self.generate(ctx, &t, Generate::Insert),
                 ExplorerAction::GenerateDdl(t) => self.generate(ctx, &t, Generate::Ddl),
                 ExplorerAction::Hide => self.show_explorer = false,
             }
+        }
+    }
+
+    fn load_object_catalog(&mut self) {
+        let Some(scope) = self.object_browser.scope.clone() else {
+            return;
+        };
+        if self.conn(scope.conn).is_some_and(|c| {
+            c.status == ConnStatus::Connected && c.schemas(Some(&scope.db)).is_none()
+        }) {
+            return;
+        }
+        let id = self.object_browser.start_catalog_request();
+        if self
+            .conn(scope.conn)
+            .is_some_and(|c| c.status == ConnStatus::Connected)
+        {
+            self.worker.send(Request::ObjectCatalog {
+                conn: scope.conn,
+                db: scope.db,
+                schema: scope.schema,
+                request_id: id,
+            });
+        } else {
+            self.object_browser.receive_catalog(
+                scope.conn,
+                id,
+                Err(tr("Connect to load current object information").into()),
+            );
+        }
+    }
+
+    fn inspect_object(&mut self, table: TableRef, count_rows: bool) {
+        let connected = self
+            .conn(table.conn)
+            .is_some_and(|c| c.status == ConnStatus::Connected);
+        let request_id = self.object_browser.start_request(table.clone());
+        self.explorer.selected_table = Some(table.clone());
+        self.explorer.selected = Some(explorer::table_key(&table));
+        if connected {
+            self.worker.send(Request::ObjectInfo {
+                conn: table.conn,
+                db: table.db,
+                schema: table.schema,
+                table: table.table,
+                request_id,
+                count_rows,
+            });
+        } else {
+            self.object_browser.receive(
+                table.conn,
+                request_id,
+                Err(tr("Connect to load current object information").into()),
+            );
         }
     }
 
@@ -1545,6 +1628,11 @@ impl DataCraftApp {
     }
 
     fn new_console_here(&mut self) {
+        if self.object_browser.active && let Some(scope) = self.object_browser.scope.clone() {
+            let i = self.new_console(Some(scope.conn), None, String::new());
+            self.consoles[i].db = Some(scope.db);
+            return;
+        }
         let (conn, db) = match self.consoles.get(self.active).filter(|c| c.conn.is_some()) {
             Some(c) => (c.conn, c.db.clone()),
             None => (self.conns.first().map(|c| c.cfg.id), None),
@@ -1585,15 +1673,16 @@ impl DataCraftApp {
         if self.modal_open() {
             return;
         }
-        let in_table = self.consoles.get(self.active).is_some_and(|c| c.table.is_some());
+        let in_objects = self.object_browser.active;
+        let in_table = !in_objects && self.consoles.get(self.active).is_some_and(|c| c.table.is_some());
         let (run_all, run, new_console, reload, quit, save) = ctx.input_mut(|i| {
-            let run_all = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
-            let run = i.consume_key(Modifiers::COMMAND, Key::Enter);
+            let run_all = !in_objects && !in_table && i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter);
+            let run = !in_objects && !in_table && i.consume_key(Modifiers::COMMAND, Key::Enter);
             let new_console = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N);
             // In a console ⌘R is "Replace" (handled by the editor).
             let reload = in_table && i.consume_key(Modifiers::COMMAND, Key::R);
             let quit = i.consume_key(Modifiers::COMMAND, Key::Q);
-            let save = i.consume_key(Modifiers::COMMAND, Key::S);
+            let save = !in_objects && i.consume_key(Modifiers::COMMAND, Key::S);
             (run_all, run, new_console, reload, quit, save)
         });
         if run_all {
@@ -1660,11 +1749,14 @@ impl DataCraftApp {
                 M::NewConnection if !modal => self.open_new_connection_dialog(),
                 M::NewConsole if !modal => self.new_console_here(),
                 M::OpenSql if !modal => self.open_sql_file(),
-                M::SaveSqlAs if !modal => self.save_console_as(),
+                M::SaveSqlAs if !modal && !self.object_browser.active => self.save_console_as(),
+                M::CloseTab if !modal && self.object_browser.active => self.object_browser.active = false,
                 M::CloseTab if !modal && !self.consoles.is_empty() => self.close_console(self.active),
                 // In a console: find in the editor; elsewhere: filter the explorer.
                 M::Find => {
-                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                    if self.object_browser.active {
+                        ctx.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
+                    } else if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
                         c.open_find(false);
                     } else {
                         self.show_explorer = true;
@@ -1681,12 +1773,14 @@ impl DataCraftApp {
                 M::FontBigger => self.font_size = (self.font_size + 1.0).min(32.0),
                 M::FontSmaller => self.font_size = (self.font_size - 1.0).max(8.0),
                 M::FontReset => self.font_size = DEFAULT_FONT_SIZE,
-                M::Run if !modal => self.run_console(self.active, false),
-                M::RunAll if !modal => self.run_console(self.active, true),
-                M::SaveChanges if !modal => self.save_active_changes(),
+                M::Run if !modal && !self.object_browser.active => self.run_console(self.active, false),
+                M::RunAll if !modal && !self.object_browser.active => self.run_console(self.active, true),
+                M::SaveChanges if !modal && !self.object_browser.active => self.save_active_changes(),
                 // ⌘R: reload in the data editor, replace in a console (like DataGrip).
                 M::Reload if !modal => {
-                    if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
+                    if self.object_browser.active {
+                        if let Some(scope) = &self.object_browser.scope { self.load_database(scope.conn, scope.db.clone()); }
+                    } else if let Some(c) = self.consoles.get_mut(self.active).filter(|c| c.table.is_none()) {
                         c.open_find(true);
                     } else {
                         self.reload_active();
@@ -1719,7 +1813,7 @@ impl DataCraftApp {
                 ui.close();
                 self.open_sql_file();
             }
-            let can_save = self.consoles.get(self.active).is_some_and(|c| c.table.is_none());
+            let can_save = !self.object_browser.active && self.consoles.get(self.active).is_some_and(|c| c.table.is_none());
             if ui.add_enabled(can_save, egui::Button::new(tr("Save console as .sql…"))).clicked() {
                 ui.close();
                 self.save_console_as();
@@ -1850,13 +1944,14 @@ impl DataCraftApp {
             egui::Popup::menu(&resp).show(|ui| self.app_menu(ui));
 
             // Active tab's connection selector.
-            let current = self.consoles.get(self.active).and_then(|c| c.conn).and_then(|id| self.conn(id));
-            let active_db = self.consoles.get(self.active).and_then(|c| c.db.clone());
+            let object_scope = self.object_browser.scope.as_ref().filter(|_| self.object_browser.active);
+            let current = object_scope.map(|s| s.conn).or_else(|| self.consoles.get(self.active).and_then(|c| c.conn)).and_then(|id| self.conn(id));
+            let active_db = object_scope.map(|s| s.db.clone()).or_else(|| self.consoles.get(self.active).and_then(|c| c.db.clone()));
             let (ico, label) = match current {
                 Some(c) => (Ico::Driver(c.cfg.driver), c.summary().label(active_db.as_deref())),
                 None => (Ico::Database, tr("No connection").into()),
             };
-            let busy = self.consoles.get(self.active).is_some_and(|c| c.is_busy() || c.table.is_some());
+            let busy = self.object_browser.active || self.consoles.get(self.active).is_some_and(|c| c.is_busy() || c.table.is_some());
             let resp = theme::flat_button(ui, Some(ico), &label, FontId::proportional(13.0), true, true)
                 .on_hover_text(tr("Data source of the active tab"));
             let mut chosen = None;
@@ -2142,6 +2237,10 @@ impl DataCraftApp {
                 egui::ScrollArea::horizontal().id_salt("editor_tabs").max_width(scroll_w).show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
+                        if self.object_browser.scope.is_some() {
+                            let (response, _) = theme::tab(ui, self.object_browser.active, Some(Ico::Folder), tr("Objects"), false);
+                            if response.clicked() { self.object_browser.active = true; }
+                        }
                         for (i, c) in self.consoles.iter().enumerate() {
                             if let Some((id, name)) = self.renaming.as_mut()
                                 && *id == c.id
@@ -2170,7 +2269,7 @@ impl DataCraftApp {
                             } else {
                                 c.title.clone()
                             };
-                            let (resp, closed) = theme::tab(ui, i == self.active, Some(ico), &title, true);
+                            let (resp, closed) = theme::tab(ui, !self.object_browser.active && i == self.active, Some(ico), &title, true);
                             if closed {
                                 close = Some(i);
                             } else if resp.clicked() {
@@ -2227,6 +2326,7 @@ impl DataCraftApp {
         }
         if let Some(i) = activate {
             self.active = i;
+            self.object_browser.active = false;
         }
         if start_rename.is_some() {
             self.renaming = start_rename;
@@ -2245,6 +2345,22 @@ impl DataCraftApp {
 
     fn central(&mut self, ui: &mut Ui) {
         let p = palette(self.dark);
+        if self.object_browser.active {
+            let mut actions = Vec::new();
+            theme::island_frame(&p).show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                self.editor_tabs(ui);
+                separator(ui, p.island_border);
+                actions = self.object_browser.show(ui, &self.conns);
+            });
+            for action in actions {
+                match action {
+                    crate::ui::object_browser::BrowserAction::Explorer(action) => self.handle_explorer(ui.ctx(), vec![action]),
+                    crate::ui::object_browser::BrowserAction::Inspect { table, count_rows } => self.inspect_object(table, count_rows),
+                }
+            }
+            return;
+        }
         // Deferred loading of restored data editors.
         if let Some(c) = self.consoles.get(self.active)
             && c.table.as_ref().is_some_and(|t| !t.loaded)
@@ -2878,11 +2994,7 @@ fn apply_execution(
         && results_in.len() == 1
         && let Some(rs) = results_in.first().cloned()
     {
-        let title = std::mem::take(&mut c.results[i].title);
-        c.results[i] = ResultView::new(rs, salt * 1000);
-        if !title.is_empty() {
-            c.results[i].title = title;
-        }
+        c.results[i].refresh(rs);
         c.result_tab = ResultTab::Result(i);
         return;
     }

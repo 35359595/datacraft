@@ -5,6 +5,7 @@ use crate::app::{ConnState, ConnStatus};
 use crate::db::{DatabaseInfo, ObjectKind, SchemaInfo, TableInfo};
 use crate::i18n::tr;
 use crate::ui::icons::{self, Ico};
+use crate::ui::object_browser::ObjectScope;
 use crate::ui::theme::{self, pal};
 use crate::worker::ConnId;
 use egui::{FontId, Rect, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2};
@@ -57,6 +58,8 @@ pub enum ExplorerAction {
     RenameTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
+    BrowseObjects(ObjectScope),
+    InspectObject(TableRef, ObjectKind),
     OpenTable(TableRef),
     GenerateSelect(TableRef),
     GenerateInsert(TableRef),
@@ -541,6 +544,17 @@ fn database_rows(
         }
     }
     let db_name = d.name.clone();
+    if row.resp.clicked() {
+        actions.push(ExplorerAction::BrowseObjects(ObjectScope {
+            conn: id,
+            db: db_name.clone(),
+            schema: None,
+            kind: None,
+        }));
+        if d.schemas.is_none() && !loading && matches!(c.status, ConnStatus::Connected) {
+            actions.push(ExplorerAction::LoadDatabase(id, db_name.clone()));
+        }
+    }
     row.resp.context_menu(|ui| {
         if ui.button(tr("New Console")).clicked() {
             actions.push(ExplorerAction::NewConsole(id, Some(db_name.clone())));
@@ -641,6 +655,14 @@ fn schema_rows(
             label_color: None,
         },
     );
+    if row.resp.clicked() {
+        actions.push(ExplorerAction::BrowseObjects(ObjectScope {
+            conn,
+            db: db.to_string(),
+            schema: Some(s.name.clone()),
+            kind: None,
+        }));
+    }
     row.resp.context_menu(|ui| {
         if ui.button(tr("New Table…")).clicked() {
             actions.push(ExplorerAction::NewTable { conn, db: db.to_string(), schema: Some(s.name.clone()) });
@@ -685,7 +707,7 @@ fn object_groups(
     let filtering = !filter.is_empty();
     for (kind, label, gk) in [(ObjectKind::Table, "tables", "t"), (ObjectKind::View, "views", "v")] {
         let tables: Vec<&TableInfo> = s.tables.iter().filter(|t| t.kind == kind && table_matches(t, filter)).collect();
-        if tables.is_empty() {
+        if filtering && tables.is_empty() {
             continue;
         }
         let gkey = format!("g:{conn}:{db}:{}:{gk}", s.name);
@@ -707,6 +729,15 @@ fn object_groups(
                 label_color: None,
             },
         );
+        if row.resp.clicked() {
+            state.selected_table = None;
+            actions.push(ExplorerAction::BrowseObjects(ObjectScope {
+                conn,
+                db: db.to_string(),
+                schema: Some(s.name.clone()),
+                kind: Some(kind),
+            }));
+        }
         if kind == ObjectKind::Table {
             row.resp.context_menu(|ui| {
                 if ui.button(tr("New Table…")).clicked() {
@@ -756,6 +787,7 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
     );
     if row.resp.clicked() || row.resp.secondary_clicked() {
         state.selected_table = Some(tref.clone());
+        actions.push(ExplorerAction::InspectObject(tref.clone(), t.kind));
     }
     if row.resp.double_clicked() {
         actions.push(ExplorerAction::OpenTable(tref.clone()));

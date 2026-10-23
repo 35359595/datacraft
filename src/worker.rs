@@ -25,7 +25,24 @@ pub enum Request {
     /// Lists the databases again and reloads the default one.
     Refresh(ConnId),
     /// Loads (or reloads) the schema of a specific database.
-    LoadDatabase { conn: ConnId, db: String },
+    LoadDatabase {
+        conn: ConnId,
+        db: String,
+    },
+    ObjectInfo {
+        conn: ConnId,
+        db: String,
+        schema: String,
+        table: String,
+        request_id: u64,
+        count_rows: bool,
+    },
+    ObjectCatalog {
+        conn: ConnId,
+        db: String,
+        schema: Option<String>,
+        request_id: u64,
+    },
     /// Runs statements in order; stops at the first error.
     /// `db`: database to run them in (`None` = the connection's default database).
     Execute {
@@ -60,8 +77,25 @@ pub enum Response {
     TestResult { conn: ConnId, result: Result<Option<String>, String> },
     Disconnected(ConnId),
     /// Reply to `Refresh`: same shape as `Connected`.
-    Refreshed { conn: ConnId, databases: Vec<DatabaseInfo> },
-    DatabaseLoaded { conn: ConnId, db: String, result: Result<Vec<SchemaInfo>, String> },
+    Refreshed {
+        conn: ConnId,
+        databases: Vec<DatabaseInfo>,
+    },
+    DatabaseLoaded {
+        conn: ConnId,
+        db: String,
+        result: Result<Vec<SchemaInfo>, String>,
+    },
+    ObjectInfo {
+        conn: ConnId,
+        request_id: u64,
+        result: Result<Box<crate::db::object_info::ObjectInfo>, String>,
+    },
+    ObjectCatalog {
+        conn: ConnId,
+        request_id: u64,
+        result: Result<Vec<crate::db::object_info::ObjectInfoRow>, String>,
+    },
     /// `results` holds what ran before the error (if there was one).
     Executed {
         console: ConsoleId,
@@ -227,6 +261,64 @@ impl State {
     }
 }
 
+async fn fetch_object_info(
+    state: &State,
+    conn: ConnId,
+    db: &str,
+    schema: Option<&str>,
+    table: Option<&str>,
+    count_rows: bool,
+) -> (
+    Result<Vec<crate::db::object_info::ObjectInfoRow>, String>,
+    bool,
+) {
+    let generation = state.current_epoch(conn);
+    let (session, target) = match state.session_for(conn, Some(db)).await {
+        Ok(value) => value,
+        Err(e) => return (Err(format!("{e:#}")), false),
+    };
+    let Some(driver) = state.live.lock().await.get(&conn).map(|l| l.cfg.driver) else {
+        return (Err(tr("Connection lost").into()), false);
+    };
+    let mut s = session.lock().await;
+    let cancel = s.cancel_handle();
+    let query = async {
+        s.use_database(&target).await?;
+        match (schema, table) {
+            (Some(schema), Some(table)) => s
+                .object_info(driver, schema, table, count_rows)
+                .await
+                .map(|info| {
+                    vec![crate::db::object_info::ObjectInfoRow {
+                        schema: schema.into(),
+                        name: table.into(),
+                        info,
+                    }]
+                }),
+            _ => s.object_list_info(driver, schema).await,
+        }
+    };
+    let (result, lost) = match tokio::time::timeout(std::time::Duration::from_secs(15), query).await
+    {
+        Ok(result) => (result.map_err(|e| format!("{e:#}")), s.is_closed()),
+        Err(_) => {
+            let cancelled = match cancel {
+                Some(h) => h.cancel().await.is_ok(),
+                None => false,
+            };
+            (
+                Err(tr("Object information request timed out").into()),
+                !cancelled,
+            )
+        }
+    };
+    drop(s);
+    if lost {
+        state.forget(conn, &session).await;
+    }
+    (result, lost && state.current_epoch(conn) == generation)
+}
+
 async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
     match req {
         Request::Connect(cfg) => {
@@ -287,6 +379,56 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 Err(e) => Err(format!("{e:#}")),
             };
             vec![Response::DatabaseLoaded { conn, db, result }]
+        }
+        Request::ObjectInfo {
+            conn,
+            db,
+            schema,
+            table,
+            request_id,
+            count_rows,
+        } => {
+            let (result, lost) =
+                fetch_object_info(state, conn, &db, Some(&schema), Some(&table), count_rows).await;
+            let result = result.and_then(|rows| {
+                rows.into_iter()
+                    .next()
+                    .map(|row| Box::new(row.info))
+                    .ok_or_else(|| tr("Object information is not available").into())
+            });
+            let mut responses = vec![Response::ObjectInfo {
+                conn,
+                request_id,
+                result,
+            }];
+            if lost {
+                responses.push(Response::ConnectFailed {
+                    conn,
+                    error: tr("Connection lost").into(),
+                });
+            }
+            responses
+        }
+        Request::ObjectCatalog {
+            conn,
+            db,
+            schema,
+            request_id,
+        } => {
+            let (result, lost) =
+                fetch_object_info(state, conn, &db, schema.as_deref(), None, false).await;
+            let mut responses = vec![Response::ObjectCatalog {
+                conn,
+                request_id,
+                result,
+            }];
+            if lost {
+                responses.push(Response::ConnectFailed {
+                    conn,
+                    error: tr("Connection lost").into(),
+                });
+            }
+            responses
         }
         Request::ApplyChanges { conn, db, console, statements } => {
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
@@ -501,6 +643,67 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for the worker");
+    }
+
+    #[test]
+    fn object_metadata_is_async_and_exact_counts_are_explicit() {
+        let path =
+            std::env::temp_dir().join(format!("datacraft-object-info-{}.db", uuid::Uuid::new_v4()));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("create table notes(id integer); insert into notes values (1),(2);")
+            .unwrap();
+        let w = Worker::start(egui::Context::default());
+        let mut cfg = ConnectionConfig::new(17, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        cfg.read_only = true;
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 17, .. }));
+        for (request_id, count_rows) in [(100, false), (101, true)] {
+            w.send(Request::ObjectInfo {
+                conn: 17,
+                db: "main".into(),
+                schema: "main".into(),
+                table: "notes".into(),
+                request_id,
+                count_rows,
+            });
+            let response = wait_for(
+                &w,
+                |r| matches!(r, Response::ObjectInfo { request_id: id, .. } if *id == request_id),
+            );
+            let Response::ObjectInfo { conn, result, .. } = response else {
+                unreachable!()
+            };
+            assert_eq!(conn, 17);
+            let info = result.unwrap();
+            assert_eq!(info.rows, if count_rows { Some(2) } else { None });
+            assert_eq!(info.rows_exact, count_rows);
+        }
+        w.send(Request::ObjectCatalog {
+            conn: 17,
+            db: "main".into(),
+            schema: Some("main".into()),
+            request_id: 102,
+        });
+        let response = wait_for(&w, |r| {
+            matches!(
+                r,
+                Response::ObjectCatalog {
+                    request_id: 102,
+                    ..
+                }
+            )
+        });
+        let Response::ObjectCatalog { result, .. } = response else {
+            unreachable!()
+        };
+        let catalog = result.unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "notes");
+        w.send(Request::Disconnect(17));
+        wait_for(&w, |r| matches!(r, Response::Disconnected(17)));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
