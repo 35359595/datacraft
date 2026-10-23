@@ -27,7 +27,7 @@ pub struct ExplorerState {
     widest_row: f32,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TableRef {
     pub conn: ConnId,
     pub db: String,

@@ -204,6 +204,8 @@ struct PersistedConsole {
 #[serde(default)]
 struct Persisted {
     object_organizations: Vec<crate::ui::object_organization::Organization>,
+    object_layout: crate::ui::object_browser::ObjectLayout,
+    save_on_row_change: bool,
     /// Islands Dark theme (Islands Light by default). Replaces the old `dark` (Darcula).
     islands_dark: bool,
     font_size: f32,
@@ -223,6 +225,8 @@ impl Default for Persisted {
     fn default() -> Self {
         Self {
             object_organizations: Vec::new(),
+            object_layout: crate::ui::object_browser::ObjectLayout::default(),
+            save_on_row_change: false,
             islands_dark: false,
             font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000,
@@ -248,6 +252,7 @@ pub struct DataCraftApp {
     result_salt: u64,
     explorer: ExplorerState,
     object_browser: crate::ui::object_browser::ObjectBrowser,
+    save_on_row_change: bool,
     dialog: Option<ConnectionDialog>,
     confirm_delete: Option<ConnId>,
     /// "New Database" / "New Table" dialog.
@@ -325,8 +330,10 @@ impl DataCraftApp {
             object_browser: {
                 let mut browser = crate::ui::object_browser::ObjectBrowser::default();
                 browser.organizations = persisted.object_organizations;
+                browser.layout = persisted.object_layout;
                 browser
             },
+            save_on_row_change: persisted.save_on_row_change,
             dialog: None,
             confirm_delete: None,
             create: None,
@@ -358,7 +365,11 @@ impl DataCraftApp {
             let conn = pc.conn.filter(|id| app.conns.iter().any(|c| c.cfg.id == *id));
             let id = app.alloc_console_id();
             match (pc.table, conn) {
-                (Some((schema, table)), Some(conn)) => app.consoles.push(Console::new_table(id, conn, pc.db, schema, table)),
+                (Some((schema, table)), Some(conn)) => {
+                    let mut console = Console::new_table(id, conn, pc.db, schema, table);
+                    if let Some(t) = &mut console.table { t.save_on_row_change = app.save_on_row_change; }
+                    app.consoles.push(console);
+                }
                 (Some(_), None) => {}
                 (None, _) => {
                     let mut c = Console::new(id, pc.title, pc.text, conn);
@@ -1114,6 +1125,15 @@ impl DataCraftApp {
         }
     }
 
+    fn sync_save_on_row_change(&mut self) {
+        if let Some(value) = self.consoles.get(self.active).and_then(|c| c.table.as_ref()).map(|t| t.save_on_row_change)
+            && value != self.save_on_row_change
+        {
+            self.save_on_row_change = value;
+            for tab in self.consoles.iter_mut().filter_map(|c| c.table.as_mut()) { tab.save_on_row_change = value; }
+        }
+    }
+
     /// Opens (or activates) a table's data editor.
     fn open_table(&mut self, t: &TableRef) {
         self.object_browser.active = false;
@@ -1132,6 +1152,7 @@ impl DataCraftApp {
         }
         let id = self.alloc_console_id();
         self.consoles.push(Console::new_table(id, t.conn, Some(t.db.clone()), t.schema.clone(), t.table.clone()));
+        if let Some(t) = self.consoles.last_mut().and_then(|c| c.table.as_mut()) { t.save_on_row_change = self.save_on_row_change; }
         self.active = self.consoles.len() - 1;
         self.reload_table(self.active);
     }
@@ -1741,7 +1762,7 @@ impl DataCraftApp {
 
     /// A modal dialog is open: shortcuts and run commands are ignored.
     fn modal_open(&self) -> bool {
-        self.object_browser.schema_search.open || self.dialog.is_some()
+        self.object_browser.schema_search.open || self.object_browser.has_dialog() || self.dialog.is_some()
             || self.confirm_delete.is_some()
             || self.create.is_some()
             || self.drop.is_some()
@@ -2512,6 +2533,7 @@ impl DataCraftApp {
         });
 
         let idx = self.active;
+        self.sync_save_on_row_change();
         for a in actions {
             match a {
                 ConsoleAction::Run => self.run_console(idx, false),
@@ -3153,6 +3175,8 @@ impl eframe::App for DataCraftApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let state = Persisted {
             object_organizations: self.object_browser.organizations.clone(),
+            object_layout: self.object_browser.layout,
+            save_on_row_change: self.save_on_row_change,
             islands_dark: self.dark,
             font_size: self.font_size,
             max_rows: self.max_rows,
@@ -3192,6 +3216,7 @@ mod tests {
             consoles: (1..=4).map(|id| Console::new(id, format!("Query {id}"), String::new(), None)).collect(),
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
+            save_on_row_change: false,
             dialog: None, confirm_delete: None, create: None, drop: None, import: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
@@ -3199,6 +3224,43 @@ mod tests {
             zoom: 1.0, applied_zoom: None, preview: None, confirm_discard: None,
             demo_explorer_w: None, demo_window: None, lang: None,
         }
+    }
+
+    #[test]
+    fn view_and_auto_save_preferences_roundtrip_and_apply_to_new_tables() {
+        use crate::ui::object_browser::ObjectLayout;
+        let defaults: Persisted = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.save_on_row_change);
+        assert_eq!(defaults.object_layout, ObjectLayout::List);
+        #[derive(Default)]
+        struct MemoryStorage(std::collections::BTreeMap<String, String>);
+        impl eframe::Storage for MemoryStorage {
+            fn get_string(&self, key: &str) -> Option<String> { self.0.get(key).cloned() }
+            fn set_string(&mut self, key: &str, value: String) { self.0.insert(key.into(), value); }
+            fn remove_string(&mut self, key: &str) { self.0.remove(key); }
+            fn flush(&mut self) {}
+        }
+        let mut app = tabs_app();
+        app.save_on_row_change = true;
+        app.object_browser.layout = ObjectLayout::Grid;
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let restored: Persisted = eframe::get_value(&storage, STORAGE_KEY).unwrap();
+        assert!(restored.save_on_row_change);
+        assert_eq!(restored.object_layout, ObjectLayout::Grid);
+        let mut app = tabs_app();
+        app.save_on_row_change = restored.save_on_row_change;
+        app.object_browser.layout = restored.object_layout;
+        let table = |name: &str| TableRef { conn: 7, db: "shop".into(), schema: "public".into(), table: name.into() };
+        app.open_table(&table("customers"));
+        app.open_table(&table("orders"));
+        assert!(app.consoles[app.active].table.as_ref().unwrap().save_on_row_change);
+        app.consoles[app.active].table.as_mut().unwrap().save_on_row_change = false;
+        app.sync_save_on_row_change();
+        assert!(!app.save_on_row_change);
+        assert!(app.consoles.iter().filter_map(|c| c.table.as_ref()).all(|t| !t.save_on_row_change));
+        app.open_table(&table("invoices"));
+        assert!(!app.consoles[app.active].table.as_ref().unwrap().save_on_row_change);
     }
 
     #[test]

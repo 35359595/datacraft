@@ -5,11 +5,12 @@ use crate::db::{ObjectKind, TableInfo, object_info::ObjectInfo};
 use crate::i18n::tr;
 use crate::ui::explorer::{ExplorerAction, TableRef};
 use crate::ui::icons::{self, Ico};
-use crate::ui::object_organization::{GroupFilter, Organization};
+use crate::ui::object_organization::Organization;
 use crate::ui::theme::{self, pal};
 use egui::{FontId, Key, Rect, RichText, Sense, Ui, pos2, vec2};
 use egui_extras::{Column, TableBuilder};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectScope {
@@ -19,7 +20,7 @@ pub struct ObjectScope {
     pub kind: Option<ObjectKind>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObjectLayout {
     #[default]
     List,
@@ -30,7 +31,12 @@ pub enum ObjectLayout {
 pub struct ObjectBrowser {
     pub schema_search: crate::ui::schema_search::SchemaSearch,
     pub organizations: Vec<Organization>,
-    group_filter: GroupFilter,
+    current_group: Option<String>,
+    selection: BTreeSet<ItemKey>,
+    anchor: Option<ItemKey>,
+    focused: Option<ItemKey>,
+    group_dialog: Option<GroupDialog>,
+    marquee: Option<Marquee>,
     pub active: bool,
     pub scope: Option<ObjectScope>,
     pub selected: Option<TableRef>,
@@ -57,11 +63,49 @@ struct Entry<'a> {
     info: &'a TableInfo,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ItemKey {
+    Group(String),
+    Table(TableRef),
+}
+
+impl ItemKey {
+    fn name(&self) -> &str {
+        match self {
+            Self::Group(name) => name,
+            Self::Table(table) => &table.table,
+        }
+    }
+}
+
+struct Item<'a> {
+    key: ItemKey,
+    table: Option<&'a TableInfo>,
+}
+
+struct ObjectDrag {
+    tables: Vec<TableRef>,
+}
+
+struct GroupDialog {
+    old_name: Option<String>,
+    name: String,
+    tables: Vec<TableRef>,
+    focus: bool,
+    invalid: bool,
+}
+
+struct Marquee {
+    start: egui::Pos2,
+    initial: BTreeSet<ItemKey>,
+}
+
 impl ObjectBrowser {
     pub fn open(&mut self, scope: ObjectScope) -> bool {
         let changed = self.scope.as_ref() != Some(&scope);
         if changed {
-            self.group_filter = GroupFilter::All;
+            self.current_group = None;
+            self.clear_selection();
             self.selected = None;
             self.info = None;
             self.loading = false;
@@ -109,6 +153,15 @@ impl ObjectBrowser {
     }
 
     pub fn start_request(&mut self, table: TableRef) -> u64 {
+        let key = ItemKey::Table(table.clone());
+        if !self.selection.contains(&key) {
+            self.selection = BTreeSet::from([key.clone()]);
+            self.anchor = Some(key.clone());
+            self.focused = Some(key.clone());
+        }
+        if self.focused.is_none() {
+            self.focused = Some(key);
+        }
         self.scroll_selection |= self.selected.as_ref() != Some(&table);
         self.selected = Some(table);
         self.info = None;
@@ -150,12 +203,6 @@ impl ObjectBrowser {
                     .iter()
                     .filter(|t| scope.kind.is_none_or(|kind| kind == t.kind))
                     .filter(|t| {
-                        self.organizations
-                            .iter()
-                            .find(|o| o.conn == scope.conn && o.db == scope.db)
-                            .is_none_or(|o| o.matches(&s.name, &t.name, &self.group_filter))
-                    })
-                    .filter(|t| {
                         search.is_empty()
                             || t.name.to_lowercase().contains(&search)
                             || s.name.to_lowercase().contains(&search)
@@ -182,29 +229,249 @@ impl ObjectBrowser {
         entries
     }
 
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = None;
+        self.focused = None;
+        self.marquee = None;
+        self.selected = None;
+        self.info = None;
+        self.loading = false;
+        self.request_id = self.request_id.wrapping_add(1);
+    }
+
+    pub fn has_dialog(&self) -> bool {
+        self.group_dialog.is_some()
+    }
+
+    fn items<'a>(&self, entries: &[Entry<'a>], organization: &Organization) -> Vec<Item<'a>> {
+        let search = self.search.to_lowercase();
+        let mut items = Vec::new();
+        if self.current_group.is_none() {
+            let mut groups = organization.groups.clone();
+            groups.sort_by_key(|g| g.to_lowercase());
+            items.extend(
+                groups
+                    .into_iter()
+                    .filter(|g| search.is_empty() || g.to_lowercase().contains(&search))
+                    .map(|name| Item {
+                        key: ItemKey::Group(name),
+                        table: None,
+                    }),
+            );
+        }
+        items.extend(
+            entries
+                .iter()
+                .filter(|e| {
+                    let group = organization.group(&e.reference.schema, &e.reference.table);
+                    match self.current_group.as_deref() {
+                        Some(current) => group == Some(current),
+                        None => !search.is_empty() || group.is_none(),
+                    }
+                })
+                .map(|e| Item {
+                    key: ItemKey::Table(e.reference.clone()),
+                    table: Some(e.info),
+                }),
+        );
+        items
+    }
+
+    fn selected_tables(&self) -> Vec<TableRef> {
+        self.selection
+            .iter()
+            .filter_map(|key| match key {
+                ItemKey::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn select_item(
+        &mut self,
+        key: &ItemKey,
+        keys: &[ItemKey],
+        mods: egui::Modifiers,
+        actions: &mut Vec<BrowserAction>,
+    ) {
+        if mods.shift {
+            let a = self
+                .anchor
+                .as_ref()
+                .and_then(|k| keys.iter().position(|v| v == k))
+                .unwrap_or(0);
+            let b = keys.iter().position(|k| k == key).unwrap_or(a);
+            if !mods.command {
+                self.selection.clear();
+            }
+            self.selection
+                .extend(keys[a.min(b)..=a.max(b)].iter().cloned());
+        } else if mods.command {
+            if !self.selection.remove(key) {
+                self.selection.insert(key.clone());
+            }
+            self.anchor = Some(key.clone());
+        } else {
+            self.selection = BTreeSet::from([key.clone()]);
+            self.anchor = Some(key.clone());
+        }
+        self.focused = Some(key.clone());
+        let primary = match key {
+            ItemKey::Table(t) if self.selection.contains(key) => Some(t.clone()),
+            _ => self.selected_tables().first().cloned(),
+        };
+        if self.selected != primary {
+            self.selected = primary.clone();
+            self.info = None;
+            self.loading = false;
+            self.request_id = self.request_id.wrapping_add(1);
+            if let Some(table) = primary {
+                actions.push(BrowserAction::Inspect {
+                    table,
+                    count_rows: false,
+                });
+            }
+        }
+    }
+
+    fn enter_group(&mut self, group: Option<String>) {
+        self.current_group = group;
+        self.clear_selection();
+    }
+
+    fn new_group_dialog(&mut self, old_name: Option<String>, tables: Vec<TableRef>) {
+        self.group_dialog = Some(GroupDialog {
+            name: old_name.clone().unwrap_or_default(),
+            old_name,
+            tables,
+            focus: true,
+            invalid: false,
+        });
+    }
+
+    fn group_dialog_ui(&mut self, ctx: &egui::Context, org_index: usize) {
+        let Some(dialog) = &mut self.group_dialog else {
+            return;
+        };
+        let mut close = false;
+        let mut created = None;
+        egui::Modal::new(egui::Id::new("object_group_dialog")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(if dialog.old_name.is_some() {
+                tr("Rename group")
+            } else {
+                tr("New group")
+            });
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut dialog.name)
+                    .char_limit(120)
+                    .hint_text(tr("Group name")),
+            );
+            if std::mem::take(&mut dialog.focus) {
+                response.request_focus();
+            }
+            if dialog.invalid {
+                ui.colored_label(ui.visuals().error_fg_color, tr("Enter a unique group name"));
+            }
+            ui.horizontal(|ui| {
+                let enter = (response.has_focus() || response.lost_focus())
+                    && ui.input(|i| i.key_pressed(Key::Enter));
+                if ui.button(tr("Save")).clicked() || enter {
+                    let name = dialog.name.trim().to_string();
+                    let organization = &mut self.organizations[org_index];
+                    let valid = match &dialog.old_name {
+                        Some(old) if old == &name => true,
+                        Some(old) => organization.rename(old, &name),
+                        None => organization.create(&name),
+                    };
+                    if valid {
+                        organization.assign(&dialog.tables, Some(&name));
+                        if dialog.old_name.is_none() {
+                            created = Some(name.clone());
+                        }
+                        if self.current_group == dialog.old_name && dialog.old_name.is_some() {
+                            self.current_group = Some(name);
+                        }
+                        close = true;
+                    } else {
+                        dialog.invalid = true;
+                    }
+                }
+                if ui.button(tr("Cancel")).clicked() {
+                    close = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+        });
+        if close {
+            self.group_dialog = None;
+        }
+        if let Some(name) = created {
+            self.enter_group(None);
+            let key = ItemKey::Group(name);
+            self.selection.insert(key.clone());
+            self.focused = Some(key.clone());
+            self.anchor = Some(key);
+        }
+    }
+
     pub fn show(&mut self, ui: &mut Ui, connections: &[ConnState]) -> Vec<BrowserAction> {
         ui.set_min_size(ui.available_size());
         let mut actions = self.schema_search.show(ui.ctx(), connections);
         let Some(scope) = self.scope.clone() else {
             return actions;
         };
-        let p = pal(ui);
-        let connected = connections
+        let org_index = self
+            .organizations
             .iter()
-            .find(|c| c.cfg.id == scope.conn)
-            .is_some_and(|c| c.status == ConnStatus::Connected);
+            .position(|o| o.conn == scope.conn && o.db == scope.db)
+            .unwrap_or_else(|| {
+                let mut organization = Organization::default();
+                organization.conn = scope.conn;
+                organization.db.clone_from(&scope.db);
+                self.organizations.push(organization);
+                self.organizations.len() - 1
+            });
+        self.group_dialog_ui(ui.ctx(), org_index);
+        if self
+            .current_group
+            .as_ref()
+            .is_some_and(|g| !self.organizations[org_index].groups.contains(g))
+        {
+            self.enter_group(None);
+        }
+        let p = pal(ui);
+        let connection = connections.iter().find(|c| c.cfg.id == scope.conn);
+        let connected = connection.is_some_and(|c| c.status == ConnStatus::Connected);
+        let writable = connected && connection.is_some_and(|c| !c.cfg.read_only);
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("object_search")));
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
-            let title = match scope.kind {
-                Some(ObjectKind::Table) => tr("Tables"),
-                Some(ObjectKind::View) => tr("Views"),
-                None => tr("Objects"),
-            };
-            ui.label(RichText::new(title).font(theme::bold(16.0)));
+            if let Some(group) = self.current_group.clone() {
+                let back = ui.button(tr("All objects"));
+                if back.clicked() {
+                    self.enter_group(None);
+                }
+                if let Some(payload) = back.dnd_release_payload::<ObjectDrag>()
+                    && self.organizations[org_index].assign(&payload.tables, None)
+                {
+                    self.enter_group(None);
+                }
+                ui.label(RichText::new(group).font(theme::bold(16.0)));
+            } else {
+                let title = match scope.kind {
+                    Some(ObjectKind::Table) => tr("Tables"),
+                    Some(ObjectKind::View) => tr("Views"),
+                    None => tr("Objects"),
+                };
+                ui.label(RichText::new(title).font(theme::bold(16.0)));
+            }
             ui.label(
                 RichText::new(match &scope.schema {
                     Some(s) => format!("{} / {s}", scope.db),
@@ -247,84 +514,47 @@ impl ObjectBrowser {
                 RichText::new(tr("Connect to load current object information")).color(p.muted),
             );
         }
-        let org_index = self
-            .organizations
-            .iter()
-            .position(|o| o.conn == scope.conn && o.db == scope.db)
-            .unwrap_or_else(|| {
-                let mut organization = Organization::default();
-                organization.conn = scope.conn;
-                organization.db.clone_from(&scope.db);
-                self.organizations.push(organization);
-                self.organizations.len() - 1
-            });
-        egui::Panel::left("object_folders")
-            .default_size(155.0)
-            .size_range(130.0..=260.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                self.organizations[org_index].folders(ui, &mut self.group_filter);
-            });
         let entries = self.entries(connections);
+        let items = self.items(&entries, &self.organizations[org_index]);
+        let keys: Vec<_> = items.iter().map(|i| i.key.clone()).collect();
+        let visible: BTreeSet<_> = keys.iter().collect();
+        self.selection.retain(|key| visible.contains(key));
         if self
             .selected
             .as_ref()
-            .is_some_and(|t| !entries.iter().any(|e| &e.reference == t))
+            .is_some_and(|t| !keys.contains(&ItemKey::Table(t.clone())))
         {
             self.selected = None;
             self.info = None;
             self.loading = false;
             self.request_id = self.request_id.wrapping_add(1);
         }
-        let scroll_to = if std::mem::take(&mut self.scroll_selection) {
-            self.selected
-                .as_ref()
-                .and_then(|t| entries.iter().position(|e| &e.reference == t))
-        } else {
-            None
-        };
         egui::Panel::right("object_information")
             .default_size(300.0)
             .size_range(220.0..=520.0)
             .resizable(true)
             .show(ui, |ui| {
-                self.information(ui, &entries, connected, &mut actions)
+                if self.selection.len() > 1 {
+                    ui.label(crate::i18n::trf(
+                        "{n} objects selected",
+                        &[("n", &self.selection.len())],
+                    ));
+                }
+                self.information(ui, &entries, connected, &mut actions);
             });
         ui.set_clip_rect(ui.clip_rect().intersect(ui.available_rect_before_wrap()));
+        let background = ui.available_rect_before_wrap();
         let grid_rows = ((ui.available_height() - 14.0) / (22.0 + ui.spacing().item_spacing.y))
             .floor()
             .max(1.0) as usize;
-        let background = ui.available_rect_before_wrap();
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-        let mut over_object = false;
-
-        if entries.is_empty() {
-            let loading = connections
-                .iter()
-                .find(|c| c.cfg.id == scope.conn)
-                .is_some_and(|c| c.loading.contains(&scope.db));
-            ui.vertical_centered(|ui| {
-                ui.add_space(48.0);
-                if loading {
-                    ui.spinner();
-                    ui.label(tr("Loading…"));
-                } else {
-                    ui.label(RichText::new(tr("No matching objects")).color(p.muted));
-                }
-            });
-            self.background_menu(ui, background, &scope, &mut actions);
-            return actions;
-        }
-        if ui.is_enabled()
+        if !items.is_empty()
+            && ui.is_enabled()
             && !egui::Popup::is_any_open(ui.ctx())
             && ui.memory(|m| m.focused().is_none())
         {
-            let current = self
-                .selected
-                .as_ref()
-                .and_then(|t| entries.iter().position(|e| &e.reference == t));
-            let navigation = ui.input_mut(|i| {
-                [
+            let input = ui.input_mut(|i| {
+                let all = i.consume_key(egui::Modifiers::COMMAND, Key::A);
+                let key = [
                     Key::ArrowDown,
                     Key::ArrowUp,
                     Key::ArrowLeft,
@@ -334,31 +564,64 @@ impl ObjectBrowser {
                     Key::Enter,
                 ]
                 .into_iter()
-                .find(|key| i.consume_key(egui::Modifiers::NONE, *key))
+                .find(|key| {
+                    i.consume_key(
+                        if i.modifiers.shift {
+                            egui::Modifiers::SHIFT
+                        } else {
+                            egui::Modifiers::NONE
+                        },
+                        *key,
+                    )
+                });
+                (all, key, i.modifiers)
             });
-            if let Some(key) = navigation {
+            if input.0 {
+                self.selection = keys.iter().cloned().collect();
+                self.focused = keys
+                    .iter()
+                    .find(|k| matches!(k, ItemKey::Table(_)))
+                    .or(keys.first())
+                    .cloned();
+                self.anchor = self.focused.clone();
+            }
+            if let Some(key) = input.1 {
+                let current = self
+                    .focused
+                    .as_ref()
+                    .and_then(|k| keys.iter().position(|v| v == k));
                 let next = object_navigation(
                     current,
                     key,
-                    entries.len(),
+                    keys.len(),
                     if self.layout == ObjectLayout::Grid {
                         grid_rows
                     } else {
-                        entries.len()
+                        keys.len()
                     },
                 );
-                let table = entries[next].reference.clone();
                 if key == Key::Enter {
-                    actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(table)));
+                    match &keys[next] {
+                        ItemKey::Group(name) => self.enter_group(Some(name.clone())),
+                        ItemKey::Table(t) => actions.push(BrowserAction::Explorer(
+                            ExplorerAction::OpenTable(t.clone()),
+                        )),
+                    }
                 } else {
-                    actions.push(BrowserAction::Inspect {
-                        table,
-                        count_rows: false,
-                    });
+                    self.select_item(&keys[next], &keys, input.2, &mut actions);
+                    self.scroll_selection = true;
                 }
             }
         }
-        let organization = &mut self.organizations[org_index];
+        let scroll_to = if std::mem::take(&mut self.scroll_selection) {
+            self.focused
+                .as_ref()
+                .and_then(|k| keys.iter().position(|v| v == k))
+        } else {
+            None
+        };
+        let organization = &self.organizations[org_index];
+        let mut responses = Vec::new();
         match self.layout {
             ObjectLayout::List => {
                 egui::ScrollArea::horizontal()
@@ -370,7 +633,7 @@ impl ObjectBrowser {
                         let mut table = TableBuilder::new(ui)
                             .id_salt("object_list")
                             .resizable(true)
-                            .sense(Sense::click());
+                            .sense(Sense::click_and_drag());
                         if let Some(row) = scroll_to {
                             table = table.scroll_to_row(row, None);
                         }
@@ -400,13 +663,9 @@ impl ObjectBrowser {
                                 }
                             })
                             .body(|body| {
-                                body.rows(21.0, entries.len(), |mut row| {
-                                    let entry = &entries[row.index()];
-                                    let info = self.catalog.get(&(
-                                        entry.reference.schema.clone(),
-                                        entry.reference.table.clone(),
-                                    ));
-                                    let selected = self.selected.as_ref() == Some(&entry.reference);
+                                body.rows(21.0, items.len(), |mut row| {
+                                    let item = &items[row.index()];
+                                    let selected = self.selection.contains(&item.key);
                                     row.set_selected(selected);
                                     row.col(|ui| {
                                         ui.horizontal(|ui| {
@@ -414,30 +673,24 @@ impl ObjectBrowser {
                                                 vec2(16.0, 16.0),
                                                 Sense::hover(),
                                             );
+                                            let color =
+                                                item_color(item, organization).unwrap_or(p.icon);
                                             icons::paint(
                                                 ui.painter(),
                                                 rect,
-                                                object_icon(entry.info.kind),
-                                                organization
-                                                    .color(
-                                                        &entry.reference.schema,
-                                                        &entry.reference.table,
-                                                    )
-                                                    .unwrap_or(p.icon),
+                                                item.table
+                                                    .map_or(Ico::Folder, |t| object_icon(t.kind)),
+                                                color,
                                                 &p,
                                                 true,
                                             );
                                             ui.add(
                                                 egui::Label::new(
-                                                    RichText::new(&entry.reference.table).color(
+                                                    RichText::new(item.key.name()).color(
                                                         if selected {
                                                             p.text
                                                         } else {
-                                                            organization
-                                                                .color(
-                                                                    &entry.reference.schema,
-                                                                    &entry.reference.table,
-                                                                )
+                                                            item_color(item, organization)
                                                                 .unwrap_or(p.text)
                                                         },
                                                     ),
@@ -446,6 +699,12 @@ impl ObjectBrowser {
                                             );
                                         });
                                     });
+                                    let info = match &item.key {
+                                        ItemKey::Table(t) => {
+                                            self.catalog.get(&(t.schema.clone(), t.table.clone()))
+                                        }
+                                        _ => None,
+                                    };
                                     let rows = info.and_then(|i| i.rows).map(|n| {
                                         if info.is_some_and(|i| i.rows_exact) {
                                             n.to_string()
@@ -474,17 +733,29 @@ impl ObjectBrowser {
                                         });
                                     }
                                     let response = row.response();
-                                    over_object |=
-                                        pointer.is_some_and(|p| response.rect.contains(p));
-                                    object_response(response, entry, organization, &mut actions);
-                                })
+                                    if matches!(item.key, ItemKey::Group(_))
+                                        && response.dnd_hover_payload::<ObjectDrag>().is_some()
+                                    {
+                                        response
+                                            .ctx
+                                            .layer_painter(response.layer_id)
+                                            .with_clip_rect(background)
+                                            .rect_stroke(
+                                                response.rect,
+                                                2.0,
+                                                egui::Stroke::new(2.0, p.accent),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                    }
+                                    responses.push((item, response));
+                                });
                             });
                     });
             }
             ObjectLayout::Grid => {
                 let pitch = 22.0 + ui.spacing().item_spacing.y;
                 let width = 240.0;
-                let columns = entries.len().div_ceil(grid_rows);
+                let columns = items.len().div_ceil(grid_rows);
                 let height = (ui.available_height() - 14.0).max(22.0);
                 let mut scroll = egui::ScrollArea::horizontal()
                     .id_salt("object_grid")
@@ -500,33 +771,40 @@ impl ObjectBrowser {
                     for column in first..last {
                         for row in 0..grid_rows {
                             let index = column * grid_rows + row;
-                            let Some(entry) = entries.get(index) else {
-                                break;
-                            };
+                            let Some(item) = items.get(index) else { break };
                             let rect = Rect::from_min_size(
                                 origin + vec2(column as f32 * width, row as f32 * pitch),
                                 vec2(width - 6.0, 22.0),
                             );
                             let response = ui.interact(
                                 rect,
-                                ui.id().with(("object_cell", index)),
-                                Sense::click(),
+                                ui.id().with(("object_cell", &item.key)),
+                                Sense::click_and_drag(),
                             );
-                            over_object |= pointer.is_some_and(|p| rect.contains(p));
+                            let selected = self.selection.contains(&item.key);
                             response.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::SelectableLabel,
                                     ui.is_enabled(),
-                                    self.selected.as_ref() == Some(&entry.reference),
-                                    &entry.reference.table,
+                                    selected,
+                                    item.key.name(),
                                 )
                             });
-                            let selected = self.selected.as_ref() == Some(&entry.reference);
                             if selected || response.hovered() {
                                 ui.painter().rect_filled(
                                     rect.shrink(1.0),
                                     3.0,
                                     if selected { p.selection } else { p.row_hover },
+                                );
+                            }
+                            if matches!(item.key, ItemKey::Group(_))
+                                && response.dnd_hover_payload::<ObjectDrag>().is_some()
+                            {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    2.0,
+                                    egui::Stroke::new(2.0, p.accent),
+                                    egui::StrokeKind::Inside,
                                 );
                             }
                             let icon = Rect::from_min_size(
@@ -536,36 +814,167 @@ impl ObjectBrowser {
                             icons::paint(
                                 ui.painter(),
                                 icon,
-                                object_icon(entry.info.kind),
-                                organization
-                                    .color(&entry.reference.schema, &entry.reference.table)
-                                    .unwrap_or(p.icon),
+                                item.table.map_or(Ico::Folder, |t| object_icon(t.kind)),
+                                item_color(item, organization).unwrap_or(p.icon),
                                 &p,
                                 true,
                             );
                             ui.painter_at(rect.shrink(3.0)).text(
                                 pos2(rect.left() + 27.0, rect.center().y),
                                 egui::Align2::LEFT_CENTER,
-                                &entry.reference.table,
+                                item.key.name(),
                                 FontId::proportional(12.0),
                                 if selected {
                                     p.text
                                 } else {
-                                    organization
-                                        .color(&entry.reference.schema, &entry.reference.table)
-                                        .unwrap_or(p.text)
+                                    item_color(item, organization).unwrap_or(p.text)
                                 },
                             );
-                            object_response(response, entry, organization, &mut actions);
+                            responses.push((item, response));
                         }
                     }
                 });
             }
         }
-        if !over_object {
-            self.background_menu(ui, background, &scope, &mut actions);
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let over_object = responses
+            .iter()
+            .any(|(_, r)| pointer.is_some_and(|p| r.rect.contains(p)));
+        let rects: Vec<_> = responses
+            .iter()
+            .map(|(item, r)| (item.key.clone(), r.rect.intersect(background)))
+            .collect();
+        for (item, response) in responses {
+            self.item_response(response, item, &keys, org_index, writable, &mut actions);
+        }
+        if items.is_empty() {
+            ui.label(RichText::new(tr("No matching objects")).color(p.muted));
+        }
+        if !over_object || self.marquee.is_some() {
+            self.background_menu(ui, background, &scope, &rects, &mut actions);
+        }
+        if let Some(payload) = egui::DragAndDrop::payload::<ObjectDrag>(ui.ctx())
+            && let Some(position) = pointer
+        {
+            egui::Area::new(egui::Id::new("object_drag_label"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(position + vec2(14.0, 14.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(crate::i18n::trf(
+                            "{n} tables",
+                            &[("n", &payload.tables.len())],
+                        ));
+                    });
+                });
         }
         actions
+    }
+
+    fn item_response(
+        &mut self,
+        response: egui::Response,
+        item: &Item<'_>,
+        keys: &[ItemKey],
+        org_index: usize,
+        writable: bool,
+        actions: &mut Vec<BrowserAction>,
+    ) {
+        let mods = response.ctx.input(|i| i.modifiers);
+        if response.clicked() {
+            self.select_item(&item.key, keys, mods, actions);
+        }
+        if response.secondary_clicked() && !self.selection.contains(&item.key) {
+            self.select_item(&item.key, keys, egui::Modifiers::NONE, actions);
+        }
+        if response.double_clicked() {
+            match &item.key {
+                ItemKey::Group(name) => self.enter_group(Some(name.clone())),
+                ItemKey::Table(table) => actions.push(BrowserAction::Explorer(
+                    ExplorerAction::OpenTable(table.clone()),
+                )),
+            }
+        }
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && matches!(item.key, ItemKey::Table(_))
+        {
+            if !self.selection.contains(&item.key) {
+                self.select_item(&item.key, keys, egui::Modifiers::NONE, actions);
+            }
+            response.dnd_set_drag_payload(ObjectDrag {
+                tables: self.selected_tables(),
+            });
+        }
+        if let ItemKey::Group(name) = &item.key
+            && let Some(payload) = response.dnd_release_payload::<ObjectDrag>()
+            && self.organizations[org_index].assign(&payload.tables, Some(name))
+        {
+            self.clear_selection();
+        }
+        response.context_menu(|ui| match &item.key {
+            ItemKey::Group(name) => {
+                if ui.button(tr("Open group")).clicked() {
+                    self.enter_group(Some(name.clone()));
+                    ui.close();
+                }
+                if ui.button(tr("Rename group")).clicked() {
+                    self.new_group_dialog(Some(name.clone()), Vec::new());
+                    ui.close();
+                }
+                if ui.button(tr("Delete group")).clicked() {
+                    self.organizations[org_index].remove(name);
+                    self.clear_selection();
+                    ui.close();
+                }
+            }
+            ItemKey::Table(_) => {
+                let tables = self.selected_tables();
+                if self.organizations[org_index].menu(ui, &tables) {
+                    self.new_group_dialog(None, tables.clone());
+                }
+                ui.separator();
+                if ui.button(tr("Open data")).clicked() {
+                    for t in &tables {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(
+                            t.clone(),
+                        )));
+                    }
+                    ui.close();
+                }
+                if ui.button(tr("Copy Name")).clicked() {
+                    ui.ctx().copy_text(
+                        tables
+                            .iter()
+                            .map(|t| t.table.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    ui.close();
+                }
+                if ui.button(tr("Show DDL")).clicked() {
+                    for t in &tables {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::GenerateDdl(
+                            t.clone(),
+                        )));
+                    }
+                    ui.close();
+                }
+                let truncate = writable
+                    && self.selection.len() == 1
+                    && item.table.is_some_and(|t| t.kind == ObjectKind::Table);
+                if ui
+                    .add_enabled(truncate, egui::Button::new(tr("Truncate…")))
+                    .clicked()
+                {
+                    if let Some(table) = tables.first() {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::TruncateTable(
+                            table.clone(),
+                        )));
+                    }
+                    ui.close();
+                }
+            }
+        });
     }
 
     fn background_menu(
@@ -573,16 +982,59 @@ impl ObjectBrowser {
         ui: &mut Ui,
         rect: Rect,
         scope: &ObjectScope,
+        rects: &[(ItemKey, Rect)],
         actions: &mut Vec<BrowserAction>,
     ) {
-        let response = ui.interact(rect, ui.id().with("object_background"), Sense::click());
+        let response = ui.interact(
+            rect,
+            ui.id().with("object_background"),
+            Sense::click_and_drag(),
+        );
+        if response.clicked() {
+            self.clear_selection();
+        }
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(start) = ui.input(|i| i.pointer.press_origin())
+        {
+            let initial = if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                self.selection.clone()
+            } else {
+                BTreeSet::new()
+            };
+            self.clear_selection();
+            self.marquee = Some(Marquee { start, initial });
+        }
+        if let Some(marquee) = &self.marquee
+            && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
+        {
+            let area = Rect::from_two_pos(marquee.start, pointer).intersect(rect);
+            self.selection = marquee.initial.clone();
+            self.selection.extend(
+                rects
+                    .iter()
+                    .filter(|(_, r)| r.is_positive() && area.intersects(*r))
+                    .map(|(key, _)| key.clone()),
+            );
+            ui.painter()
+                .rect_filled(area, 0.0, pal(ui).selection.gamma_multiply(0.35));
+            ui.painter().rect_stroke(
+                area,
+                0.0,
+                egui::Stroke::new(1.0, pal(ui).accent),
+                egui::StrokeKind::Inside,
+            );
+            ui.ctx().request_repaint();
+            if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+                self.marquee = None;
+            }
+        }
         response.context_menu(|ui| {
             if ui.button(tr("Find in Schema…")).clicked() {
                 self.schema_search.open(scope);
                 ui.close();
             }
-            if ui.button(tr("New group")).clicked() {
-                ui.memory_mut(|m| m.request_focus(egui::Id::new("new_object_group")));
+            if ui.button(tr("New group…")).clicked() {
+                self.new_group_dialog(None, Vec::new());
                 ui.close();
             }
             if ui.button(tr("Refresh objects")).clicked() {
@@ -735,54 +1187,18 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn object_response(
-    response: egui::Response,
-    entry: &Entry<'_>,
-    organization: &mut Organization,
-    actions: &mut Vec<BrowserAction>,
-) {
-    let response = response.on_hover_text(format!(
-        "{}.{}",
-        entry.reference.schema, entry.reference.table
-    ));
-    if response.clicked() {
-        actions.push(BrowserAction::Inspect {
-            table: entry.reference.clone(),
-            count_rows: false,
-        });
+fn item_color(item: &Item<'_>, organization: &Organization) -> Option<egui::Color32> {
+    match &item.key {
+        ItemKey::Table(t) => organization.color(&t.schema, &t.table),
+        _ => None,
     }
-    if response.double_clicked() {
-        actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(
-            entry.reference.clone(),
-        )));
-    }
-    response.context_menu(|ui| {
-        organization.menu(ui, &entry.reference.schema, &entry.reference.table);
-        ui.separator();
-        if ui.button(tr("Open data")).clicked() {
-            actions.push(BrowserAction::Explorer(ExplorerAction::OpenTable(
-                entry.reference.clone(),
-            )));
-            ui.close();
-        }
-        if ui.button(tr("Copy Name")).clicked() {
-            ui.ctx().copy_text(entry.reference.table.clone());
-            ui.close();
-        }
-        if ui.button(tr("Show DDL")).clicked() {
-            actions.push(BrowserAction::Explorer(ExplorerAction::GenerateDdl(
-                entry.reference.clone(),
-            )));
-            ui.close();
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo};
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     fn connection() -> ConnState {
         let mut connection = ConnState::new(ConnectionConfig::new(7, Driver::Postgres));
@@ -942,6 +1358,7 @@ mod tests {
         browser: ObjectBrowser,
         connections: Vec<ConnState>,
         opened: Option<TableRef>,
+        truncated: Option<TableRef>,
     }
 
     fn harness(layout: ObjectLayout, dark: bool) -> egui_kittest::Harness<'static, State> {
@@ -981,6 +1398,9 @@ mod tests {
                             BrowserAction::Explorer(ExplorerAction::OpenTable(table)) => {
                                 state.opened = Some(table)
                             }
+                            BrowserAction::Explorer(ExplorerAction::TruncateTable(table)) => {
+                                state.truncated = Some(table)
+                            }
                             _ => {}
                         }
                     }
@@ -989,6 +1409,7 @@ mod tests {
                     browser,
                     connections: vec![connection()],
                     opened: None,
+                    truncated: None,
                 },
             );
         h.run_steps(3);
@@ -1058,45 +1479,226 @@ mod tests {
         h.run_steps(3);
         h.get_by_label("customers").click_secondary();
         h.run_steps(3);
-        assert!(h.query_by_label("Move to group ⏵").is_some());
+        assert!(h.query_by_label("Add to group… ⏵").is_some());
         assert!(h.query_by_label("Color ⏵").is_some());
-        assert!(h.query_by_label("Open data").is_some());
+        assert!(h.query_all_by_label("Open data").next().is_some());
     }
 
-    #[test]
-    fn folders_filter_objects_and_context_menu_assigns_group_and_color() {
-        let mut h = harness(ObjectLayout::Grid, true);
-        h.ctx
-            .memory_mut(|m| m.request_focus(egui::Id::new("new_object_group")));
-        h.input_mut().events.push(egui::Event::Text("Sales".into()));
+    fn create_group(h: &mut egui_kittest::Harness<'_, State>, name: &str) {
+        let position = pos2(500.0, 500.0);
+        h.event(egui::Event::PointerMoved(position));
+        h.run_steps(2);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(2);
+        }
+        h.get_by_label("New group…").click();
         h.run_steps(3);
-        h.get_by_label("New group").click();
-        h.run_steps(3);
-        assert_eq!(h.state().browser.organizations[0].groups, vec!["Sales"]);
-        assert!(h.query_by_label("customers").is_none());
-        h.get_by_label("All objects").click();
-        h.run_steps(3);
-        h.get_by_label("customers").click_secondary();
-        h.run_steps(3);
-        h.get_by_label("Move to group ⏵").click();
-        h.run_steps(3);
-        h.get_all_by_label("Sales").last().unwrap().click();
-        h.run_steps(3);
-        h.get_by_label("Sales").click();
-        h.run_steps(3);
-        assert!(h.query_by_label("customers").is_some());
-        assert!(h.query_by_label("orders").is_none());
-        h.get_by_label("customers").click_secondary();
-        h.run_steps(3);
-        h.get_by_label("Color ⏵").click();
-        h.run_steps(3);
-        h.get_by_label("Blue").click();
+        h.input_mut().events.push(egui::Event::Text(name.into()));
+        h.run_steps(2);
+        h.get_by_label("Save").click();
         h.run_steps(3);
         assert!(
             h.state().browser.organizations[0]
-                .color("public", "customers")
-                .is_some()
+                .groups
+                .contains(&name.to_string())
         );
+    }
+
+    fn drag_selected_to_group(
+        h: &mut egui_kittest::Harness<'_, State>,
+        source: &str,
+        group: &str,
+        render: bool,
+    ) {
+        let source = h.get_by_label(source).rect().center();
+        let target = h.get_by_label(group).rect().center();
+        h.event(egui::Event::PointerMoved(source));
+        h.run_steps(2);
+        h.event(egui::Event::PointerButton {
+            pos: source,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+        h.event(egui::Event::PointerMoved(source + vec2(16.0, 0.0)));
+        h.run_steps(2);
+        h.event(egui::Event::PointerMoved(target));
+        h.run_steps(3);
+        assert_eq!(
+            egui::DragAndDrop::payload::<ObjectDrag>(&h.ctx)
+                .unwrap()
+                .tables
+                .len(),
+            2
+        );
+        if render {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/object-browser-snapshots");
+            std::fs::create_dir_all(&dir).unwrap();
+            h.render()
+                .unwrap()
+                .save(dir.join("group-drag.png"))
+                .unwrap();
+        }
+        h.event(egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn inline_folders_accept_multiple_tables_by_drag_and_drop_in_both_layouts() {
+        for layout in [ObjectLayout::Grid, ObjectLayout::List] {
+            let mut h = harness(layout, true);
+            assert!(h.query_by_label("Groups").is_none());
+            create_group(&mut h, "Sales");
+            h.get_by_label("customers").click();
+            h.run_steps(2);
+            h.get_by_label("orders")
+                .click_modifiers(egui::Modifiers::COMMAND);
+            h.run_steps(2);
+            assert_eq!(h.state().browser.selected_tables().len(), 2);
+            drag_selected_to_group(&mut h, "customers", "Sales", false);
+            for name in ["customers", "orders"] {
+                assert_eq!(
+                    h.state().browser.organizations[0].group("public", name),
+                    Some("Sales")
+                );
+                assert!(h.query_by_label(name).is_none());
+            }
+            h.get_by_label("Sales").click();
+            h.run_steps(2);
+            h.key_press(Key::Enter);
+            h.run_steps(3);
+            assert!(h.query_by_label("customers").is_some());
+            assert!(h.query_by_label("orders").is_some());
+            assert!(h.query_by_label("All objects").is_some());
+        }
+    }
+
+    #[test]
+    fn shift_and_select_all_cover_tables_and_context_colors_apply_to_the_selection() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        h.get_by_label("customers").click();
+        h.run_steps(2);
+        h.get_by_label("orders")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        h.run_steps(2);
+        assert_eq!(h.state().browser.selected_tables().len(), 2);
+        h.get_all_by_label("orders")
+            .last()
+            .unwrap()
+            .click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Color ⏵").click();
+        h.run_steps(2);
+        h.get_by_label("Blue").click();
+        h.run_steps(3);
+        for name in ["customers", "orders"] {
+            assert!(
+                h.state().browser.organizations[0]
+                    .color("public", name)
+                    .is_some()
+            );
+        }
+        h.get_by_label("customers").click();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+        h.run_steps(2);
+        assert_eq!(h.state().browser.selected_tables().len(), 2);
+    }
+
+    #[test]
+    fn truncate_is_available_only_for_one_writable_table_and_uses_the_existing_action() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        h.get_by_label("customers").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Truncate…").click();
+        h.run_steps(2);
+        assert_eq!(h.state().truncated.as_ref().unwrap().table, "customers");
+        h.state_mut().connections[0].cfg.read_only = true;
+        h.get_by_label("orders").click_secondary();
+        h.run_steps(2);
+        assert!(h.get_by_label("Truncate…").accesskit_node().is_disabled());
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        h.state_mut().connections[0].cfg.read_only = false;
+        h.state_mut().browser.open(scope(Some(ObjectKind::View)));
+        h.run_steps(3);
+        h.get_by_label("active_customers").click_secondary();
+        h.run_steps(2);
+        assert!(h.get_by_label("Truncate…").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn dragging_a_selection_rectangle_from_empty_space_selects_multiple_objects() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        let start = pos2(400.0, 250.0);
+        let end = pos2(8.0, 60.0);
+        h.event(egui::Event::PointerMoved(start));
+        h.run_steps(2);
+        h.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+        h.event(egui::Event::PointerMoved(start - vec2(15.0, 15.0)));
+        h.run_steps(2);
+        h.event(egui::Event::PointerMoved(end));
+        h.run_steps(3);
+        h.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(3);
+        assert_eq!(h.state().browser.selected_tables().len(), 2);
+        assert!(h.state().browser.marquee.is_none());
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders dragging a multi-selection onto a local folder"]
+    fn render_group_drag() {
+        let mut h = harness(ObjectLayout::Grid, true);
+        create_group(&mut h, "Sales");
+        h.get_by_label("customers").click();
+        h.run_steps(2);
+        h.get_by_label("orders")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run_steps(2);
+        h.get_all_by_label("orders")
+            .last()
+            .unwrap()
+            .click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Color ⏵").click();
+        h.run_steps(2);
+        h.get_by_label("Blue").click();
+        h.run_steps(2);
+        drag_selected_to_group(&mut h, "customers", "Sales", true);
+        h.get_by_label("Sales").click();
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/object-browser-snapshots");
+        h.render()
+            .unwrap()
+            .save(dir.join("group-contents.png"))
+            .unwrap();
     }
 
     #[test]
@@ -1151,7 +1753,7 @@ mod tests {
                 }
             }
             h.run_steps(3);
-            h.get_by_label("customers").click();
+            h.get_by_label("table_01").click();
             h.run_steps(3);
             h.render()
                 .unwrap()

@@ -36,6 +36,14 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Ungrouped", "Sin grupo"),
     ("Group name", "Nombre del grupo"),
     ("New group", "Nuevo grupo"),
+    ("New group…", "Nuevo grupo…"),
+    ("Add to group…", "Añadir al grupo…"),
+    ("Open group", "Abrir grupo"),
+    (
+        "Enter a unique group name",
+        "Introduce un nombre de grupo único",
+    ),
+    ("{n} objects selected", "{n} objetos seleccionados"),
     ("Rename group", "Renombrar grupo"),
     ("Delete group", "Eliminar grupo"),
     (

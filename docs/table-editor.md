@@ -58,8 +58,9 @@ Sorting or filtering commits an open editor into pending changes first.
 
 ## Optional save on row change
 
-**Save on row change** is off by default and applies only to the current table
-editor tab. SQL console results retain explicit submission. Enable the checkbox
+**Save on row change** is off by default. Its setting is remembered across app
+restarts and shared by existing and newly opened table editors. SQL console
+results retain explicit submission. Enable the checkbox
 in the table toolbar to submit pending changes when leaving the edited rows
 with the keyboard or mouse. The batch remains independent of the current cursor
 selection and includes unchanged cells inside a bulk-edited range.

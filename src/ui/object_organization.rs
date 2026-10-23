@@ -1,5 +1,4 @@
 //! Local object folders and colors; never changes database objects.
-
 use crate::i18n::tr;
 use egui::{Color32, RichText, Ui};
 use serde::{Deserialize, Serialize};
@@ -11,8 +10,6 @@ pub struct Organization {
     pub db: String,
     pub groups: Vec<String>,
     objects: Vec<ObjectStyle>,
-    #[serde(skip)]
-    name: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -21,14 +18,6 @@ struct ObjectStyle {
     table: String,
     group: Option<String>,
     color: Option<[u8; 3]>,
-}
-
-#[derive(Default, Clone, PartialEq, Eq)]
-pub enum GroupFilter {
-    #[default]
-    All,
-    Ungrouped,
-    Named(String),
 }
 
 impl Organization {
@@ -60,16 +49,44 @@ impl Organization {
             .map(|[r, g, b]| Color32::from_rgb(r, g, b))
     }
 
-    pub fn matches(&self, schema: &str, table: &str, filter: &GroupFilter) -> bool {
-        let group = self.style(schema, table).and_then(|o| o.group.as_deref());
-        match filter {
-            GroupFilter::All => true,
-            GroupFilter::Ungrouped => group.is_none(),
-            GroupFilter::Named(name) => group == Some(name.as_str()),
-        }
+    pub fn group(&self, schema: &str, table: &str) -> Option<&str> {
+        self.style(schema, table).and_then(|o| o.group.as_deref())
     }
 
-    fn rename(&mut self, old: &str, name: &str) {
+    pub fn assign(
+        &mut self,
+        tables: &[crate::ui::explorer::TableRef],
+        group: Option<&str>,
+    ) -> bool {
+        if group.is_some_and(|name| !self.groups.iter().any(|g| g == name))
+            || tables
+                .iter()
+                .any(|t| t.conn != self.conn || t.db != self.db)
+        {
+            return false;
+        }
+        for table in tables {
+            self.style_mut(&table.schema, &table.table).group = group.map(str::to_string);
+        }
+        true
+    }
+
+    pub fn create(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.groups.iter().any(|g| g == name) {
+            return false;
+        }
+        self.groups.push(name.into());
+        true
+    }
+
+    pub fn rename(&mut self, old: &str, name: &str) -> bool {
+        if name.trim().is_empty()
+            || self.groups.iter().any(|g| g == name)
+            || !self.groups.iter().any(|g| g == old)
+        {
+            return false;
+        }
         for group in &mut self.groups {
             if group == old {
                 *group = name.into();
@@ -80,9 +97,10 @@ impl Organization {
                 style.group = Some(name.into());
             }
         }
+        true
     }
 
-    fn remove(&mut self, name: &str) {
+    pub fn remove(&mut self, name: &str) {
         self.groups.retain(|g| g != name);
         for style in &mut self.objects {
             if style.group.as_deref() == Some(name) {
@@ -91,77 +109,18 @@ impl Organization {
         }
     }
 
-    pub fn folders(&mut self, ui: &mut Ui, filter: &mut GroupFilter) {
-        ui.heading(tr("Groups"));
-        ui.selectable_value(filter, GroupFilter::All, tr("All objects"));
-        ui.selectable_value(filter, GroupFilter::Ungrouped, tr("Ungrouped"));
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("object_groups")
-            .max_height((ui.available_height() - 150.0).max(60.0))
-            .show(ui, |ui| {
-                for name in &self.groups {
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        let p = crate::ui::theme::pal(ui);
-                        crate::ui::icons::paint(
-                            ui.painter(),
-                            rect,
-                            crate::ui::icons::Ico::Folder,
-                            p.icon,
-                            &p,
-                            true,
-                        );
-                        ui.selectable_value(filter, GroupFilter::Named(name.clone()), name);
-                    });
-                }
-            });
-        ui.separator();
-        ui.add(
-            egui::TextEdit::singleline(&mut self.name)
-                .id(egui::Id::new("new_object_group"))
-                .char_limit(120)
-                .hint_text(tr("Group name"))
-                .desired_width(ui.available_width()),
-        );
-        let name = self.name.trim().to_string();
-        let valid = !name.is_empty() && !self.groups.contains(&name);
-        if ui
-            .add_enabled(valid, egui::Button::new(tr("New group")))
-            .clicked()
-        {
-            self.groups.push(name.clone());
-            *filter = GroupFilter::Named(name.clone());
-            self.name.clear();
-        }
-        if let GroupFilter::Named(old) = filter.clone() {
-            if ui
-                .add_enabled(valid, egui::Button::new(tr("Rename group")))
-                .clicked()
-            {
-                self.rename(&old, &name);
-                *filter = GroupFilter::Named(name);
-                self.name.clear();
-            }
-            if ui.button(tr("Delete group")).clicked() {
-                self.remove(&old);
-                *filter = GroupFilter::All;
-            }
-        }
-        ui.label(
-            RichText::new(tr("Groups and colors are stored locally."))
-                .small()
-                .weak(),
-        );
-    }
-
-    pub fn menu(&mut self, ui: &mut Ui, schema: &str, table: &str) {
-        ui.menu_button(tr("Move to group"), |ui| {
+    pub fn menu(&mut self, ui: &mut Ui, tables: &[crate::ui::explorer::TableRef]) -> bool {
+        let mut create = false;
+        ui.menu_button(tr("Add to group…"), |ui| {
             if ui.button(tr("Ungrouped")).clicked() {
-                self.style_mut(schema, table).group = None;
+                self.assign(tables, None);
                 ui.close();
             }
+            if ui.button(tr("New group…")).clicked() {
+                create = true;
+                ui.close();
+            }
+            ui.separator();
             let mut chosen = None;
             for group in &self.groups {
                 if ui.button(group).clicked() {
@@ -170,12 +129,14 @@ impl Organization {
                 }
             }
             if let Some(group) = chosen {
-                self.style_mut(schema, table).group = Some(group);
+                self.assign(tables, Some(&group));
             }
         });
         ui.menu_button(tr("Color"), |ui| {
             if ui.button(tr("Default")).clicked() {
-                self.style_mut(schema, table).color = None;
+                for table in tables {
+                    self.style_mut(&table.schema, &table.table).color = None;
+                }
                 ui.close();
             }
             for (name, color) in [
@@ -192,19 +153,22 @@ impl Organization {
                     )
                     .clicked()
                 {
-                    self.style_mut(schema, table).color = Some(color);
+                    for table in tables {
+                        self.style_mut(&table.schema, &table.table).color = Some(color);
+                    }
                     ui.close();
                 }
             }
         });
+        create
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
+
     fn groups_and_colors_roundtrip_without_touching_other_schemas() {
         let mut org = Organization {
             conn: 7,
@@ -218,11 +182,11 @@ mod tests {
         org.rename("Sales", "Orders");
         let mut org: Organization =
             serde_json::from_str(&serde_json::to_string(&org).unwrap()).unwrap();
-        assert!(org.matches("public", "orders", &GroupFilter::Named("Orders".into())));
-        assert!(org.matches("archive", "orders", &GroupFilter::Ungrouped));
+        assert_eq!(org.group("public", "orders"), Some("Orders"));
+        assert!(org.group("archive", "orders").is_none());
         assert!(org.color("public", "orders").is_some());
         org.remove("Orders");
-        assert!(org.matches("public", "orders", &GroupFilter::Ungrouped));
+        assert!(org.group("public", "orders").is_none());
         assert!(org.color("public", "orders").is_some());
     }
 }

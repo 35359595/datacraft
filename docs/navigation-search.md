@@ -36,16 +36,33 @@ session after attempting native cancellation.
 
 ## Object groups and colors
 
-The Groups pane provides local folders for organizing tables and views. Enter
-a name and choose **New group**. Right-click an object and use **Move to group**
-or **Color**. Select a group to browse its contents; **All objects** and
-**Ungrouped** provide the other views. Rename/delete operates on the selected
-group. Deleting a group returns its objects to Ungrouped and retains colors.
+Groups appear as folders alongside objects, without a separate Groups pane.
+Right-click empty space, choose **New group…**, enter its name and save.
+Double-click a folder (or select it and press Enter) to browse its contents;
+**All objects** returns to the parent view.
+
+Ctrl/Command-click toggles individual objects, Shift-click or Shift+arrows extends
+a range, and Ctrl/Command+A selects all visible objects. Drag a rectangle from
+empty space to select several objects with the mouse. Right-clicking an already
+selected table keeps the full selection for **Add to group…** and **Color**.
+
+Drag selected tables onto a folder to move the entire selection into it. Inside
+a folder, drop onto **All objects**, or choose **Add to group… → Ungrouped**, to
+move tables out. A folder's context menu offers rename and delete. Deleting a
+folder removes only its grouping and retains object colors.
 
 Groups and colors are saved in application preferences per connection/database,
 with separate entries for objects of the same name in different schemas. They
 do not create schemas, rename tables, or write organizational metadata to the
 database. They apply to both the object list and grid.
+
+The selected list/grid layout is saved with application settings. **Save on row
+change** is also remembered and used by existing and newly opened table editors;
+it remains disabled by default.
+
+Right-click one writable table and choose **Truncate…** to open the existing
+confirmation and SQL preview. Truncate is disabled for views, read-only
+connections and multiple selections; choosing the menu item does not execute SQL.
 
 ## Closing tabs
 
