@@ -373,7 +373,14 @@
     "Related rows:": "Powiązane wiersze:",
     "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "Powiązane tabele trafiają do tego samego schematu docelowego pod własnymi nazwami; wiersze, które już tam są (ten sam klucz główny), są pomijane.",
     "Rows that reference them (e.g. their orders and order lines)": "Wiersze, które się do nich odwołują (np. ich zamówienia i pozycje zamówień)",
-    "Rows they reference (needed by the foreign keys)": "Wiersze, do których się odwołują (wymagane przez klucze obce)"
+    "Rows they reference (needed by the foreign keys)": "Wiersze, do których się odwołują (wymagane przez klucze obce)",
+    "Masked export saved": "Zapisano zamaskowany eksport",
+    "Masked rows copied to the clipboard": "Skopiowano zamaskowane wiersze do schowka",
+    "Export with Masking…": "Eksportuj z maskowaniem…",
+    "Export with Masking": "Eksportuj z maskowaniem",
+    "Format:": "Format:",
+    "Masked columns: {n}": "Zamaskowane kolumny: {n}",
+    "The grid keeps the real values; only the exported text is masked.": "Siatka zachowuje prawdziwe wartości; maskowany jest tylko eksportowany tekst."
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "Instrukcja zmieniła wiersze: {n} (oczekiwano 1); nic nie zapisano:\n{stmt}",

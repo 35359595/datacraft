@@ -6,6 +6,7 @@ pub mod console;
 pub mod create_dialog;
 pub mod drop_dialog;
 pub mod import_dialog;
+pub mod mask_export_dialog;
 pub mod editing;
 pub mod explorer;
 pub mod icons;

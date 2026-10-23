@@ -195,6 +195,8 @@ pub enum ConsoleAction {
     Submit(usize),
     /// Close result tabs (the app confirms if they have unsaved changes).
     CloseResults(CloseResults),
+    /// Open "Export with Masking" for the last result.
+    ExportMasked,
 }
 
 fn edit_action(a: results::EditAction, view: usize) -> ConsoleAction {
@@ -1099,11 +1101,16 @@ impl Console {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    if ui.button(tr("Export with Masking…")).clicked() {
+                        actions.push(ConsoleAction::ExportMasked);
+                        ui.close();
+                    }
                 });
                 // ⤓: export straight to a file in the chosen format.
                 if theme::icon_button(ui, Ico::Export, has_rows, &trf("Export to {format} file…", &[("format", &fmt.label())])).clicked()
                     && let Some(view) = self.results.last()
-                    && let Err(e) = results::export_to_file(view, fmt, &target, &base)
+                    && let Err(e) = results::export_to_file(view, fmt, &target, &base, None)
                 {
                     actions.push(ConsoleAction::Error(trf("Export failed: {error}", &[("error", &e)])));
                 }

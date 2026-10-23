@@ -23,6 +23,7 @@
 //! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
 //! `DATACRAFT_DEMO_COPY=1` opens "Copy Table To…" on the first table, into `<name>_copy`;
 //! `mask` also applies "Suggest masking".
+//! `DATACRAFT_DEMO_MASK_EXPORT=1` opens "Export with Masking…" on the first table's data.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
@@ -41,6 +42,7 @@ use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
 use crate::ui::copy_dialog::{CopyAction, CopyDialog};
 use crate::ui::import_dialog::{ImportDialog, ImportResult};
+use crate::ui::mask_export_dialog::{MaskExportAction, MaskExportDialog};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -265,6 +267,8 @@ pub struct DataCraftApp {
     import: Option<ImportDialog>,
     /// "Copy Table To…".
     copy: Option<CopyDialog>,
+    /// "Export with Masking…".
+    mask_export: Option<MaskExportDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -341,6 +345,7 @@ impl DataCraftApp {
             drop: None,
             import: None,
             copy: None,
+            mask_export: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -813,6 +818,14 @@ impl DataCraftApp {
 
     /// Demo mode: simulated changes (never saved) on the first data editor.
     fn apply_demo_edit(&mut self, console: u64) {
+        // DATACRAFT_DEMO_MASK_EXPORT=1: "Export with Masking…" on the first table's data.
+        if self.mask_export.is_none()
+            && std::env::var("DATACRAFT_DEMO").is_ok_and(|v| !v.is_empty())
+            && std::env::var("DATACRAFT_DEMO_MASK_EXPORT").is_ok_and(|v| v == "1")
+            && let Some(idx) = self.consoles.iter().position(|c| c.id == console && c.table.is_some())
+        {
+            self.open_mask_export(idx);
+        }
         let Some(kind) = self.demo_edit else { return };
         let Some(idx) = self.consoles.iter().position(|c| c.id == console && c.table.is_some()) else { return };
         let Some(v) = self.consoles[idx].results.last_mut() else { return };
@@ -1438,6 +1451,36 @@ impl DataCraftApp {
         self.info(msg);
     }
 
+    /// "Export with Masking…" for a console's last result.
+    fn open_mask_export(&mut self, idx: usize) {
+        let Some(c) = self.consoles.get(idx) else { return };
+        let Some(view) = c.results.last().filter(|v| !v.rs.is_command()) else { return };
+        let driver = c.conn.and_then(|id| self.conn(id)).map_or(Driver::Postgres, |x| x.cfg.driver);
+        let (target, base) = match &c.table {
+            Some(t) => (Session::quote_table(driver, &t.schema, &t.table), t.table.clone()),
+            None => (tr("table").to_string(), tr("result").to_string()),
+        };
+        self.mask_export = Some(MaskExportDialog::new(c.id, view.rs.columns.clone(), c.export_format, target, base));
+    }
+
+    /// Exports or copies the masked result (a cancelled save dialog leaves it open).
+    fn run_mask_export(&mut self, ctx: &egui::Context, save: bool) {
+        let Some(d) = self.mask_export.take() else { return };
+        let Some(view) = self.consoles.iter().find(|c| c.id == d.console).and_then(|c| c.results.last()) else { return };
+        let key = if d.masks.iter().any(|m| *m != crate::db::copy::Mask::Keep) { config::masking_key() } else { String::new() };
+        let masks = Some(crate::ui::results::ExportMasks { masks: &d.masks, key: &key });
+        if save {
+            match crate::ui::results::export_to_file(view, d.format, &d.insert_target, &d.base_name, masks) {
+                Ok(true) => self.info(tr("Masked export saved")),
+                Ok(false) => self.mask_export = Some(d),
+                Err(e) => self.error(trf("Export failed: {error}", &[("error", &e)])),
+            }
+        } else {
+            ctx.copy_text(crate::ui::results::format_rows_masked(view, d.format, &d.insert_target, masks));
+            self.info(tr("Masked rows copied to the clipboard"));
+        }
+    }
+
     /// Demo mode: runs the import as if "Import" had been clicked.
     fn submit_import(&mut self) {
         let Some(d) = self.import.as_mut() else { return };
@@ -1854,6 +1897,7 @@ impl DataCraftApp {
             || self.drop.is_some()
             || self.import.is_some()
             || self.copy.is_some()
+            || self.mask_export.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2658,6 +2702,7 @@ impl DataCraftApp {
                 ConsoleAction::Preview(view) => self.open_preview(idx, view),
                 ConsoleAction::Submit(view) => self.submit_now(idx, view),
                 ConsoleAction::CloseResults(which) => self.close_results(idx, which),
+                ConsoleAction::ExportMasked => self.open_mask_export(idx),
             }
         }
     }
@@ -2718,6 +2763,15 @@ impl DataCraftApp {
                     self.worker.send(Request::RunDdl { conn, db, statements, close_db: None, transaction: true });
                 }
                 Some(ImportResult::Cancel) => self.import = None,
+                None => {}
+            }
+        }
+
+        if let Some(d) = self.mask_export.as_mut() {
+            match d.show(ctx) {
+                Some(MaskExportAction::Save) => self.run_mask_export(ctx, true),
+                Some(MaskExportAction::Copy) => self.run_mask_export(ctx, false),
+                Some(MaskExportAction::Close) => self.mask_export = None,
                 None => {}
             }
         }
@@ -3315,7 +3369,7 @@ mod tests {
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             save_on_row_change: false,
-            dialog: None, confirm_delete: None, create: None, drop: None, import: None, copy: None, renaming: None,
+            dialog: None, confirm_delete: None, create: None, drop: None, import: None, copy: None, mask_export: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,

@@ -373,7 +373,14 @@
     "Related rows:": "Lignes liées :",
     "Related tables go to the same target schema with their own names; rows already there (same primary key) are skipped.": "Les tables liées vont dans le même schéma cible avec leur propre nom ; les lignes déjà présentes (même clé primaire) sont ignorées.",
     "Rows that reference them (e.g. their orders and order lines)": "Lignes qui les référencent (ex. leurs commandes et lignes de commande)",
-    "Rows they reference (needed by the foreign keys)": "Lignes qu'elles référencent (nécessaires aux clés étrangères)"
+    "Rows they reference (needed by the foreign keys)": "Lignes qu'elles référencent (nécessaires aux clés étrangères)",
+    "Masked export saved": "Export masqué enregistré",
+    "Masked rows copied to the clipboard": "Lignes masquées copiées dans le presse-papiers",
+    "Export with Masking…": "Exporter avec masquage…",
+    "Export with Masking": "Exporter avec masquage",
+    "Format:": "Format :",
+    "Masked columns: {n}": "Colonnes masquées : {n}",
+    "The grid keeps the real values; only the exported text is masked.": "La grille garde les valeurs réelles ; seul le texte exporté est masqué."
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "L’instruction a affecté {n} lignes (1 attendue) ; rien n’a été enregistré :\n{stmt}",
