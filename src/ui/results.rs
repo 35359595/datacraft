@@ -124,6 +124,8 @@ pub struct ResultView {
     selected_cells: BTreeSet<(usize, usize)>,
     cell_anchor: Option<(usize, usize)>,
     drag_anchor: Option<(usize, usize, bool)>,
+    /// Rows belonging to the pending edit batch, independent of cursor selection.
+    edit_rows: BTreeSet<RowRef>,
     /// Selected visual rows (to delete several).
     selected_rows: BTreeSet<usize>,
     anchor: Option<usize>,
@@ -155,6 +157,7 @@ impl ResultView {
             selected_cells: BTreeSet::new(),
             cell_anchor: None,
             drag_anchor: None,
+            edit_rows: BTreeSet::new(),
             selected_rows: BTreeSet::new(),
             anchor: None,
             scroll_to: None,
@@ -192,6 +195,7 @@ impl ResultView {
 
     /// Discards pending changes and any edit in progress.
     pub fn discard_edits(&mut self) {
+        self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.state.clear();
             e.editing = None;
@@ -215,11 +219,13 @@ impl ResultView {
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             e.state.undo();
+            if !e.state.is_dirty() { self.edit_rows.clear(); }
         }
         self.clamp_selection();
     }
 
     pub fn revert_all(&mut self) {
+        self.edit_rows.clear();
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             e.state.revert_all();
@@ -375,16 +381,7 @@ impl ResultView {
         if cells.is_empty() {
             cells.push((ed.row, ed.col));
         }
-        if let Some(e) = self.edit.as_mut() {
-            e.state.set_values(
-                &self.rs,
-                &e.target,
-                cells
-                    .into_iter()
-                    .map(|(row, col)| (row, col, Some(ed.buffer.clone())))
-                    .collect(),
-            );
-        }
+        self.apply_cell_values(cells.into_iter().map(|(row, col)| (row, col, Some(ed.buffer.clone()))).collect());
     }
 
     fn toggle_sort(&mut self, col: usize) {
@@ -570,18 +567,16 @@ impl ResultView {
             .join("\n")
     }
 
-    fn fill_selection(&mut self, value: Cell) {
-        let cells = self.selected_cell_refs();
+    fn apply_cell_values(&mut self, values: Vec<(RowRef, usize, Cell)>) {
         if let Some(edit) = self.edit.as_mut() {
-            edit.state.set_values(
-                &self.rs,
-                &edit.target,
-                cells
-                    .into_iter()
-                    .map(|(r, c)| (r, c, value.clone()))
-                    .collect(),
-            );
+            if !edit.state.is_dirty() { self.edit_rows.clear(); }
+            let rows: BTreeSet<_> = values.iter().filter(|(row, col, _)| edit.state.cell_editable(&self.rs, &edit.target, *row, *col)).map(|(row, _, _)| *row).collect();
+            if edit.state.set_values(&self.rs, &edit.target, values) { self.edit_rows.extend(rows); }
         }
+    }
+
+    fn fill_selection(&mut self, value: Cell) {
+        self.apply_cell_values(self.selected_cell_refs().into_iter().map(|(r, c)| (r, c, value.clone())).collect());
     }
 
     fn paste_selection(&mut self, text: &str) -> Result<(), String> {
@@ -605,9 +600,7 @@ impl ResultView {
                 values.push((row_ref, c + dc, Some(value.to_owned())));
             }
         }
-        if let Some(edit) = self.edit.as_mut() {
-            edit.state.set_values(&self.rs, &edit.target, values);
-        }
+        self.apply_cell_values(values);
         Ok(())
     }
 
@@ -674,6 +667,7 @@ impl ResultView {
 
     fn cancel_row(&mut self) {
         let row = self.selected_row();
+        if let Some(row) = row { self.edit_rows.remove(&row); }
         if let Some(e) = self.edit.as_mut() {
             e.editing = None;
             if let Some(row) = row {
@@ -683,12 +677,19 @@ impl ResultView {
         self.clamp_selection();
     }
 
+    fn row_in_edit_batch(&self, row: RowRef) -> bool {
+        self.edit_rows.contains(&row) || self.edit.as_ref().is_some_and(|edit| match row {
+            RowRef::Existing(r) => edit.state.deleted.contains(&r) || edit.state.changes.keys().any(|(changed, _)| *changed == r),
+            RowRef::New(i) => i < edit.state.inserted.len(),
+        })
+    }
+
     fn row_change_needs_save(&self, previous: Option<RowRef>) -> bool {
         // A newly added row must be filled before it is submitted.
-        previous.is_some()
+        previous.is_none_or(|row| self.row_in_edit_batch(row))
             && self
                 .selected_row()
-                .is_some_and(|r| matches!(r, RowRef::Existing(_)) && Some(r) != previous)
+                .is_some_and(|r| matches!(r, RowRef::Existing(_)) && Some(r) != previous && !self.row_in_edit_batch(r))
             && self.is_dirty()
     }
 
@@ -712,6 +713,7 @@ impl ResultView {
             (r, c, keys)
         });
         self.rs = rs;
+        self.edit_rows.clear();
         self.edit = None;
         self.edit_checked = false;
         self.readonly_reason = None;
@@ -1026,8 +1028,21 @@ pub fn show_result(
     let previous_row = view.selected_row();
     let edit_id = egui::Id::new(("cell_edit", view.salt));
     let page_rows = (area_rect.height() / ROW_H).floor().max(1.0) as usize;
+    let owns_focus = ui.memory(|m| m.focused().is_none() || m.has_focus(edit_id));
+    let editor_pending_focus = view.edit.as_ref().and_then(|e| e.editing.as_ref()).is_some_and(|ed| ed.focus);
+    let keyboard_enabled = ui.is_enabled() && !egui::Popup::is_any_open(ui.ctx());
 
-    if ui.is_enabled() && editable && editing_now && ui.memory(|m| m.has_focus(edit_id)) {
+    if keyboard_enabled && editable && editing_now && (owns_focus || editor_pending_focus) {
+        let action = ui.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::Escape) { Some(GridAction::Cancel) }
+            else if i.consume_key(Modifiers::SHIFT, Key::Tab) { Some(GridAction::Navigate(Key::Tab, Modifiers::SHIFT)) }
+            else if i.consume_key(Modifiers::NONE, Key::Tab) { Some(GridAction::Navigate(Key::Tab, Modifiers::NONE)) }
+            else if i.consume_key(Modifiers::COMMAND, Key::Enter) || i.consume_key(Modifiers::SHIFT, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Enter) { Some(GridAction::Commit) }
+            else if i.consume_key(Modifiers::NONE, Key::ArrowUp) { Some(GridAction::Navigate(Key::ArrowUp, Modifiers::NONE)) }
+            else if i.consume_key(Modifiers::NONE, Key::ArrowDown) { Some(GridAction::Navigate(Key::ArrowDown, Modifiers::NONE)) }
+            else { None }
+        });
+        if let Some(action) = action { actions.push(action); }
         let (add, delete) = ui.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::N)
@@ -1043,13 +1058,10 @@ pub fn show_result(
         }
     }
 
-    // Grid keyboard (only if no widget has focus).
-    if ui.is_enabled()
-        && !egui::Popup::is_any_open(ui.ctx())
-        && ui.memory(|m| m.focused().is_none())
-        && !editing_now
+    // Retain grid ownership when an inline editor was removed before this frame.
+    if keyboard_enabled && owns_focus && !editing_now
     {
-        if copy_requested && view.has_selection() {
+        if (copy_requested || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))) && view.has_selection() {
             ui.ctx().copy_text(view.selection_tsv());
         }
         if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
@@ -1318,16 +1330,17 @@ pub fn show_result(
                     for c in 0..n_cols {
                         let is_sel = view.cell_selected(vr, c);
                         let value = view.display_value(rref, c);
-                        let modified = edit.is_some_and(|e| e.state.is_modified(rref, c)) && !is_new;
                         let can_edit = edit.is_some_and(|e| e.state.cell_editable(&view.rs, &e.target, rref, c));
                         let editing_here = inline.as_ref().is_some_and(|ed| ed.row == rref && ed.col == c);
+                        let modified = (edit.is_some_and(|e| e.state.is_modified(rref, c)) && !is_new)
+                            || inline.as_ref().is_some_and(|ed| editing_here && ed.changed);
                         let (_, resp) = row.col(|ui| {
                             let r = ui.max_rect();
                             if view.selected == Some((vr, c)) && scroll_to == Some(vr) { ui.scroll_to_rect(r, None); }
-                            let bg = if is_sel && !editing_here {
-                                Some(p.selection)
-                            } else if modified && !deleted {
+                            let bg = if modified && !deleted {
                                 Some(p.cell_modified)
+                            } else if is_sel && !editing_here {
+                                Some(p.selection)
                             } else if row_sel {
                                 Some(p.selection_inactive)
                             } else {
@@ -1336,28 +1349,19 @@ pub fn show_result(
                             if let Some(bg) = bg {
                                 ui.painter().rect_filled(r, 0.0, bg);
                             }
+                            if modified && is_sel && !editing_here {
+                                let width = if view.selected == Some((vr, c)) { 2.0 } else { 1.0 };
+                                ui.painter().rect_stroke(r.shrink(0.5), 0.0, Stroke::new(width, p.accent), egui::StrokeKind::Inside);
+                            }
                             ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.grid));
                             if editing_here && let Some(ed) = inline.as_mut() {
-                                let focused = ui.memory(|m| m.has_focus(edit_id));
-                                if focused && ui.is_enabled() {
-                                    let keys = ui.input_mut(|i| {
-                                        let back = i.consume_key(Modifiers::SHIFT, Key::Tab);
-                                        let fwd = !back && i.consume_key(Modifiers::NONE, Key::Tab);
-                                        let enter = i.consume_key(Modifiers::NONE, Key::Enter);
-                                        let esc = i.consume_key(Modifiers::NONE, Key::Escape);
-                                        let up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
-                                        let down = i.consume_key(Modifiers::NONE, Key::ArrowDown);
-                                        (back, fwd, enter, esc, up, down)
-                                    });
-                                    match keys {
-                                        (_, _, _, true, _, _) => actions.push(GridAction::Cancel),
-                                        (true, _, _, _, _, _) => actions.push(GridAction::Navigate(Key::Tab, Modifiers::SHIFT)),
-                                        (_, true, _, _, _, _) => actions.push(GridAction::Navigate(Key::Tab, Modifiers::NONE)),
-                                        (_, _, true, _, _, _) => actions.push(GridAction::Navigate(Key::Enter, Modifiers::NONE)),
-                                        (_, _, _, _, true, _) => actions.push(GridAction::Navigate(Key::ArrowUp, Modifiers::NONE)),
-                                        (_, _, _, _, _, true) => actions.push(GridAction::Navigate(Key::ArrowDown, Modifiers::NONE)),
-                                        _ => {}
-                                    }
+                                if ed.focus && ui.is_enabled() {
+                                    ed.focus = false;
+                                    ui.memory_mut(|m| m.request_focus(edit_id));
+                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
+                                    let n = ed.buffer.chars().count();
+                                    st.cursor.set_char_range(Some(if ed.select_all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) }));
+                                    st.store(ui.ctx(), edit_id);
                                 }
                                 ui.painter().rect_stroke(r.shrink(0.5), 2.0, Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
                                 let edit_rect = r.shrink2(egui::vec2(5.0, 2.0));
@@ -1373,14 +1377,7 @@ pub fn show_result(
                                         .desired_width(edit_rect.width()),
                                 );
                                 ed.changed |= te.changed();
-                                if ed.focus {
-                                    ed.focus = false;
-                                    te.request_focus();
-                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
-                                    let n = ed.buffer.chars().count();
-                                    st.cursor.set_char_range(Some(if ed.select_all { CCursorRange::two(CCursor::new(0), CCursor::new(n)) } else { CCursorRange::one(CCursor::new(n)) }));
-                                    st.store(ui.ctx(), edit_id);
-                                } else if te.lost_focus() && !actions.iter().any(|a| matches!(a, GridAction::Commit | GridAction::Navigate(..) | GridAction::Cancel)) {
+                                if te.lost_focus() && !actions.iter().any(|a| matches!(a, GridAction::Commit | GridAction::Navigate(..) | GridAction::Cancel)) {
                                     actions.push(GridAction::Commit);
                                 }
                                 return;
@@ -1618,8 +1615,8 @@ pub fn show_result(
             GridAction::SetNull(row, c) => {
                 if !view.selected_cells.is_empty() {
                     view.fill_selection(None);
-                } else if let Some(e) = view.edit.as_mut() {
-                    e.state.set_value(&view.rs, row, c, None);
+                } else {
+                    view.apply_cell_values(vec![(row, c, None)]);
                 }
             }
             GridAction::Revert(row, c) => {
@@ -2201,6 +2198,306 @@ mod keyboard_tests {
             assert!(state.view.edit.as_ref().unwrap().editing.is_none());
             assert_eq!(state.submits, usize::from(auto_save));
         }
+    }
+
+    fn batch_view() -> ResultView {
+        let mut v = ResultView::new(
+            ResultSet {
+                columns: (0..7).map(|c| format!("field_{c}")).collect(),
+                rows: (0..20)
+                    .map(|r| (0..7).map(|c| Some(format!("value_{r}_{c}"))).collect())
+                    .collect(),
+                ..Default::default()
+            },
+            43,
+        );
+        v.rs.rows[4][2] = Some("0".into());
+        v.set_edit_target(Ok(EditTarget {
+            schema: "main".into(),
+            table: "sample".into(),
+            col_names: v.rs.columns.clone(),
+            key_cols: vec![0],
+            binary_cols: vec![false; 7],
+            has_pk: true,
+        }));
+        v.select_cell(0, 2, Modifiers::NONE);
+        v.select_cell(9, 2, Modifiers::SHIFT);
+        v
+    }
+
+    #[test]
+    fn bulk_edit_stays_put_and_saves_only_after_leaving_its_rows() {
+        let mut h = harness(true, false);
+        h.state_mut().view = batch_view();
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(
+            h.state().view.selected,
+            Some((9, 2)),
+            "Enter must not advance out of the edited block"
+        );
+        assert_eq!(h.state().submits, 0);
+        assert_eq!(h.state().view.edit.as_ref().unwrap().state.changes.len(), 9);
+        for key in [
+            Key::ArrowRight,
+            Key::ArrowLeft,
+            Key::ArrowUp,
+            Key::ArrowDown,
+        ] {
+            h.key_press(key);
+            h.run_steps(2);
+            assert_eq!(
+                h.state().submits,
+                0,
+                "navigation inside the edited rows must not submit"
+            );
+        }
+        for _ in 0..5 {
+            h.key_press(Key::ArrowUp);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().view.selected, Some((4, 2)));
+        assert_eq!(
+            h.state().submits,
+            0,
+            "an unchanged value inside the selected block is still part of that block"
+        );
+        for _ in 0..6 {
+            h.key_press(Key::ArrowDown);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().view.selected, Some((10, 2)));
+        assert_eq!(h.state().submits, 1);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(
+            h.state().submits,
+            1,
+            "a failed submission must not retry on every outside row"
+        );
+        for _ in 0..2 {
+            h.key_press(Key::ArrowUp);
+            h.run_steps(2);
+        }
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(
+            h.state().submits,
+            2,
+            "returning to the batch and leaving it allows retry"
+        );
+    }
+
+    #[test]
+    fn undo_preserves_the_remaining_batch_until_save() {
+        let mut v = batch_view();
+        v.fill_selection(Some("0".into()));
+        v.select_cell(9, 3, Modifiers::NONE);
+        v.fill_selection(Some("another".into()));
+        v.undo();
+        assert!(v.row_in_edit_batch(RowRef::Existing(4)));
+        assert_eq!(v.edit.as_ref().unwrap().state.changes.len(), 9);
+        v.mark_saved();
+        assert!(v.edit_rows.is_empty());
+        assert!(!v.is_dirty());
+    }
+
+    #[test]
+    fn clicking_outside_after_sort_clears_selection_still_saves_the_batch() {
+        let mut v = batch_view();
+        v.fill_selection(Some("0".into()));
+        v.toggle_sort(0);
+        v.selected = None;
+        v.selected_cells.clear();
+        v.selected_rows.clear();
+        let outside = v.order.iter().position(|&r| r == 10).unwrap();
+        v.select_cell(outside, 2, Modifiers::NONE);
+        assert!(v.row_change_needs_save(None));
+    }
+
+    fn batch_console_scenario(render: bool) {
+        use crate::ui::console::{Console, ConsoleAction, ConsoleCtx};
+        struct ConsoleState {
+            console: Console,
+            db: rusqlite::Connection,
+            submits: usize,
+        }
+        let v = batch_view();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE sample(field_0 TEXT PRIMARY KEY, field_1 TEXT, field_2 TEXT, field_3 TEXT, field_4 TEXT, field_5 TEXT, field_6 TEXT)").unwrap();
+        for row in &v.rs.rows {
+            db.execute(
+                "INSERT INTO sample VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params_from_iter(row.iter()),
+            )
+            .unwrap();
+        }
+        let mut console = Console::new_table(1, 1, None, "main".into(), "sample".into());
+        console.table.as_mut().unwrap().save_on_row_change = true;
+        console.results.push(v);
+        let mut first = true;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1280.0, 760.0))
+            .build_ui_state(
+                move |ui, state: &mut ConsoleState| {
+                    if std::mem::take(&mut first) {
+                        theme::install_fonts(ui.ctx());
+                        theme::apply(ui.ctx(), true);
+                        return;
+                    }
+                    let cx = ConsoleCtx {
+                        connections: &[],
+                        schemas: None,
+                        driver: crate::db::Driver::Sqlite,
+                        dark: true,
+                        font_size: 14.0,
+                        columns: None,
+                    };
+                    for action in state.console.show_table(ui, &cx) {
+                        if let ConsoleAction::Submit(i) = action {
+                            state.submits += 1;
+                            let view = &mut state.console.results[i];
+                            view.finish_inline_edit();
+                            let edit = view.edit.as_ref().unwrap();
+                            let target = edit.target.clone();
+                            let changes = edit.state.build_changes(&view.rs, &target).unwrap();
+                            let transaction = state.db.transaction().unwrap();
+                            for change in changes {
+                                let sql = crate::edit::change_sql(
+                                    crate::db::Driver::Sqlite,
+                                    &target.schema,
+                                    &target.table,
+                                    &change,
+                                );
+                                assert_eq!(transaction.execute(&sql, []).unwrap(), 1);
+                            }
+                            transaction.commit().unwrap();
+                            let mut statement = state
+                                .db
+                                .prepare("SELECT * FROM sample ORDER BY rowid")
+                                .unwrap();
+                            let rows = statement
+                                .query_map([], |row| {
+                                    (0..7)
+                                        .map(|c| row.get::<_, Option<String>>(c))
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                })
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let mut fresh = view.rs.clone();
+                            fresh.rows = rows;
+                            view.mark_saved();
+                            view.refresh(fresh);
+                            view.set_edit_target(Ok(target));
+                        } else if let ConsoleAction::Error(error) = action {
+                            panic!("{error}");
+                        }
+                    }
+                },
+                ConsoleState {
+                    console,
+                    db,
+                    submits: 0,
+                },
+            );
+        h.run_steps(3);
+        h.input_mut().events.push(egui::Event::Text("0".into()));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().submits, 0);
+        assert_eq!(h.state().console.results[0].selected, Some((9, 2)));
+        assert_eq!(
+            h.state().console.results[0]
+                .edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .len(),
+            9
+        );
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/edit-range-snapshots");
+        if render {
+            std::fs::create_dir_all(&directory).unwrap();
+            h.render()
+                .unwrap()
+                .save(directory.join("pending.png"))
+                .unwrap();
+        }
+        for key in [Key::ArrowRight, Key::ArrowLeft] {
+            h.key_press(key);
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().submits, 0);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().submits, 1);
+        assert_eq!(h.state().console.results[0].selected, Some((10, 2)));
+        assert!(!h.state().console.results[0].is_dirty());
+        let count: i64 = h
+            .state()
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sample WHERE field_2 = '0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 10);
+        if render {
+            h.render()
+                .unwrap()
+                .save(directory.join("saved.png"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn leaving_the_batch_submits_the_sqlite_transaction() {
+        batch_console_scenario(false);
+    }
+
+    #[test]
+    #[ignore = "Requires a GPU; renders the pending batch and its saved result on test data"]
+    fn render_edit_batch() {
+        batch_console_scenario(true);
+    }
+
+    #[test]
+    fn navigation_accepts_a_stale_inline_focus_id() {
+        let mut h = harness(false, false);
+        let id = egui::Id::new(("cell_edit", h.state().view.salt));
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.key_press(Key::ArrowDown);
+        h.run_steps(1);
+        assert_eq!(h.state().view.selected, Some((1, 1)));
+    }
+
+    #[test]
+    fn text_and_down_are_handled_before_the_editor_has_its_first_focus_frame() {
+        let mut h = harness(true, false);
+        h.state_mut().view.begin_edit(0, 1);
+        h.input_mut().events.push(egui::Event::Text("quick".into()));
+        h.key_press(Key::ArrowDown);
+        h.run_steps(3);
+        assert_eq!(h.state().view.selected, Some((1, 1)));
+        assert_eq!(
+            h.state()
+                .view
+                .edit
+                .as_ref()
+                .unwrap()
+                .state
+                .changes
+                .get(&(0, 1)),
+            Some(&Some("quick".into()))
+        );
+        assert_eq!(h.state().submits, 1);
     }
 
     #[test]

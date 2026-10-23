@@ -167,7 +167,7 @@ pub struct TableTab {
     pub order_by: String,
     /// false until the first load (restored tabs load when activated).
     pub loaded: bool,
-    /// Opt-in: submit pending grid changes when navigating to another row.
+    /// Opt-in: submit pending grid changes when leaving the edited rows.
     pub save_on_row_change: bool,
 }
 
@@ -1061,7 +1061,7 @@ impl Console {
                         let editable =
                             !busy && self.results.last().is_some_and(|v| v.edit.is_some());
                         ui.add_enabled(editable, egui::Checkbox::new(&mut t.save_on_row_change, tr("Save on row change")))
-                    .on_hover_text(tr("Automatically submit all pending grid changes in a transaction when moving to another row. Off by default."));
+                    .on_hover_text(tr("Automatically submit all pending grid changes when leaving the edited rows. Off by default."));
             }
             self.busy_label(ui);
                 }

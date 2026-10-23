@@ -9,7 +9,7 @@ Ctrl for the combinations below.
 | Arrow keys | Select the adjacent cell |
 | Enter, F2 or Ctrl+Enter | Edit the selected cell |
 | Up / Down while editing | Finish the cell edit and select the previous / next row |
-| Enter while editing | Finish the cell edit and select the next row |
+| Enter while editing | Finish the cell edit without moving the cursor |
 | Tab / Shift+Tab | Move to the next / previous cell, wrapping between rows; during editing, edit the destination cell |
 | Ctrl+Left / Right, Home / End | First / last column of the current row |
 | Ctrl+Up / Down, Ctrl+Home / End | First / last loaded row in the current column |
@@ -43,6 +43,9 @@ value. The whole fill is one Undo action. A single pasted value also fills the
 selection; tab-separated clipboard data is pasted as a matrix. An oversized
 matrix is rejected before any cells change.
 
+Pending changes have an amber background. Selected changed cells keep that
+background and add a blue outline, so selection cannot hide unsaved edits.
+
 Column selection covers the loaded rows after the current filters, including
 new rows, rather than every record in the database. Deleted rows, binary cells,
 truncated values and rows without usable identifiers retain their protections.
@@ -57,12 +60,16 @@ Sorting or filtering commits an open editor into pending changes first.
 
 **Save on row change** is off by default and applies only to the current table
 editor tab. SQL console results retain explicit submission. Enable the checkbox
-in the table toolbar to submit pending changes when moving to a different
-existing row with the keyboard or mouse.
+in the table toolbar to submit pending changes when leaving the edited rows
+with the keyboard or mouse. The batch remains independent of the current cursor
+selection and includes unchanged cells inside a bulk-edited range.
 
 Submission uses the existing grid transaction: **all pending updates, inserts
 and deletions are submitted together**, just as with Ctrl+S. Moving between
-columns of the same row does not submit. Moving into a newly added row does not
+columns or rows inside the batch does not submit. For example, after filling one
+column in rows 1–10, Enter keeps the cursor in place, and navigating any of those
+rows across all columns keeps the batch pending. Entering row 11 submits it once.
+Moving into a newly added row does not
 submit it before its fields have been entered; finish entering the record and
 move to an existing row, or press Ctrl+S.
 

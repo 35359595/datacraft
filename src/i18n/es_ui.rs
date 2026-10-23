@@ -4,8 +4,8 @@
 pub const ENTRIES: &[(&str, &str)] = &[
     ("Save on row change", "Guardar al cambiar de fila"),
     (
-        "Automatically submit all pending grid changes in a transaction when moving to another row. Off by default.",
-        "Guardar automáticamente todos los cambios pendientes de la cuadrícula en una transacción al pasar a otra fila. Desactivado por defecto.",
+        "Automatically submit all pending grid changes when leaving the edited rows. Off by default.",
+        "Guardar automáticamente todos los cambios pendientes de la cuadrícula al salir de las filas editadas. Desactivado por defecto.",
     ),
     // connection_dialog.rs
     ("Name is required", "El nombre es obligatorio"),

@@ -151,7 +151,7 @@ pub const LIGHT: Palette = Palette {
     column_icon: hex(0x7B8094),
     key_icon: hex(0xD9A343),
     project_badge: hex(0x8E6CEF),
-    cell_modified: hex(0xD6E4FD),
+    cell_modified: hex(0xFFF0C2),
     row_added: hex(0xDDF1E1),
     row_deleted: hex(0xF3E1E2),
 };
@@ -201,7 +201,7 @@ pub const DARK: Palette = Palette {
     column_icon: hex(0x9FA2A8),
     key_icon: hex(0xE4AD5F),
     project_badge: hex(0x8060DB),
-    cell_modified: hex(0x263A5C),
+    cell_modified: hex(0x514018),
     row_added: hex(0x233F2D),
     row_deleted: hex(0x45282B),
 };
