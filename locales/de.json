@@ -356,7 +356,16 @@
     "The table has more than 1,000,000 rows: copy fewer with a filter or a percentage": "Die Tabelle hat mehr als 1.000.000 Zeilen: Kopieren Sie weniger mit einem Filter oder einem Prozentsatz",
     "Connect a connection that is not read-only to copy into": "Verbinden Sie eine Verbindung ohne Schreibschutz, um dorthin zu kopieren",
     "The WHERE condition can only read data": "Die WHERE-Bedingung darf nur Daten lesen",
-    "{n} rows copied to “{table}”": "{n} Zeilen nach „{table}“ kopiert"
+    "{n} rows copied to “{table}”": "{n} Zeilen nach „{table}“ kopiert",
+    "Keep": "Beibehalten",
+    "Empty text": "Leerer Text",
+    "Hash": "Hash",
+    "Keep last 4": "Letzte 4 behalten",
+    "Fake email": "Falsche E-Mail",
+    "Fake name": "Falscher Name",
+    "Fake phone": "Falsche Telefonnummer",
+    "Suggest masking": "Maskierung vorschlagen",
+    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "Die Maskierung ist deterministisch: Derselbe Wert ergibt immer denselben maskierten Wert, mit einem Schlüssel aus dem Schlüsselbund dieses Computers."
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "Die Anweisung hat {n} Zeilen betroffen (erwartet: 1); nichts wurde gespeichert:\n{stmt}",

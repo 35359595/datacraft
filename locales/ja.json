@@ -356,7 +356,16 @@
     "The table has more than 1,000,000 rows: copy fewer with a filter or a percentage": "テーブルの行数が 1,000,000 を超えています: フィルターまたは割合でコピーする行を減らしてください",
     "Connect a connection that is not read-only to copy into": "コピー先として読み取り専用でない接続に接続してください",
     "The WHERE condition can only read data": "WHERE 条件はデータの読み取りのみ可能です",
-    "{n} rows copied to “{table}”": "{n} 行を「{table}」にコピーしました"
+    "{n} rows copied to “{table}”": "{n} 行を「{table}」にコピーしました",
+    "Keep": "そのまま",
+    "Empty text": "空のテキスト",
+    "Hash": "ハッシュ",
+    "Keep last 4": "末尾 4 文字を残す",
+    "Fake email": "ダミーのメール",
+    "Fake name": "ダミーの名前",
+    "Fake phone": "ダミーの電話番号",
+    "Suggest masking": "マスキングを提案",
+    "Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain.": "マスキングは決定的です: 同じ値は常に同じマスク値になります。キーはこのコンピューターのキーチェーンに保存されます。"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "ステートメントが {n} 行に影響しました (想定は 1 行)。何も保存されていません:\n{stmt}",

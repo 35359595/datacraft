@@ -2,7 +2,7 @@
 //! database or schema of the same one), creating the target table when it doesn't exist.
 
 use crate::app::{ConnState, ConnStatus};
-use crate::db::copy::{self, CopyRequest};
+use crate::db::copy::{self, CopyRequest, Mask};
 use crate::db::{ColumnInfo, Driver};
 use crate::i18n::{tr, trf};
 use crate::sql;
@@ -22,6 +22,8 @@ pub struct CopyDialog {
     columns: Vec<ColumnInfo>,
     /// Source columns to copy (binary ones can't be).
     selected: Vec<bool>,
+    /// Masking rule of each source column.
+    masks: Vec<Mask>,
     pub target: ConnId,
     pub target_db: String,
     pub target_schema: String,
@@ -36,7 +38,7 @@ pub struct CopyDialog {
 
 pub enum CopyAction {
     /// Validate (read-only filter) and send.
-    Start(CopyRequest),
+    Start(Box<CopyRequest>),
     /// The target database's schema is needed.
     Load(ConnId, String),
     Close,
@@ -53,6 +55,7 @@ impl CopyDialog {
     pub fn new(source: &ConnState, db: String, schema: String, table: String, columns: Vec<ColumnInfo>, conns: &[ConnState]) -> Self {
         let driver = source.cfg.driver;
         let selected = columns.iter().map(|c| !copy::is_binary(driver, &c.data_type)).collect();
+        let n_columns = columns.len();
         // prod → dev: another writable connection first, the same one otherwise.
         let target = conns
             .iter()
@@ -69,6 +72,7 @@ impl CopyDialog {
             table,
             columns,
             selected,
+            masks: vec![Mask::Keep; n_columns],
             target,
             target_db: String::new(),
             target_schema: String::new(),
@@ -130,16 +134,29 @@ impl CopyDialog {
 
     /// Source columns to copy and the target name of each: on an existing table, only those it
     /// has (matched ignoring case).
-    fn plan(&self, target: &Target) -> (Vec<ColumnInfo>, Vec<String>) {
-        self.columns
-            .iter()
-            .zip(&self.selected)
-            .filter(|(_, on)| **on)
-            .filter_map(|(c, _)| match target {
-                Target::Existing(cols) => cols.iter().find(|t| t.name.eq_ignore_ascii_case(&c.name)).map(|t| (c.clone(), t.name.clone())),
-                _ => Some((c.clone(), c.name.clone())),
-            })
-            .unzip()
+    fn plan(&self, target: &Target) -> (Vec<ColumnInfo>, Vec<String>, Vec<Mask>) {
+        let mut plan = (Vec::new(), Vec::new(), Vec::new());
+        for ((c, on), mask) in self.columns.iter().zip(&self.selected).zip(&self.masks) {
+            let name = match target {
+                _ if !on => None,
+                Target::Existing(cols) => cols.iter().find(|t| t.name.eq_ignore_ascii_case(&c.name)).map(|t| t.name.clone()),
+                _ => Some(c.name.clone()),
+            };
+            if let Some(name) = name {
+                plan.0.push(c.clone());
+                plan.1.push(name);
+                plan.2.push(*mask);
+            }
+        }
+        plan
+    }
+
+    /// "Suggest masking": a rule for each column whose name looks personal (email, phone…).
+    pub fn suggest_masks(&mut self) {
+        for (c, mask) in self.columns.iter().zip(&mut self.masks) {
+            let s = Mask::suggest(&c.name);
+            *mask = if s.allowed(self.source_driver, c) { s } else { Mask::Keep };
+        }
     }
 
     fn target_driver(&self, conns: &[ConnState]) -> Option<Driver> {
@@ -176,7 +193,7 @@ impl CopyDialog {
             result = Some(CopyAction::Load(self.target, self.target_db.clone()));
         }
         let to = self.target_driver(conns).unwrap_or(self.source_driver);
-        let (columns, names) = self.plan(&target);
+        let (columns, names, masks) = self.plan(&target);
         let creating = matches!(target, Target::New);
         let running = self.running();
         let dark = ctx.global_style().visuals.dark_mode;
@@ -293,6 +310,13 @@ impl CopyDialog {
                 });
             ui.add_space(6.0);
             ui.label(RichText::new(tr("Up to 1,000,000 rows, inserted in one transaction. Binary columns are not copied.")).small().color(p.muted));
+            if masks.iter().any(|m| *m != Mask::Keep) {
+                ui.label(
+                    RichText::new(tr("Masking is deterministic: the same value always gives the same masked value, using a key kept in this computer's keychain."))
+                        .small()
+                        .color(p.muted),
+                );
+            }
             if to == Driver::Snowflake || self.source_driver == Driver::Snowflake {
                 ui.colored_label(ui.visuals().warn_fg_color, tr("Snowflake: the copy runs on the warehouse and uses credits."));
             }
@@ -315,7 +339,7 @@ impl CopyDialog {
                         && (to.flat_schema() || !self.target_schema.is_empty());
                     ui.add_enabled_ui(ready, |ui| {
                         if theme::primary_button(ui, tr("Copy")).clicked() {
-                            result = Some(CopyAction::Start(CopyRequest {
+                            result = Some(CopyAction::Start(Box::new(CopyRequest {
                                 source_db: self.db.clone(),
                                 source_schema: self.schema.clone(),
                                 source_table: self.table.clone(),
@@ -328,7 +352,9 @@ impl CopyDialog {
                                 target_table: self.target_table.trim().to_string(),
                                 create: creating,
                                 clear: self.clear && !creating,
-                            }));
+                                masks: masks.clone(),
+                                mask_key: String::new(),
+                            })));
                         }
                     });
                     if running {
@@ -351,11 +377,19 @@ impl CopyDialog {
     }
 
     fn columns_ui(&mut self, ui: &mut egui::Ui, target: &Target, to: Driver, p: &theme::Palette) {
-        ui.label(RichText::new(tr("Columns")).font(theme::bold(13.0)));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tr("Columns")).font(theme::bold(13.0)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(tr("Suggest masking")).clicked() {
+                    self.suggest_masks();
+                }
+            });
+        });
         ui.add_space(6.0);
+        let driver = self.source_driver;
         egui::ScrollArea::vertical().id_salt("copy_columns").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
-            egui::Grid::new("copy_columns_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                for (c, on) in self.columns.iter().zip(self.selected.iter_mut()) {
+            egui::Grid::new("copy_columns_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                for (i, ((c, on), mask)) in self.columns.iter().zip(self.selected.iter_mut()).zip(self.masks.iter_mut()).enumerate() {
                     let binary = copy::is_binary(self.source_driver, &c.data_type);
                     let missing = matches!(target, Target::Existing(cols) if !cols.iter().any(|t| t.name.eq_ignore_ascii_case(&c.name)));
                     ui.add_enabled_ui(!binary && !missing, |ui| {
@@ -371,7 +405,21 @@ impl CopyDialog {
                     } else {
                         c.data_type.to_lowercase()
                     };
-                    ui.label(RichText::new(detail).small().color(p.muted));
+                    ui.allocate_ui_with_layout(vec2(190.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_min_width(190.0);
+                        ui.add(egui::Label::new(RichText::new(detail).small().color(p.muted)).truncate());
+                    });
+                    if binary || missing {
+                        ui.label("");
+                    } else {
+                        ui.add_enabled_ui(*on, |ui| {
+                            egui::ComboBox::from_id_salt(("copy_mask", i)).selected_text(mask.label()).width(130.0).show_ui(ui, |ui| {
+                                for m in Mask::ALL.into_iter().filter(|m| m.allowed(driver, c)) {
+                                    ui.selectable_value(mask, m, m.label());
+                                }
+                            });
+                        });
+                    }
                     ui.end_row();
                 }
             });

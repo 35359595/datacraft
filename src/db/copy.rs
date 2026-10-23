@@ -34,6 +34,151 @@ pub struct CopyRequest {
     pub create: bool,
     /// Delete the target's rows first, in the same transaction.
     pub clear: bool,
+    /// Masking rule of each column (`Keep` = copied as is).
+    pub masks: Vec<Mask>,
+    /// Secret for the deterministic masks (Hash, Email, Name, Phone).
+    pub mask_key: String,
+}
+
+/// Masking rule for a column. Every rule is deterministic: with the same key, the same value
+/// always gives the same masked value, so masked keys still match across tables and copies.
+/// NULL stays NULL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mask {
+    #[default]
+    Keep,
+    Null,
+    Blank,
+    Hash,
+    /// Keeps the last 4 characters: `************1234`.
+    Partial,
+    Email,
+    Name,
+    Phone,
+}
+
+const FIRST_NAMES: [&str; 24] = [
+    "Alex", "Sam", "Jordan", "Taylor", "Morgan", "Casey", "Robin", "Jamie", "Avery", "Riley", "Quinn", "Drew", "Elena",
+    "Marco", "Yuki", "Amara", "Lucas", "Nadia", "Omar", "Ingrid", "Mateo", "Leila", "Hugo", "Sofia",
+];
+const LAST_NAMES: [&str; 24] = [
+    "Smith", "Garcia", "Muller", "Rossi", "Silva", "Kim", "Novak", "Dubois", "Tanaka", "Jensen", "Lopez", "Martin",
+    "Costa", "Weber", "Moreau", "Ivanova", "Okafor", "Nguyen", "Larsen", "Romero", "Fischer", "Sato", "Brown", "Ruiz",
+];
+
+impl Mask {
+    pub const ALL: [Mask; 8] = [Mask::Keep, Mask::Null, Mask::Blank, Mask::Hash, Mask::Partial, Mask::Email, Mask::Name, Mask::Phone];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mask::Keep => tr("Keep"),
+            Mask::Null => tr("Set NULL"),
+            Mask::Blank => tr("Empty text"),
+            Mask::Hash => tr("Hash"),
+            Mask::Partial => tr("Keep last 4"),
+            Mask::Email => tr("Fake email"),
+            Mask::Name => tr("Fake name"),
+            Mask::Phone => tr("Fake phone"),
+        }
+    }
+
+    /// Rules that fit a column: NULL needs a nullable column that isn't a key, and the others
+    /// write text (an empty text can't be a key either).
+    pub fn allowed(self, driver: Driver, column: &ColumnInfo) -> bool {
+        let text = matches!(classify(driver, &column.data_type), Kind::Varchar(_) | Kind::Text);
+        match self {
+            Mask::Keep => true,
+            Mask::Null => column.nullable && !column.primary_key,
+            Mask::Blank => text && !column.primary_key,
+            _ => text,
+        }
+    }
+
+    /// Rule suggested from a column's name (`email`, `phone`, `first_name`, `iban`…).
+    pub fn suggest(name: &str) -> Mask {
+        let n = name.to_ascii_lowercase().replace(['-', ' '], "_");
+        let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+        if has(&["email", "e_mail", "mail", "correo"]) {
+            Mask::Email
+        } else if has(&["phone", "mobile", "cell", "fax", "telef", "tel_", "movil"]) || n == "tel" {
+            Mask::Phone
+        } else if has(&["first_name", "firstname", "last_name", "lastname", "full_name", "fullname", "surname", "given_name", "family_name", "nombre", "apellido"])
+            || matches!(n.as_str(), "name" | "contact" | "contact_name" | "customer_name" | "person_name" | "user_name" | "username")
+        {
+            Mask::Name
+        } else if has(&["iban", "card", "tarjeta", "account_number", "ssn", "dni", "nif", "nie", "passport", "pasaporte", "tax_id", "vat"]) {
+            Mask::Partial
+        } else if has(&["password", "passwd", "secret", "token", "address", "street", "direccion", "domicilio", "ip_addr"]) {
+            Mask::Hash
+        } else {
+            Mask::Keep
+        }
+    }
+
+    /// Masked value, cut to `max_len` characters when the column has a limit.
+    pub fn apply(self, key: &[u8], value: Cell, max_len: Option<u32>) -> Cell {
+        let v = value?;
+        let digest = || {
+            let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+            aws_lc_rs::hmac::sign(&key, v.as_bytes()).as_ref().to_vec()
+        };
+        let hex = |d: &[u8], n: usize| d.iter().take(n.div_ceil(2)).map(|b| format!("{b:02x}")).collect::<String>()[..n].to_string();
+        let out = match self {
+            Mask::Keep => v.clone(),
+            Mask::Null => return None,
+            Mask::Blank => String::new(),
+            Mask::Hash => hex(&digest(), 16),
+            Mask::Partial => {
+                let chars: Vec<char> = v.chars().collect();
+                let keep = if chars.len() > 4 { 4 } else { 0 };
+                let mut s = "*".repeat(chars.len() - keep);
+                s.extend(&chars[chars.len() - keep..]);
+                s
+            }
+            Mask::Email => format!("user_{}@example.com", hex(&digest(), 10)),
+            Mask::Name => {
+                let d = digest();
+                format!("{} {}", FIRST_NAMES[d[0] as usize % FIRST_NAMES.len()], LAST_NAMES[d[1] as usize % LAST_NAMES.len()])
+            }
+            Mask::Phone => {
+                let d = digest();
+                let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % 10_000_000;
+                format!("555-{:03}-{:04}", n / 10_000, n % 10_000)
+            }
+        };
+        Some(match max_len {
+            Some(n) if out.chars().count() > n as usize => out.chars().take(n as usize).collect(),
+            _ => out,
+        })
+    }
+}
+
+/// Character limit of a text column (`varchar(20)` → 20), for masked values.
+fn text_limit(driver: Driver, data_type: &str) -> Option<u32> {
+    match classify(driver, data_type) {
+        Kind::Varchar(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Applies each column's mask to the rows.
+pub fn mask_rows(driver: Driver, columns: &[ColumnInfo], masks: &[Mask], key: &str, rows: &mut [Vec<Cell>]) {
+    let plan: Vec<(usize, Mask, Option<u32>)> = masks
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m != Mask::Keep)
+        .filter_map(|(i, m)| Some((i, *m, text_limit(driver, &columns.get(i)?.data_type))))
+        .collect();
+    if plan.is_empty() {
+        return;
+    }
+    for row in rows {
+        for &(i, mask, limit) in &plan {
+            if let Some(cell) = row.get_mut(i) {
+                *cell = mask.apply(key.as_bytes(), cell.take(), limit);
+            }
+        }
+    }
 }
 
 /// Broad type class, to translate a column type from one engine to another.
@@ -345,6 +490,8 @@ pub async fn copy(source: ConnectionConfig, target: ConnectionConfig, req: CopyR
     if req.clear {
         statements.push(format!("DELETE FROM {table}"));
     }
+    let mut rows = rows;
+    mask_rows(from, &req.columns, &req.masks, &req.mask_key, &mut rows);
     let n = rows.len() as u64;
     statements.extend(insert_sql(from, to, &table, &req.columns, &req.target_names, rows));
     let handle = t.cancel_handle();
@@ -384,6 +531,47 @@ mod tests {
         assert_eq!(target_type(Driver::Postgres, Driver::MySql, "integer[]", false), "longtext");
         assert!(is_binary(Driver::Postgres, "bytea") && is_binary(Driver::MsSql, "varbinary(max)"));
         assert!(!is_binary(Driver::Oracle, "varchar2(10 char)"));
+    }
+
+    #[test]
+    fn masks_are_deterministic_and_fit_the_column() {
+        let key = b"k";
+        let email = Mask::Email.apply(key, Some("ana@corp.com".into()), None).unwrap();
+        assert!(email.starts_with("user_") && email.ends_with("@example.com") && email.len() == 27, "{email}");
+        assert_eq!(Mask::Email.apply(key, Some("ana@corp.com".into()), None).unwrap(), email);
+        assert_ne!(Mask::Email.apply(b"other", Some("ana@corp.com".into()), None).unwrap(), email);
+        assert_ne!(Mask::Hash.apply(key, Some("a".into()), None), Mask::Hash.apply(key, Some("b".into()), None));
+        assert_eq!(Mask::Hash.apply(key, Some("a".into()), Some(6)).unwrap().len(), 6);
+        assert_eq!(Mask::Partial.apply(key, Some("ES91 2100 1234".into()), None).unwrap(), "**********1234");
+        assert_eq!(Mask::Partial.apply(key, Some("123".into()), None).unwrap(), "***");
+        assert!(Mask::Phone.apply(key, Some("+34 600".into()), None).unwrap().starts_with("555-"));
+        assert_eq!(Mask::Name.apply(key, None, None), None);
+        assert_eq!(Mask::Null.apply(key, Some("x".into()), None), None);
+        assert_eq!(Mask::Blank.apply(key, Some("x".into()), None), Some(String::new()));
+
+        let pk = ColumnInfo { name: "id".into(), data_type: "varchar(10)".into(), nullable: false, primary_key: true };
+        let num = ColumnInfo { name: "n".into(), data_type: "integer".into(), nullable: true, primary_key: false };
+        assert!(!Mask::Null.allowed(Driver::Postgres, &pk) && !Mask::Blank.allowed(Driver::Postgres, &pk));
+        assert!(Mask::Hash.allowed(Driver::Postgres, &pk));
+        assert!(Mask::Null.allowed(Driver::Postgres, &num) && !Mask::Hash.allowed(Driver::Postgres, &num));
+
+        let cols = [pk, num];
+        let mut rows = vec![vec![Some("abc".into()), Some("7".into())]];
+        mask_rows(Driver::Postgres, &cols, &[Mask::Hash, Mask::Null], "k", &mut rows);
+        assert_eq!(rows[0][0].as_ref().map(String::len), Some(10));
+        assert_eq!(rows[0][1], None);
+    }
+
+    #[test]
+    fn suggests_masks_from_column_names() {
+        assert_eq!(Mask::suggest("Email"), Mask::Email);
+        assert_eq!(Mask::suggest("mobile_phone"), Mask::Phone);
+        assert_eq!(Mask::suggest("first_name"), Mask::Name);
+        assert_eq!(Mask::suggest("name"), Mask::Name);
+        assert_eq!(Mask::suggest("product_name"), Mask::Keep);
+        assert_eq!(Mask::suggest("IBAN"), Mask::Partial);
+        assert_eq!(Mask::suggest("password_hash"), Mask::Hash);
+        assert_eq!(Mask::suggest("created_at"), Mask::Keep);
     }
 
     #[test]
