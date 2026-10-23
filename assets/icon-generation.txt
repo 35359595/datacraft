@@ -1,0 +1,6 @@
+Tool: built-in image_gen (imagegen skill)
+Reference: icon-reference.png (user-selected artwork).
+Output: icon-master.png; transparent production master.
+
+Prompt:
+Use case: background-extraction / precise-object-edit. Prepare this exact user-supplied DataCraft application icon for production use. KEEP the supplied artwork: large white uppercase D, cyan uppercase C, navy rounded-square tile, cyan outer border, database cylinder in the upper right, small table / connection decorations, existing colors, relative positions, typography, proportions and composition. Do NOT redesign, do NOT reinterpret, do NOT replace the icon or text, do NOT add details. Remove ONLY the pale gray background OUTSIDE the rounded-square tile and the external cast shadow, replacing those outside areas with genuine transparency. Preserve the entire cyan rounded-square outline with clean anti-aliased alpha edges. Crop / frame to a square with a small even transparent margin around the tile, so the tile occupies approximately 94 percent of the canvas width. No opaque backdrop, no new shadow outside the tile. Return a high-resolution square PNG with alpha.

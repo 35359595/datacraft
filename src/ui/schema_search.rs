@@ -155,7 +155,7 @@ impl SchemaSearch {
             if let Some(view) = &mut self.preview {
                 ui.separator();
                 ui.allocate_ui(egui::vec2(ui.available_width(), 240.0), |ui| {
-                    results::show_result(ui, view, false, None, false);
+                    results::show_result(ui, view, false, None, false, true);
                 });
             }
             if ui.button(tr("Close")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }

@@ -96,7 +96,6 @@ pub struct Palette {
     pub schema_icon: Color32,
     pub column_icon: Color32,
     pub key_icon: Color32,
-    pub project_badge: Color32,
     // --- data editing (approximating the DataGrip grid) ---
     /// Modified cell pending save.
     pub cell_modified: Color32,
@@ -150,7 +149,6 @@ pub const LIGHT: Palette = Palette {
     schema_icon: hex(0x8060DB),
     column_icon: hex(0x7B8094),
     key_icon: hex(0xD9A343),
-    project_badge: hex(0x8E6CEF),
     cell_modified: hex(0xFFF0C2),
     row_added: hex(0xDDF1E1),
     row_deleted: hex(0xF3E1E2),
@@ -200,7 +198,6 @@ pub const DARK: Palette = Palette {
     schema_icon: hex(0xA894F6),
     column_icon: hex(0x9FA2A8),
     key_icon: hex(0xE4AD5F),
-    project_badge: hex(0x8060DB),
     cell_modified: hex(0x514018),
     row_added: hex(0x233F2D),
     row_deleted: hex(0x45282B),
@@ -432,6 +429,7 @@ pub fn icon_button_sized(ui: &mut Ui, ico: Ico, enabled: bool, tooltip: &str, si
     let p = pal(ui);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), sense);
+    if !tooltip.is_empty() { resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, false, tooltip)); }
     if enabled && (resp.hovered() || resp.is_pointer_button_down_on()) {
         let fill = if resp.is_pointer_button_down_on() { p.pressed } else { p.hover };
         ui.painter().rect_filled(rect, 6.0, fill);
@@ -474,6 +472,45 @@ pub fn flat_button(ui: &mut Ui, leading: Option<Ico>, text: &str, font: FontId, 
         );
     }
     resp
+}
+
+/// Compact icon-and-label action, with a subtle selected state.
+pub fn tool_button(ui: &mut Ui, icon: Ico, text: &str, selected: bool) -> Response {
+    text_tool_button(ui, icon, text, selected, false)
+}
+
+pub fn add_button(ui: &mut Ui, icon: Ico, text: &str) -> Response {
+    text_tool_button(ui, icon, text, false, true)
+}
+
+fn text_tool_button(ui: &mut Ui, icon: Ico, text: &str, selected: bool, accented: bool) -> Response {
+    let p = pal(ui);
+    let text_color = if !ui.is_enabled() { p.disabled } else if accented { p.accent } else { p.text };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(12.5), text_color);
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 32.0, 24.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, text));
+    if selected {
+        ui.painter().rect(rect, 4.0, p.tab_selected_bg, Stroke::new(1.0, p.tab_selected_border), egui::StrokeKind::Inside);
+    } else if accented {
+        ui.painter().rect(rect, 4.0, blend(p.island_bg, p.accent.gamma_multiply(if response.hovered() { 0.22 } else { 0.12 })), Stroke::new(1.0, p.accent.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, p.hover);
+    }
+    let color = if !ui.is_enabled() { p.disabled } else if selected || accented { p.accent } else { p.icon };
+    icons::paint(ui.painter(), Rect::from_min_size(rect.left_center() + vec2(6.0, -7.0), Vec2::splat(14.0)), icon, color, &p, ui.is_enabled());
+    ui.painter().galley(rect.left_center() + vec2(25.0, -galley.size().y / 2.0), galley, p.text);
+    response
+}
+
+pub fn icon_tab(ui: &mut Ui, icon: Ico, label: &str, selected: bool) -> Response {
+    let p = pal(ui);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, label));
+    if selected || response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, if selected { p.tab_selected_bg } else { p.hover });
+    }
+    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(15.0)), icon, if selected { p.accent } else { p.icon }, &p, ui.is_enabled());
+    response.on_hover_text(label)
 }
 
 /// Thin vertical toolbar separator.

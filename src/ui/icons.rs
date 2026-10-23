@@ -30,6 +30,11 @@ pub enum Ico {
     Gear,
     Search,
     Properties,
+    Edit,
+    Info,
+    List,
+    Grid,
+    Record,
     Play,
     PlayAll,
     Undo,
@@ -219,6 +224,27 @@ pub fn paint(painter: &Painter, rect: Rect, ico: Ico, color: Color32, p: &Palett
                 painter.circle_filled(at(k, y), 2.0 * s, p.island_bg);
                 painter.circle_stroke(at(k, y), 2.0 * s, st(color));
             }
+        }
+        Ico::Edit => {
+            line(&[(3.0, 10.5), (10.5, 3.0), (13.0, 5.5), (5.5, 13.0), (2.5, 13.5), (3.0, 10.5)], color);
+            line(&[(9.0, 4.5), (11.5, 7.0)], color);
+        }
+        Ico::Info => {
+            painter.circle_stroke(at(8.0, 8.0), 6.0 * s, st(color));
+            painter.circle_filled(at(8.0, 4.8), 0.8 * s, color);
+            line(&[(8.0, 7.0), (8.0, 11.3)], color);
+        }
+        Ico::List | Ico::Record => {
+            for y in [4.0, 8.0, 12.0] {
+                painter.rect_filled(Rect::from_min_max(at(2.0, y - 1.0), at(4.0, y + 1.0)), 0.4 * s, color);
+                line(&[(6.5, y), (14.0, y)], color);
+            }
+            if ico == Ico::Record { line(&[(5.2, 1.5), (5.2, 14.5)], color); }
+        }
+        Ico::Grid => {
+            for x in [2.0, 9.0] { for y in [2.0, 9.0] {
+                painter.rect_stroke(Rect::from_min_max(at(x, y), at(x + 5.0, y + 5.0)), 0.6 * s, st(color), StrokeKind::Inside);
+            } }
         }
         Ico::Play | Ico::PlayAll => {
             let c = if enabled { p.run } else { color };

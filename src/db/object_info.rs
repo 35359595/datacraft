@@ -173,18 +173,20 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!(tr("Object information is not available")))?;
         if count_rows {
             // Explicit user action: an exact count may scan a large table or execute a view.
-            let qualified = format!(
-                "{}.{}",
-                driver.quote_ident(schema),
-                driver.quote_ident(table)
-            );
-            let results = self
-                .execute(&format!("SELECT COUNT(*) AS row_count FROM {qualified}"), 1)
-                .await?;
-            info.rows = results.iter().find_map(decode).and_then(|v| v.rows);
-            info.rows_exact = info.rows.is_some();
+            info.rows = Some(self.table_row_count(driver, schema, table, "").await?);
+            info.rows_exact = true;
         }
         Ok(info)
+    }
+
+    pub async fn table_row_count(&mut self, driver: Driver, schema: &str, table: &str, filter: &str) -> anyhow::Result<u64> {
+        let qualified = format!("{}.{}", driver.quote_ident(schema), driver.quote_ident(table));
+        let count = if driver == Driver::MsSql { "COUNT_BIG(*)" } else { "COUNT(*)" };
+        let mut sql = format!("SELECT {count} AS row_count FROM {qualified}");
+        if !filter.trim().is_empty() { sql.push_str(&format!(" WHERE {filter}")); }
+        if crate::sql::split_statements(&sql, driver).len() != 1 { anyhow::bail!(tr("Filter text must be a single SQL expression")); }
+        let results = self.execute(&sql, 1).await?;
+        results.iter().find_map(decode).and_then(|info| info.rows).ok_or_else(|| anyhow::anyhow!(tr("Exact row count unavailable")))
     }
 }
 
@@ -255,6 +257,9 @@ mod tests {
             .unwrap();
         assert_eq!(counted.rows, Some(2));
         assert!(counted.rows_exact);
+        assert_eq!(session.table_row_count(Driver::Sqlite, "main", "a'b", "id > 1").await.unwrap(), 1);
+        assert_eq!(session.table_row_count(Driver::Sqlite, "main", "a'b", "id > 5").await.unwrap(), 0);
+        assert!(session.table_row_count(Driver::Sqlite, "main", "a'b", "1=1; DROP TABLE v").await.is_err());
         assert_eq!(
             session
                 .object_info(Driver::Sqlite, "main", "v", true)

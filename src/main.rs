@@ -12,16 +12,7 @@ mod worker;
 
 fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("DataCraft")
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([900.0, 560.0])
-            // Title bar unified with the toolbar (DataGrip style): content is drawn under
-            // the transparent bar and only the macOS traffic lights remain.
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
-            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()),
+        viewport: ui::window_chrome::viewport(),
         ..Default::default()
     };
     // Demo mode (see app.rs): don't touch the user's persisted state.
