@@ -229,8 +229,44 @@ pub fn mono_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FONT_MONO_BOLD.into()))
 }
 
+/// System fonts for the scripts Inter and JetBrains Mono lack (Chinese, Japanese, Korean,
+/// Thai…), in order. Each group uses the first file that exists; they are read from disk, not
+/// bundled (a CJK font weighs 20 MB). `%WINDIR%` is the Windows folder.
+const SYSTEM_FONTS: &[&[&str]] = &[
+    // CJK and Hangul; on macOS also Thai, Hebrew, Arabic, Devanagari…
+    &[
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "%WINDIR%/Fonts/msyh.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    ],
+    // Korean (Microsoft YaHei has no Hangul).
+    &["%WINDIR%/Fonts/malgun.ttf"],
+    // Thai.
+    &["%WINDIR%/Fonts/LeelawUI.ttf", "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"],
+];
+
+/// The system fallback fonts found, read once per run.
+fn system_fonts() -> &'static [(String, Arc<FontData>)] {
+    static FONTS: std::sync::OnceLock<Vec<(String, Arc<FontData>)>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let windir = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot")).unwrap_or_else(|_| r"C:\Windows".into());
+        SYSTEM_FONTS
+            .iter()
+            .filter_map(|group| {
+                group.iter().find_map(|path| {
+                    let path = path.replace("%WINDIR%", &windir);
+                    let bytes = std::fs::read(&path).ok()?;
+                    Some((format!("system:{path}"), Arc::new(FontData::from_owned(bytes))))
+                })
+            })
+            .collect()
+    })
+}
+
 /// Inter (UI) and JetBrains Mono (editor and grid). egui's default fonts remain as
-/// fallback for symbols and emoji.
+/// fallback for symbols and emoji, and system fonts for CJK, Hangul, Thai…
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let add = |fonts: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
@@ -242,8 +278,13 @@ pub fn install_fonts(ctx: &egui::Context) {
     add(&mut fonts, "JBMono-Bold", include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf"));
     add(&mut fonts, "JBMono-Italic", include_bytes!("../../assets/fonts/JetBrainsMono-Italic.ttf"));
 
-    let fallback_prop = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let fallback_mono = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    let mut fallback_prop = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let mut fallback_mono = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    for (name, data) in system_fonts() {
+        fonts.font_data.insert(name.clone(), data.clone());
+        fallback_prop.push(name.clone());
+        fallback_mono.push(name.clone());
+    }
     let with = |first: &str, rest: &[String]| -> Vec<String> {
         let mut v = vec![first.to_owned()];
         v.extend(rest.iter().cloned());
@@ -568,4 +609,26 @@ pub fn tab(ui: &mut Ui, selected: bool, ico: Option<Ico>, text: &str, closable: 
         close = cresp.clicked();
     }
     (resp, close)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #4: CJK, Hangul and Thai in the grid and the UI used to show as boxes.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn system_fonts_cover_cjk_hangul_and_thai() {
+        assert!(!system_fonts().is_empty(), "no system fallback font found");
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        for family in [FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name(FONT_BOLD.into())] {
+            let font = FontId::new(13.0, family);
+            for text in ["中文汉字", "日本語のテキスト", "한국어", "ภาษาไทย"] {
+                assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, text)), "{text} missing in {font:?}");
+            }
+        }
+    }
 }
