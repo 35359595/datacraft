@@ -653,5 +653,31 @@
     "View “{name}” created": "Utworzono widok „{name}”",
     "The definition of view “{name}” is not available": "Definicja widoku „{name}” jest niedostępna",
     "The view definition request timed out": "Przekroczono czas oczekiwania na definicję widoku"
+  },
+  "modify_table": {
+    "Modify Table…": "Modyfikuj tabelę…",
+    "Modify Table": "Modyfikuj tabelę",
+    "Loading table structure…": "Wczytywanie struktury tabeli…",
+    "No changes": "Brak zmian",
+    "Applying changes…": "Stosowanie zmian…",
+    "Indexes": "Indeksy",
+    "Unique": "Unikalny",
+    "column1, column2": "kolumna1, kolumna2",
+    "Remove index": "Usuń indeks",
+    "Add Index": "Dodaj indeks",
+    "Table “{name}” modified": "Zmodyfikowano tabelę „{name}”",
+    "Table “{name}” not found": "Nie znaleziono tabeli „{name}”",
+    "(expression)": "(wyrażenie)",
+    "Every index needs a name": "Każdy indeks musi mieć nazwę",
+    "Duplicate index “{name}”": "Powtórzony indeks „{name}”",
+    "Index “{name}” needs at least one column": "Indeks „{name}” musi mieć co najmniej jedną kolumnę",
+    "Index “{name}”: unknown column “{column}”": "Indeks „{name}”: nieznana kolumna „{column}”",
+    "“{name}” is a generated column: it can only be renamed or dropped": "„{name}” to kolumna generowana: można ją tylko przemianować lub usunąć",
+    "Drops column “{name}” and all its data": "Usuwa kolumnę „{name}” i wszystkie jej dane",
+    "Changing the type of “{name}” can truncate or lose data, or fail on existing rows": "Zmiana typu „{name}” może obciąć lub utracić dane albo nie powieść się na istniejących wierszach",
+    "SQLite can't alter columns in place: the table is copied into a new one and the old one dropped, in one transaction.": "SQLite nie zmienia kolumn w miejscu: tabela jest kopiowana do nowej, a stara usuwana, w jednej transakcji.",
+    "SQLite can only make this change by rebuilding the table, and this table has constraints, triggers or foreign keys that a rebuild would lose. Use a console instead.": "SQLite może wprowadzić tę zmianę tylko przez przebudowę tabeli, a ta tabela ma ograniczenia, wyzwalacze lub klucze obce, które przebudowa by utraciła. Użyj konsoli.",
+    "Snowflake can only remove a column's default, not set a new one": "Snowflake pozwala tylko usunąć wartość domyślną kolumny, nie ustawić nowej",
+    "Index “{name}” can't be rebuilt (expression or partial index): drop it first": "Indeksu „{name}” nie można odtworzyć (indeks wyrażeniowy lub częściowy): najpierw go usuń"
   }
 }

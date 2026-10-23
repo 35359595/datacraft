@@ -59,6 +59,8 @@ pub enum Request {
     },
     /// The real definition of a view (for "Edit View…" and "Generate DDL").
     ViewDefinition { conn: ConnId, db: String, schema: String, view: String, request_id: u64 },
+    /// "Modify Table…": the table's full structure (defaults, primary key, indexes).
+    TableDetails { conn: ConnId, db: String, schema: String, table: String, request_id: u64 },
     /// Runs statements in order; stops at the first error.
     /// `db`: database to run them in (`None` = the connection's default database).
     Execute {
@@ -127,6 +129,7 @@ pub enum Response {
     ChangesApplied { console: ConsoleId, result: Result<u64, String> },
     /// Result of `RunDdl`.
     DdlDone { conn: ConnId, result: Result<(), String> },
+    TableDetails { request_id: u64, result: Result<Box<crate::db::alter::TableDetails>, String> },
 }
 
 pub struct Worker {
@@ -532,6 +535,24 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
         Request::ViewDefinition { conn, db, schema, view, request_id } => {
             let result = fetch_view_definition(state, conn, &db, &schema, &view).await;
             vec![Response::ViewDefinition { conn, request_id, result }]
+        }
+        Request::TableDetails { conn, db, schema, table, request_id } => {
+            // On the metadata session: it doesn't wait behind a console's query.
+            let result = async {
+                let driver = state.live.lock().await.get(&conn).map(|l| l.cfg.driver).ok_or_else(|| anyhow::anyhow!(tr("Connection lost")))?;
+                let (session, target) = state.meta_session_for(conn, &db).await?;
+                let mut s = session.lock().await;
+                s.use_database(&target).await?;
+                let details = crate::db::alter::load_details(&mut s, driver, &schema, &table).await;
+                let broken = s.is_closed();
+                drop(s);
+                if broken {
+                    state.forget_meta(conn, &session).await;
+                }
+                details
+            }
+            .await;
+            vec![Response::TableDetails { request_id, result: result.map(Box::new).map_err(|e| format!("{e:#}")) }]
         }
         Request::ApplyChanges { conn, db, console, statements } => {
             let (session, target) = match state.session_for(conn, db.as_deref()).await {
@@ -1500,5 +1521,164 @@ mod tests {
         assert_eq!((n, ids, oks, keys, real), (20, 20, 20, 20, 0));
         first_rows(&w, 43, 4, &["db.dc_people.drop()", "db.dc_people2.drop()"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ---- "Modify Table…" ------------------------------------------------------------------
+
+    fn table_details(w: &Worker, conn: ConnId, db: &str, schema: &str, table: &str, request_id: u64) -> crate::db::alter::TableDetails {
+        w.send(Request::TableDetails { conn, db: db.into(), schema: schema.into(), table: table.into(), request_id });
+        let r = wait_for(w, |r| matches!(r, Response::TableDetails { request_id: id, .. } if *id == request_id));
+        let Response::TableDetails { result, .. } = r else { unreachable!() };
+        *result.unwrap()
+    }
+
+    fn run_ddl(w: &Worker, conn: ConnId, statements: Vec<String>, transaction: bool) -> Result<(), String> {
+        w.send(Request::RunDdl { conn, db: None, statements, close_db: None, transaction });
+        let Response::DdlDone { result, .. } = wait_for(w, |r| matches!(r, Response::DdlDone { .. })) else { unreachable!() };
+        result
+    }
+
+    /// Renames, retypes, makes NOT NULL with a new default, drops and adds columns, changes the
+    /// primary key, drops and adds indexes and renames the table, then reads the structure back.
+    fn modify_table_roundtrip(cfg: ConnectionConfig, schema: &str, setup: &[&str]) {
+        use crate::db::alter::{self, EditColumn, EditIndex, TableEdit};
+        use crate::ui::create_dialog::NewColumn;
+        let (conn, driver, db) = (cfg.id, cfg.driver, cfg.database.clone());
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        let r = wait_for(&w, |r| matches!(r, Response::Connected { .. } | Response::ConnectFailed { .. }));
+        assert!(matches!(r, Response::Connected { .. }), "could not connect");
+        let _ = run_ddl(&w, conn, vec!["drop table if exists dc_goods".into(), "drop table if exists dc_mod".into()], false);
+        run_ddl(&w, conn, setup.iter().map(|s| s.to_string()).collect(), false).unwrap();
+
+        let d = table_details(&w, conn, &db, schema, "dc_mod", 1);
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "price", "note"]);
+        assert_eq!(d.primary_key, ["id"]);
+        assert_eq!(d.indexes.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["dc_mod_name"]);
+        assert!(!d.columns[1].nullable && d.columns[2].nullable);
+        assert_eq!(d.columns[2].default.as_deref(), Some("0"));
+
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.name = "title".into();
+        cols[1].column.data_type = "varchar(100)".into();
+        cols[1].column.primary_key = true;
+        cols[2].column.not_null = true;
+        cols[2].column.default = "1".into();
+        cols.remove(3);
+        cols.push(EditColumn {
+            original: None,
+            column: NewColumn { name: "email".into(), data_type: "varchar(255)".into(), not_null: false, primary_key: false, default: String::new() },
+        });
+        let indexes = vec![EditIndex { original: None, name: "dc_goods_email".into(), columns: "email".into(), unique: true }];
+        let edit = TableEdit { schema, table: "dc_mod", new_name: "dc_goods", columns: &cols, indexes: &indexes };
+        let plan = alter::plan(driver, &d, &edit).unwrap();
+        run_ddl(&w, conn, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+
+        let d = table_details(&w, conn, &db, schema, "dc_goods", 2);
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "title", "price", "email"]);
+        assert_eq!(d.primary_key, ["id", "title"]);
+        assert_eq!(d.indexes.iter().map(|x| (x.name.as_str(), x.unique)).collect::<Vec<_>>(), [("dc_goods_email", true)]);
+        assert!(d.columns[1].data_type.contains("100"), "{}", d.columns[1].data_type);
+        assert!(!d.columns[2].nullable);
+        assert_eq!(d.columns[2].default.as_deref(), Some("1"));
+        // The rows survive, under the new names.
+        w.send(Request::Execute { conn, db: None, console: 5, statements: vec!["select id, title, price from dc_goods".into()], max_rows: 10 });
+        let Response::Executed { results, error, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 5, .. })) else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(results[0].rows, vec![vec![Some("1".into()), Some("pen".into()), Some("3".into())]]);
+
+        // A rename alone; then dropping the column an index uses also drops the index.
+        let mut cols = alter::initial_columns(&d);
+        cols[2].column.name = "cost".into();
+        cols.remove(3);
+        let indexes = alter::initial_indexes(&d);
+        let edit = TableEdit { schema, table: "dc_goods", new_name: "dc_goods", columns: &cols, indexes: &indexes };
+        let plan = alter::plan(driver, &d, &edit).unwrap();
+        run_ddl(&w, conn, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+        let d = table_details(&w, conn, &db, schema, "dc_goods", 3);
+        assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "title", "cost"]);
+        assert!(d.indexes.is_empty());
+        run_ddl(&w, conn, vec!["drop table dc_goods".into()], false).unwrap();
+    }
+
+    #[test]
+    fn sqlite_modify_table() {
+        let dir = std::env::temp_dir().join(format!("datacraft-modify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        rusqlite::Connection::open(&path).unwrap();
+        let mut cfg = ConnectionConfig::new(14, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        modify_table_roundtrip(
+            cfg.clone(),
+            "main",
+            &[
+                "create table dc_mod (id integer primary key autoincrement, name varchar(50) not null, price integer default 0, note text)",
+                "create index dc_mod_name on dc_mod (name)",
+                "insert into dc_mod (name, price, note) values ('pen', 3, 'x')",
+            ],
+        );
+        // A rebuild keeps AUTOINCREMENT and works with a view on the table; a CHECK constraint
+        // refuses it.
+        use crate::db::alter::{self, TableEdit};
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(cfg));
+        wait_for(&w, |r| matches!(r, Response::Connected { .. }));
+        run_ddl(
+            &w,
+            14,
+            vec![
+                "create table dc_auto (id integer primary key autoincrement, n int)".into(),
+                "create view dc_view as select id, n from dc_auto".into(),
+                "insert into dc_auto (n) values (1)".into(),
+            ],
+            false,
+        )
+        .unwrap();
+        let d = table_details(&w, 14, "main", "main", "dc_auto", 4);
+        assert!(d.autoincrement && d.rebuild_blocker.is_none());
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.data_type = "bigint".into();
+        cols[1].column.not_null = true;
+        let plan = alter::plan(Driver::Sqlite, &d, &TableEdit { schema: "main", table: "dc_auto", new_name: "dc_auto", columns: &cols, indexes: &[] }).unwrap();
+        run_ddl(&w, 14, plan.statements.clone(), plan.transaction).unwrap_or_else(|e| panic!("{e}\n{:#?}", plan.statements));
+        let d = table_details(&w, 14, "main", "main", "dc_auto", 5);
+        assert!(d.autoincrement);
+        assert_eq!(d.columns[1].data_type, "bigint");
+        assert!(!d.columns[1].nullable);
+        w.send(Request::Execute { conn: 14, db: None, console: 6, statements: vec!["select n from dc_view".into()], max_rows: 10 });
+        let Response::Executed { results, error, .. } = wait_for(&w, |r| matches!(r, Response::Executed { console: 6, .. })) else { unreachable!() };
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(results[0].rows, vec![vec![Some("1".into())]]);
+        run_ddl(&w, 14, vec!["create table dc_check (id integer primary key, n int check (n > 0))".into()], false).unwrap();
+        let d = table_details(&w, 14, "main", "main", "dc_check", 6);
+        let mut cols = alter::initial_columns(&d);
+        cols[1].column.not_null = true;
+        assert!(alter::plan(Driver::Sqlite, &d, &TableEdit { schema: "main", table: "dc_check", new_name: "dc_check", columns: &cols, indexes: &[] }).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live: `DATACRAFT_MY_HOST/PORT/USER/PASSWORD/DB`.
+    #[test]
+    #[ignore]
+    fn mysql_modify_table() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(15, Driver::MariaDb);
+        cfg.host = var("DATACRAFT_MY_HOST");
+        cfg.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        cfg.user = var("DATACRAFT_MY_USER");
+        cfg.password = var("DATACRAFT_MY_PASSWORD");
+        cfg.database = var("DATACRAFT_MY_DB");
+        let schema = cfg.database.clone();
+        modify_table_roundtrip(
+            cfg,
+            &schema,
+            &[
+                "create table dc_mod (id int auto_increment primary key, name varchar(50) not null, price int default 0, note text)",
+                "create index dc_mod_name on dc_mod (name)",
+                "insert into dc_mod (name, price, note) values ('pen', 3, 'x')",
+            ],
+        );
     }
 }

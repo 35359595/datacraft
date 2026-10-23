@@ -653,5 +653,31 @@
     "View “{name}” created": "Ansicht „{name}“ erstellt",
     "The definition of view “{name}” is not available": "Die Definition der Ansicht „{name}“ ist nicht verfügbar",
     "The view definition request timed out": "Zeitüberschreitung beim Abrufen der Ansichtsdefinition"
+  },
+  "modify_table": {
+    "Modify Table…": "Tabelle ändern…",
+    "Modify Table": "Tabelle ändern",
+    "Loading table structure…": "Tabellenstruktur wird geladen…",
+    "No changes": "Keine Änderungen",
+    "Applying changes…": "Änderungen werden angewendet…",
+    "Indexes": "Indizes",
+    "Unique": "Eindeutig",
+    "column1, column2": "spalte1, spalte2",
+    "Remove index": "Index entfernen",
+    "Add Index": "Index hinzufügen",
+    "Table “{name}” modified": "Tabelle „{name}“ geändert",
+    "Table “{name}” not found": "Tabelle „{name}“ nicht gefunden",
+    "(expression)": "(Ausdruck)",
+    "Every index needs a name": "Jeder Index braucht einen Namen",
+    "Duplicate index “{name}”": "Doppelter Index „{name}“",
+    "Index “{name}” needs at least one column": "Index „{name}“ braucht mindestens eine Spalte",
+    "Index “{name}”: unknown column “{column}”": "Index „{name}“: unbekannte Spalte „{column}“",
+    "“{name}” is a generated column: it can only be renamed or dropped": "„{name}“ ist eine generierte Spalte: Sie kann nur umbenannt oder gelöscht werden",
+    "Drops column “{name}” and all its data": "Löscht die Spalte „{name}“ mit allen Daten",
+    "Changing the type of “{name}” can truncate or lose data, or fail on existing rows": "Den Typ von „{name}“ zu ändern kann Daten abschneiden oder verlieren oder an vorhandenen Zeilen scheitern",
+    "SQLite can't alter columns in place: the table is copied into a new one and the old one dropped, in one transaction.": "SQLite kann Spalten nicht direkt ändern: Die Tabelle wird in eine neue kopiert und die alte gelöscht, in einer einzigen Transaktion.",
+    "SQLite can only make this change by rebuilding the table, and this table has constraints, triggers or foreign keys that a rebuild would lose. Use a console instead.": "SQLite kann diese Änderung nur durch Neuaufbau der Tabelle vornehmen, und diese Tabelle hat Constraints, Trigger oder Fremdschlüssel, die dabei verloren gingen. Verwenden Sie stattdessen eine Konsole.",
+    "Snowflake can only remove a column's default, not set a new one": "Snowflake kann den Standardwert einer Spalte nur entfernen, keinen neuen setzen",
+    "Index “{name}” can't be rebuilt (expression or partial index): drop it first": "Index „{name}“ kann nicht neu aufgebaut werden (Ausdrucks- oder partieller Index): Löschen Sie ihn zuerst"
   }
 }

@@ -998,6 +998,12 @@ impl ObjectBrowser {
                 let truncate = writable
                     && self.selection.len() == 1
                     && item.table.is_some_and(|t| t.kind == ObjectKind::Table);
+                if ui.add_enabled(truncate, egui::Button::new(tr("Modify Table…"))).clicked() {
+                    if let Some(table) = tables.first() {
+                        actions.push(BrowserAction::Explorer(ExplorerAction::ModifyTable(table.clone())));
+                    }
+                    ui.close();
+                }
                 if ui
                     .add_enabled(truncate, egui::Button::new(tr("Truncate…")))
                     .clicked()

@@ -653,5 +653,31 @@
     "View “{name}” created": "视图“{name}”已创建",
     "The definition of view “{name}” is not available": "视图“{name}”的定义不可用",
     "The view definition request timed out": "视图定义请求超时"
+  },
+  "modify_table": {
+    "Modify Table…": "修改表…",
+    "Modify Table": "修改表",
+    "Loading table structure…": "正在加载表结构…",
+    "No changes": "没有更改",
+    "Applying changes…": "正在应用更改…",
+    "Indexes": "索引",
+    "Unique": "唯一",
+    "column1, column2": "列1, 列2",
+    "Remove index": "移除索引",
+    "Add Index": "添加索引",
+    "Table “{name}” modified": "已修改表“{name}”",
+    "Table “{name}” not found": "未找到表“{name}”",
+    "(expression)": "（表达式）",
+    "Every index needs a name": "每个索引都需要名称",
+    "Duplicate index “{name}”": "索引“{name}”重复",
+    "Index “{name}” needs at least one column": "索引“{name}”至少需要一列",
+    "Index “{name}”: unknown column “{column}”": "索引“{name}”：未知列“{column}”",
+    "“{name}” is a generated column: it can only be renamed or dropped": "“{name}”是生成列：只能重命名或删除",
+    "Drops column “{name}” and all its data": "删除列“{name}”及其所有数据",
+    "Changing the type of “{name}” can truncate or lose data, or fail on existing rows": "更改“{name}”的类型可能会截断或丢失数据，或在现有行上失败",
+    "SQLite can't alter columns in place: the table is copied into a new one and the old one dropped, in one transaction.": "SQLite 无法就地修改列：表会在一个事务中复制到新表，并删除旧表。",
+    "SQLite can only make this change by rebuilding the table, and this table has constraints, triggers or foreign keys that a rebuild would lose. Use a console instead.": "SQLite 只能通过重建表来进行此更改，而此表有重建会丢失的约束、触发器或外键。请改用控制台。",
+    "Snowflake can only remove a column's default, not set a new one": "Snowflake 只能移除列的默认值，不能设置新的默认值",
+    "Index “{name}” can't be rebuilt (expression or partial index): drop it first": "索引“{name}”无法重建（表达式索引或部分索引）：请先删除它"
   }
 }

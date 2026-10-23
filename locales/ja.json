@@ -653,5 +653,31 @@
     "View “{name}” created": "ビュー「{name}」を作成しました",
     "The definition of view “{name}” is not available": "ビュー「{name}」の定義は利用できません",
     "The view definition request timed out": "ビュー定義の取得がタイムアウトしました"
+  },
+  "modify_table": {
+    "Modify Table…": "テーブルの変更…",
+    "Modify Table": "テーブルの変更",
+    "Loading table structure…": "テーブル構造を読み込み中…",
+    "No changes": "変更はありません",
+    "Applying changes…": "変更を適用中…",
+    "Indexes": "インデックス",
+    "Unique": "一意",
+    "column1, column2": "列1, 列2",
+    "Remove index": "インデックスを削除",
+    "Add Index": "インデックスを追加",
+    "Table “{name}” modified": "テーブル「{name}」を変更しました",
+    "Table “{name}” not found": "テーブル「{name}」が見つかりません",
+    "(expression)": "（式）",
+    "Every index needs a name": "すべてのインデックスに名前が必要です",
+    "Duplicate index “{name}”": "インデックス「{name}」が重複しています",
+    "Index “{name}” needs at least one column": "インデックス「{name}」には少なくとも 1 つの列が必要です",
+    "Index “{name}”: unknown column “{column}”": "インデックス「{name}」: 不明な列「{column}」",
+    "“{name}” is a generated column: it can only be renamed or dropped": "「{name}」は生成列です: 名前の変更か削除のみ可能です",
+    "Drops column “{name}” and all its data": "列「{name}」とそのすべてのデータを削除します",
+    "Changing the type of “{name}” can truncate or lose data, or fail on existing rows": "「{name}」の型を変更すると、データが切り捨てられたり失われたり、既存の行で失敗したりすることがあります",
+    "SQLite can't alter columns in place: the table is copied into a new one and the old one dropped, in one transaction.": "SQLite は列をその場で変更できません: 1 つのトランザクションで、テーブルを新しいテーブルにコピーして古いテーブルを削除します。",
+    "SQLite can only make this change by rebuilding the table, and this table has constraints, triggers or foreign keys that a rebuild would lose. Use a console instead.": "SQLite ではテーブルを再構築しないとこの変更はできませんが、このテーブルには再構築で失われる制約、トリガー、外部キーがあります。コンソールを使用してください。",
+    "Snowflake can only remove a column's default, not set a new one": "Snowflake では列のデフォルト値を削除することしかできず、新しく設定することはできません",
+    "Index “{name}” can't be rebuilt (expression or partial index): drop it first": "インデックス「{name}」は再構築できません（式インデックスまたは部分インデックス）: 先に削除してください"
   }
 }

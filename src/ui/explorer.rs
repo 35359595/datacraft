@@ -62,6 +62,8 @@ pub enum ExplorerAction {
     /// "Copy Table To…" another connection, database or schema.
     CopyTable(TableRef),
     RenameTable(TableRef),
+    /// "Modify Table…": columns, primary key, indexes and name.
+    ModifyTable(TableRef),
     /// Load a database's schema when it is expanded.
     LoadDatabase(ConnId, String),
     BrowseObjects(ObjectScope),
@@ -887,6 +889,10 @@ fn table_rows(ui: &mut Ui, state: &mut ExplorerState, actions: &mut Vec<Explorer
         if t.kind == ObjectKind::Table {
             if ui.button(tr("Import Data from File…")).clicked() {
                 actions.push(ExplorerAction::ImportData(tref.clone()));
+                ui.close();
+            }
+            if ui.button(tr("Modify Table…")).clicked() {
+                actions.push(ExplorerAction::ModifyTable(tref.clone()));
                 ui.close();
             }
             if ui.button(tr("Rename…")).clicked() {

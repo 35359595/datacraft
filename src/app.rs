@@ -31,6 +31,8 @@
 //! `DATACRAFT_DEMO_DROP=table|truncate|rename` opens the confirmation to drop, truncate or
 //! rename (to `<name>_renamed`) the first table; with `-submit` (e.g. `rename-submit`) it also runs it.
 //! `DATACRAFT_DEMO_VIEW=new|edit` opens "New View" over the first table or "Edit View" on the first view.
+//! `DATACRAFT_DEMO_MODIFY=1` opens "Modify Table…" on the first table; `edit` also makes a few
+//! sample changes (shown in the preview, never run).
 
 use crate::config;
 use crate::db::{ColumnInfo, ConnectionConfig, DatabaseInfo, Driver, SchemaInfo, Session, TableInfo};
@@ -44,6 +46,7 @@ use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
 use crate::ui::copy_dialog::{CopyAction, CopyDialog};
 use crate::ui::import_dialog::{ImportDialog, ImportResult};
 use crate::ui::mask_export_dialog::{MaskExportAction, MaskExportDialog};
+use crate::ui::modify_table_dialog::{ModifyResult, ModifyTableDialog};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
 use crate::ui::icons::{self, Ico};
@@ -274,6 +277,8 @@ pub struct DataCraftApp {
     copy: Option<CopyDialog>,
     /// "Export with Masking…".
     mask_export: Option<MaskExportDialog>,
+    /// "Modify Table…".
+    modify: Option<ModifyTableDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -352,6 +357,7 @@ impl DataCraftApp {
             import: None,
             copy: None,
             mask_export: None,
+            modify: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -656,6 +662,11 @@ impl DataCraftApp {
                             }
                         }
                         self.demo_view(conn);
+                        if matches!(std::env::var("DATACRAFT_DEMO_MODIFY").as_deref(), Ok("1" | "edit"))
+                            && let Some(t) = self.explorer.selected_table.clone()
+                        {
+                            self.open_modify_table(t);
+                        }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
@@ -748,6 +759,7 @@ impl DataCraftApp {
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
                 Response::ViewDefinition { conn, request_id, result } => self.view_definition_received(conn, request_id, result),
+                Response::TableDetails { request_id, result } => self.modify_loaded(request_id, result.map(|d| *d)),
                 Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
             }
         }
@@ -1289,6 +1301,7 @@ impl DataCraftApp {
                 | ExplorerAction::TruncateTable(t)
                 | ExplorerAction::ImportData(t)
                 | ExplorerAction::RenameTable(t)
+                | ExplorerAction::ModifyTable(t)
                 | ExplorerAction::GenerateSelect(t)
                 | ExplorerAction::GenerateInsert(t)
                 | ExplorerAction::GenerateDdl(t)
@@ -1354,6 +1367,7 @@ impl DataCraftApp {
                 ExplorerAction::ImportData(t) => self.open_import(t),
                 ExplorerAction::CopyTable(t) => self.open_copy(t),
                 ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
+                ExplorerAction::ModifyTable(t) => self.open_modify_table(t),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
                     self.consoles[i].db = db;
@@ -1622,9 +1636,78 @@ impl DataCraftApp {
         self.create = Some(CreateDialog::table(conn, driver, db, schema));
     }
 
+    /// "Modify Table…": opens the dialog and asks the worker for the table's full structure.
+    fn open_modify_table(&mut self, t: TableRef) {
+        if self.refuse_read_only(t.conn) {
+            return;
+        }
+        let Some(driver) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected).map(|c| c.cfg.driver) else { return };
+        let d = ModifyTableDialog::new(t.conn, driver, t.db.clone(), t.schema.clone(), t.table.clone());
+        let request_id = d.request_id;
+        self.modify = Some(d);
+        self.worker.send(Request::TableDetails { conn: t.conn, db: t.db, schema: t.schema, table: t.table, request_id });
+    }
+
+    fn modify_loaded(&mut self, request_id: u64, result: Result<crate::db::alter::TableDetails, String>) {
+        let Some(d) = self.modify.as_mut().filter(|d| d.request_id == request_id) else { return };
+        d.loaded(result);
+        let demo = std::env::var("DATACRAFT_DEMO").is_ok_and(|v| !v.is_empty());
+        if demo && d.is_loaded() && std::env::var("DATACRAFT_DEMO_MODIFY").is_ok_and(|v| v == "edit") {
+            d.demo_edits();
+        }
+    }
+
+    /// Reply to "Modify Table…"'s statements: the table (maybe renamed) is reloaded.
+    fn modify_done(&mut self, result: Result<(), String>) {
+        let Some(d) = self.modify.as_mut() else { return };
+        if let Err(e) = result {
+            d.running = false;
+            d.error = Some(e);
+            // Engines without transactional DDL may have applied part of it: show the current state.
+            let (conn, db) = (d.conn, d.db.clone());
+            if let Some(c) = self.conn_mut(conn) {
+                c.loading.remove(&db);
+            }
+            self.load_database(conn, db);
+            return;
+        }
+        let Some(d) = self.modify.take() else { return };
+        let conn = d.conn;
+        let new_name = d.final_name();
+        if new_name != d.table {
+            // Data editors of the old name have nothing to show any more.
+            let default_db = self.conn(conn).and_then(|c| c.default_db()).map(str::to_string);
+            let gone = |c: &Console| {
+                c.conn == Some(conn)
+                    && c.db.as_deref().or(default_db.as_deref()) == Some(d.db.as_str())
+                    && c.table.as_ref().is_some_and(|t| t.schema == d.schema && t.table == d.table)
+            };
+            while let Some(i) = self.consoles.iter().position(gone) {
+                self.close_console_now(i);
+            }
+            for org in self.object_browser.organizations.iter_mut().filter(|o| o.conn == conn && o.db == d.db) {
+                org.table_changed(&d.schema, &d.table, Some(&new_name));
+            }
+            let renamed = TableRef { conn, db: d.db.clone(), schema: d.schema.clone(), table: new_name.clone() };
+            self.explorer.selected = Some(explorer::table_key(&renamed));
+            self.explorer.selected_table = Some(renamed);
+        } else {
+            self.reload_table_editors(conn, &d.db, &d.schema, &d.table);
+        }
+        if let Some(c) = self.conn_mut(conn) {
+            c.loading.remove(&d.db);
+        }
+        self.load_database(conn, d.db.clone());
+        self.info(trf("Table “{name}” modified", &[("name", &new_name)]));
+    }
+
     /// Reply to the "New Database" / "New Table" dialog's statements.
     fn ddl_done(&mut self, conn: ConnId, result: Result<(), String>) {
         if self.view_ddl_done(conn, &result) {
+            return;
+        }
+        if self.modify.as_ref().is_some_and(|d| d.conn == conn && d.running) {
+            self.modify_done(result);
             return;
         }
         if self.drop.as_ref().is_some_and(|d| d.conn == conn && d.running) {
@@ -2870,6 +2953,19 @@ impl DataCraftApp {
             }
         }
 
+        if let Some(d) = self.modify.as_mut() {
+            match d.show(ctx) {
+                Some(ModifyResult::Apply(plan)) => {
+                    d.running = true;
+                    d.error = None;
+                    let (conn, db) = (d.conn, Some(d.db.clone()));
+                    self.worker.send(Request::RunDdl { conn, db, statements: plan.statements, close_db: None, transaction: plan.transaction });
+                }
+                Some(ModifyResult::Cancel) => self.modify = None,
+                None => {}
+            }
+        }
+
         if let Some(d) = self.drop.as_mut() {
             match d.show(ctx) {
                 Some(DropResult::Drop(statements)) => {
@@ -3498,6 +3594,7 @@ mod tests {
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,
             zoom: 1.0, applied_zoom: None, preview: None, confirm_discard: None,
             demo_explorer_w: None, demo_window: None, lang: None,
+            modify: None,
         }
     }
 

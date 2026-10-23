@@ -44,7 +44,7 @@ pub enum CreateResult {
 }
 
 /// Usual types per engine, offered in each column's type menu.
-fn common_types(driver: Driver) -> &'static [&'static str] {
+pub(crate) fn common_types(driver: Driver) -> &'static [&'static str] {
     match driver {
         Driver::Postgres => &[
             "integer", "bigint", "smallint", "serial", "bigserial", "numeric(10,2)", "real", "double precision",
@@ -280,102 +280,124 @@ impl CreateDialog {
     }
 
     fn columns_editor(&mut self, ui: &mut Ui) {
-        let p = theme::pal(ui);
-        let types = common_types(self.driver);
-        ui.label(RichText::new(tr("Columns")).font(theme::bold(13.0)));
-        ui.add_space(6.0);
-        let mut remove = None;
-        let can_remove = self.columns.len() > 1;
-        egui::ScrollArea::vertical().id_salt("create_columns").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-            egui::Grid::new("create_columns_grid").num_columns(6).spacing([8.0, 6.0]).show(ui, |ui| {
-                for h in [tr("Name"), tr("Type"), tr("Not null"), "PK", tr("Default"), ""] {
-                    ui.label(RichText::new(h).small().color(p.muted));
-                }
-                ui.end_row();
-                for (i, c) in self.columns.iter_mut().enumerate() {
-                    ui.add_sized([160.0, 26.0], egui::TextEdit::singleline(&mut c.name).id_salt(("col_name", i)).margin(vec2(6.0, 4.0)));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.add_sized(
-                            [150.0, 26.0],
-                            egui::TextEdit::singleline(&mut c.data_type)
-                                .id_salt(("col_type", i))
-                                .font(egui::TextStyle::Monospace)
-                                .margin(vec2(6.0, 4.0)),
-                        );
-                        let pick = theme::icon_button(ui, Ico::ChevronDown, true, tr("Choose a type"));
-                        egui::Popup::menu(&pick).show(|ui| {
-                            for t in types {
-                                if ui.button(RichText::new(*t).monospace()).clicked() {
-                                    c.data_type = (*t).to_string();
-                                    ui.close();
-                                }
-                            }
-                        });
-                    });
-                    ui.add_enabled(!c.primary_key, egui::Checkbox::without_text(&mut c.not_null));
-                    if ui.add(egui::Checkbox::without_text(&mut c.primary_key)).changed() && c.primary_key {
-                        c.not_null = true;
-                    }
-                    ui.add_sized(
-                        [120.0, 26.0],
-                        egui::TextEdit::singleline(&mut c.default)
-                            .id_salt(("col_default", i))
-                            .font(egui::TextStyle::Monospace)
-                            .margin(vec2(6.0, 4.0)),
-                    );
-                    if theme::icon_button(ui, Ico::Minus, can_remove, tr("Remove column")).clicked() {
-                        remove = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-        });
-        if let Some(i) = remove {
-            self.columns.remove(i);
-        }
-        ui.add_space(4.0);
-        if theme::flat_button(ui, Some(Ico::Plus), tr("Add Column"), FontId::proportional(13.0), false, true).clicked() {
-            let data_type = types.iter().find(|t| t.contains("varchar") || **t == "TEXT").unwrap_or(&types[0]);
-            self.columns.push(NewColumn {
-                name: String::new(),
-                data_type: (*data_type).to_string(),
-                not_null: false,
-                primary_key: false,
-                default: String::new(),
-            });
-        }
+        columns_editor(ui, "create", self.driver, &mut self.columns, |c| c, |c| c, 1);
     }
 
     fn preview(&self, ui: &mut Ui) {
-        let p = theme::pal(ui);
-        let dark = ui.visuals().dark_mode;
-        let text = format!("{};", self.sql());
-        egui::Frame::NONE
-            .fill(p.editor_bg)
-            .stroke(egui::Stroke::new(1.0, p.control_border))
-            .corner_radius(6)
-            .inner_margin(Margin::same(8))
-            .show(ui, |ui| {
-                egui::ScrollArea::both().id_salt("create_preview").max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
-                    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
-                        let mut job = sql::highlight(buf.as_str(), dark, FontId::monospace(12.5));
-                        job.wrap.max_width = f32::INFINITY;
-                        ui.fonts_mut(|f| f.layout_job(job))
-                    };
-                    let mut t = text.as_str();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut t)
-                            .id(egui::Id::new("create_preview_sql"))
-                            .code_editor()
-                            .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(2)
-                            .layouter(&mut layouter),
-                    );
-                });
-            });
+        sql_preview(ui, "create", &format!("{};", self.sql()));
     }
+}
+
+/// The column list of "New Table" and "Modify Table": name, type (with a menu of usual types),
+/// NOT NULL, primary key and default, one row per column, plus "Add Column". `column` gives
+/// each row's column and `new_row` wraps a new one; at least `min_rows` rows are kept.
+/// Returns the index of the row removed this frame.
+pub(crate) fn columns_editor<T>(
+    ui: &mut Ui,
+    id: &str,
+    driver: Driver,
+    rows: &mut Vec<T>,
+    column: impl Fn(&mut T) -> &mut NewColumn,
+    new_row: impl FnOnce(NewColumn) -> T,
+    min_rows: usize,
+) -> Option<usize> {
+    let p = theme::pal(ui);
+    let types = common_types(driver);
+    ui.label(RichText::new(tr("Columns")).font(theme::bold(13.0)));
+    ui.add_space(6.0);
+    let mut remove = None;
+    let can_remove = rows.len() > min_rows;
+    egui::ScrollArea::vertical().id_salt((id, "columns")).max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new((id, "columns_grid")).num_columns(6).spacing([8.0, 6.0]).show(ui, |ui| {
+            for h in [tr("Name"), tr("Type"), tr("Not null"), "PK", tr("Default"), ""] {
+                ui.label(RichText::new(h).small().color(p.muted));
+            }
+            ui.end_row();
+            for (i, row) in rows.iter_mut().enumerate() {
+                let c = column(row);
+                ui.add_sized([160.0, 26.0], egui::TextEdit::singleline(&mut c.name).id_salt((id, "col_name", i)).margin(vec2(6.0, 4.0)));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_sized(
+                        [150.0, 26.0],
+                        egui::TextEdit::singleline(&mut c.data_type)
+                            .id_salt((id, "col_type", i))
+                            .font(egui::TextStyle::Monospace)
+                            .margin(vec2(6.0, 4.0)),
+                    );
+                    let pick = theme::icon_button(ui, Ico::ChevronDown, true, tr("Choose a type"));
+                    egui::Popup::menu(&pick).show(|ui| {
+                        for t in types {
+                            if ui.button(RichText::new(*t).monospace()).clicked() {
+                                c.data_type = (*t).to_string();
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                ui.add_enabled(!c.primary_key, egui::Checkbox::without_text(&mut c.not_null));
+                if ui.add(egui::Checkbox::without_text(&mut c.primary_key)).changed() && c.primary_key {
+                    c.not_null = true;
+                }
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(&mut c.default)
+                        .id_salt((id, "col_default", i))
+                        .font(egui::TextStyle::Monospace)
+                        .margin(vec2(6.0, 4.0)),
+                );
+                if theme::icon_button(ui, Ico::Minus, can_remove, tr("Remove column")).clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    });
+    if let Some(i) = remove {
+        rows.remove(i);
+    }
+    ui.add_space(4.0);
+    if theme::flat_button(ui, Some(Ico::Plus), tr("Add Column"), FontId::proportional(13.0), false, true).clicked() {
+        let data_type = types.iter().find(|t| t.contains("varchar") || **t == "TEXT").or(types.first()).copied().unwrap_or_default();
+        rows.push(new_row(NewColumn {
+            name: String::new(),
+            data_type: data_type.to_string(),
+            not_null: false,
+            primary_key: false,
+            default: String::new(),
+        }));
+    }
+    remove
+}
+
+/// Read-only, highlighted SQL preview.
+pub(crate) fn sql_preview(ui: &mut Ui, id: &str, text: &str) {
+    let p = theme::pal(ui);
+    let dark = ui.visuals().dark_mode;
+    egui::Frame::NONE
+        .fill(p.editor_bg)
+        .stroke(egui::Stroke::new(1.0, p.control_border))
+        .corner_radius(6)
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            egui::ScrollArea::both().id_salt((id, "preview")).max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
+                let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
+                    let mut job = sql::highlight(buf.as_str(), dark, FontId::monospace(12.5));
+                    job.wrap.max_width = f32::INFINITY;
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+                let mut t = text;
+                ui.add(
+                    egui::TextEdit::multiline(&mut t)
+                        .id(egui::Id::new((id, "preview_sql")))
+                        .code_editor()
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .layouter(&mut layouter),
+                );
+            });
+        });
 }
 
 #[cfg(test)]
