@@ -3,6 +3,7 @@
 //! Every driver converts values to text (`Cell`) so the UI doesn't need to
 //! know each engine's native types.
 
+pub mod copy;
 pub mod mssql;
 pub mod object_info;
 pub mod schema_search;

@@ -21,6 +21,7 @@
 //! `DATACRAFT_DEMO_LANG=en|es|fr|pt|de|zh|ja` forces the interface language.
 //! `DATACRAFT_DEMO_IMPORT=<file.csv>` opens "Import Data from File" on the first table with
 //! that file loaded; `DATACRAFT_DEMO_IMPORT_SUBMIT=1` also imports it.
+//! `DATACRAFT_DEMO_COPY=1` opens "Copy Table To…" on the first table, into `<name>_copy`.
 //! `DATACRAFT_DEMO_GRID=record|clone` opens the record view of the first row of the first
 //! grid shown, or clones that row (pending, never saved).
 //! `DATACRAFT_DEMO_CREATE=table` opens the "New Table" dialog with a few sample columns;
@@ -37,6 +38,7 @@ use crate::ui::connection_dialog::{ConnectionDialog, DialogResult};
 use crate::ui::console::{self, CloseResults, Console, ConsoleAction, ConsoleCtx, ResultTab};
 use crate::ui::create_dialog::{self, CreateDialog, CreateResult, CreateTarget};
 use crate::ui::drop_dialog::{DropDialog, DropKind, DropResult};
+use crate::ui::copy_dialog::{CopyAction, CopyDialog};
 use crate::ui::import_dialog::{ImportDialog, ImportResult};
 use crate::ui::editing::{self, RowRef};
 use crate::ui::explorer::{self, ExplorerAction, ExplorerState, TableRef};
@@ -260,6 +262,8 @@ pub struct DataCraftApp {
     /// Confirmation to drop a database, table or view.
     drop: Option<DropDialog>,
     import: Option<ImportDialog>,
+    /// "Copy Table To…".
+    copy: Option<CopyDialog>,
     renaming: Option<(u64, String)>,
     show_about: bool,
     show_settings: bool,
@@ -335,6 +339,7 @@ impl DataCraftApp {
             create: None,
             drop: None,
             import: None,
+            copy: None,
             renaming: None,
             show_about: false,
             show_settings: false,
@@ -621,6 +626,14 @@ impl DataCraftApp {
                                 self.submit_import();
                             }
                         }
+                        if std::env::var("DATACRAFT_DEMO_COPY").is_ok_and(|v| v == "1")
+                            && let Some(t) = self.explorer.selected_table.clone()
+                        {
+                            self.open_copy(t);
+                            if let Some(d) = self.copy.as_mut() {
+                                d.target_table.push_str("_copy");
+                            }
+                        }
                         let demo_create = std::env::var("DATACRAFT_DEMO_CREATE").unwrap_or_default();
                         if demo_create.starts_with("table")
                             && let Some(db) = self.conn(conn).and_then(|c| c.default_db().map(str::to_string))
@@ -712,6 +725,7 @@ impl DataCraftApp {
                 Response::SchemaSearch { request_id, result } => self.object_browser.schema_search.receive(request_id, result),
                 Response::ChangesApplied { console, result } => self.changes_applied(console, result),
                 Response::DdlDone { conn, result } => self.ddl_done(conn, result),
+                Response::TableCopied { request_id, result } => self.copy_done(request_id, result),
             }
         }
     }
@@ -1248,6 +1262,7 @@ impl DataCraftApp {
                 ExplorerAction::DropObject(t, kind) => self.open_object_dialog(t, kind.into()),
                 ExplorerAction::TruncateTable(t) => self.open_object_dialog(t, DropKind::Truncate),
                 ExplorerAction::ImportData(t) => self.open_import(t),
+                ExplorerAction::CopyTable(t) => self.open_copy(t),
                 ExplorerAction::RenameTable(t) => self.open_object_dialog(t, DropKind::Rename),
                 ExplorerAction::NewConsole(id, db) => {
                     let i = self.new_console(Some(id), None, String::new());
@@ -1357,6 +1372,55 @@ impl DataCraftApp {
             return;
         };
         self.import = Some(ImportDialog::new(t.conn, driver, t.db, t.schema, t.table, columns));
+    }
+
+    /// "Copy Table To…" from a table or view whose structure is loaded.
+    fn open_copy(&mut self, t: TableRef) {
+        let Some(source) = self.conn(t.conn).filter(|c| c.status == ConnStatus::Connected) else { return };
+        let Some(columns) = self.table_columns(t.conn, Some(&t.db), &t.schema, &t.table).map(<[ColumnInfo]>::to_vec) else {
+            self.error(tr("Table structure not loaded yet").to_string());
+            return;
+        };
+        let d = CopyDialog::new(source, t.db, t.schema, t.table, columns, &self.conns);
+        if !self.conns.iter().any(|c| c.cfg.id == d.target && c.status == ConnStatus::Connected && !c.cfg.read_only) {
+            self.error(tr("Connect a connection that is not read-only to copy into").to_string());
+            return;
+        }
+        self.copy = Some(d);
+    }
+
+    /// Checks the copy's filter (it must only read) and sends it to the worker.
+    fn start_copy(&mut self, request: crate::db::copy::CopyRequest) {
+        let Some(d) = self.copy.as_mut() else { return };
+        let Some(driver) = self.conns.iter().find(|c| c.cfg.id == d.source).map(|c| c.cfg.driver) else { return };
+        let select = crate::db::copy::select_sql(driver, &request.source_schema, &request.source_table, &request.columns, &request.filter, None);
+        if request.filter.contains(';') || !is_query(&select) {
+            d.error = Some(tr("The WHERE condition can only read data").to_string());
+            return;
+        }
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        d.started(cancel.clone());
+        let (source, target, request_id) = (d.source, d.target, d.request_id);
+        self.worker.send(Request::CopyTable { source, target, request_id, request, cancel });
+    }
+
+    /// Reply to a copy: on success the dialog closes and the target is reloaded.
+    fn copy_done(&mut self, request_id: u64, result: Result<u64, String>) {
+        let Some(d) = self.copy.as_mut() else { return };
+        if !d.finished(request_id) {
+            return;
+        }
+        let n = match result {
+            Ok(n) => n,
+            Err(e) => {
+                d.error = Some(e);
+                return;
+            }
+        };
+        let Some(d) = self.copy.take() else { return };
+        self.load_database(d.target, d.target_db.clone());
+        self.reload_table_editors(d.target, &d.target_db, &d.target_schema, &d.target_table);
+        self.info(trf("{n} rows copied to “{table}”", &[("n", &n), ("table", &d.target_table)]));
     }
 
     /// Demo mode: runs the import as if "Import" had been clicked.
@@ -1774,6 +1838,7 @@ impl DataCraftApp {
             || self.create.is_some()
             || self.drop.is_some()
             || self.import.is_some()
+            || self.copy.is_some()
             || self.show_about
             || self.show_settings
             || self.preview.as_ref().is_some_and(|p| p.visible)
@@ -2642,6 +2707,15 @@ impl DataCraftApp {
             }
         }
 
+        if let Some(d) = self.copy.as_mut() {
+            match d.show(ctx, &self.conns) {
+                Some(CopyAction::Start(request)) => self.start_copy(request),
+                Some(CopyAction::Load(conn, db)) => self.ensure_db_loaded(conn, Some(&db)),
+                Some(CopyAction::Close) => self.copy = None,
+                None => {}
+            }
+        }
+
         if let Some(d) = self.drop.as_mut() {
             match d.show(ctx) {
                 Some(DropResult::Drop(statements)) => {
@@ -3226,7 +3300,7 @@ mod tests {
             active: 1, next_console_id: 5, console_counter: 4, result_salt: 0,
             explorer: ExplorerState::default(), object_browser: crate::ui::object_browser::ObjectBrowser::default(),
             save_on_row_change: false,
-            dialog: None, confirm_delete: None, create: None, drop: None, import: None, renaming: None,
+            dialog: None, confirm_delete: None, create: None, drop: None, import: None, copy: None, renaming: None,
             show_about: false, show_settings: false, native_menu: None, show_explorer: true,
             show_results: true, dark: true, applied_dark: None, font_size: DEFAULT_FONT_SIZE,
             max_rows: 1000, status_msg: None, last_conn_id: 0, demo_pending: false, demo_edit: None,

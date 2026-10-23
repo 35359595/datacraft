@@ -23,6 +23,14 @@ pub enum Request {
         request: crate::db::schema_search::SearchRequest,
         cancel: Arc<tokio::sync::Notify>,
     },
+    /// "Copy Table To…": copies rows from `source` to `target` on sessions of their own.
+    CopyTable {
+        source: ConnId,
+        target: ConnId,
+        request_id: u64,
+        request: crate::db::copy::CopyRequest,
+        cancel: Arc<tokio::sync::Notify>,
+    },
     /// Opens (or reopens) the connection, lists its databases and loads the default database's schema.
     Connect(ConnectionConfig),
     /// Only tests the connection and closes it.
@@ -77,6 +85,8 @@ pub enum Request {
 
 pub enum Response {
     SchemaSearch { request_id: u64, result: Result<crate::db::schema_search::SearchReport, String> },
+    /// Result of `CopyTable`: rows copied.
+    TableCopied { request_id: u64, result: Result<u64, String> },
     /// `databases` in order; the default one has `current = true` and its schema loaded.
     Connected { conn: ConnId, databases: Vec<DatabaseInfo> },
     ConnectFailed { conn: ConnId, error: String },
@@ -387,6 +397,19 @@ async fn handle(req: Request, epoch: u64, state: &State) -> Vec<Response> {
                 None => Err(tr("The connection is not open").into()),
             };
             vec![Response::SchemaSearch { request_id, result }]
+        }
+        Request::CopyTable { source, target, request_id, request, cancel } => {
+            let cfgs = {
+                let live = state.live.lock().await;
+                live.get(&source).map(|l| l.cfg.clone()).zip(live.get(&target).map(|l| l.cfg.clone()))
+            };
+            let result = match cfgs {
+                Some((source, target)) => {
+                    crate::db::copy::copy(source, target, request, cancel).await.map_err(|e| format!("{e:#}"))
+                }
+                None => Err(tr("The connection is not open").into()),
+            };
+            vec![Response::TableCopied { request_id, result }]
         }
         Request::Connect(cfg) => {
             let conn = cfg.id;
@@ -937,5 +960,123 @@ mod tests {
         let r = wait_for(&w, |r| matches!(r, Response::Executed { console: 2, .. }));
         let Response::Executed { error, .. } = r else { unreachable!() };
         assert!(error.is_none(), "{error:?}");
+    }
+
+    fn sqlite_cfg(id: ConnId, path: &std::path::Path) -> ConnectionConfig {
+        let mut cfg = ConnectionConfig::new(id, Driver::Sqlite);
+        cfg.file_path = path.display().to_string();
+        cfg
+    }
+
+    fn copy_request(target_db: &str, target_table: &str, filter: &str, percent: u8, create: bool, clear: bool) -> crate::db::copy::CopyRequest {
+        let col = |name: &str, ty: &str, pk: bool| crate::db::ColumnInfo { name: name.into(), data_type: ty.into(), nullable: !pk, primary_key: pk };
+        let columns = vec![col("id", "INTEGER", true), col("name", "TEXT", false), col("ok", "BOOLEAN", false)];
+        crate::db::copy::CopyRequest {
+            source_db: "main".into(),
+            source_schema: "main".into(),
+            source_table: "people".into(),
+            target_names: columns.iter().map(|c| c.name.clone()).collect(),
+            columns,
+            filter: filter.into(),
+            percent,
+            target_db: target_db.into(),
+            target_schema: target_db.into(),
+            target_table: target_table.into(),
+            create,
+            clear,
+        }
+    }
+
+    fn run_copy(w: &Worker, source: ConnId, target: ConnId, request_id: u64, request: crate::db::copy::CopyRequest) -> Result<u64, String> {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        w.send(Request::CopyTable { source, target, request_id, request, cancel });
+        let r = wait_for(w, |r| matches!(r, Response::TableCopied { request_id: id, .. } if *id == request_id));
+        let Response::TableCopied { result, .. } = r else { unreachable!() };
+        result
+    }
+
+    fn people_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("source.db");
+        let mut sql = String::from("create table people(id integer primary key, name text, ok boolean, photo blob);");
+        for i in 1..=40 {
+            sql.push_str(&format!("insert into people values ({i}, 'O''Brien {i}', {}, x'00ff');", i % 2));
+        }
+        rusqlite::Connection::open(&path).unwrap().execute_batch(&sql).unwrap();
+        path
+    }
+
+    /// Copies part of a table to another SQLite file, creating it, then replaces its rows.
+    #[test]
+    fn copies_a_table_between_connections() {
+        let dir = std::env::temp_dir().join(format!("datacraft-copy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = people_db(&dir);
+        let target = dir.join("target.db");
+        rusqlite::Connection::open(&target).unwrap();
+        let w = Worker::start(egui::Context::default());
+        let mut src = sqlite_cfg(21, &source);
+        src.read_only = true;
+        w.send(Request::Connect(src));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 21, .. }));
+        w.send(Request::Connect(sqlite_cfg(22, &target)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 22, .. }));
+
+        // Half of the 20 rows with id > 20.
+        assert_eq!(run_copy(&w, 21, 22, 1, copy_request("main", "people_copy", "id > 20", 50, true, false)), Ok(10));
+        // Again into the existing table, replacing its rows.
+        assert_eq!(run_copy(&w, 21, 22, 2, copy_request("main", "people_copy", "", 100, false, true)), Ok(40));
+        // A filter that writes is refused by the read-only source session.
+        assert!(run_copy(&w, 21, 22, 3, copy_request("main", "people_copy", "1=1; delete from people", 100, false, false)).is_err());
+
+        let db = rusqlite::Connection::open(&target).unwrap();
+        let (n, name): (i64, String) =
+            db.query_row("select count(*), max(name) from people_copy where ok = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((n, name.as_str()), (20, "O'Brien 9"));
+        let total: i64 = db.query_row("select count(*) from people_copy", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 40);
+        let left: i64 = rusqlite::Connection::open(&source).unwrap().query_row("select count(*) from people", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 40);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQLite → MariaDB (creating the table) → SQLite. Needs the same `DATACRAFT_MY_*` variables.
+    #[test]
+    #[ignore]
+    fn copies_between_sqlite_and_mariadb() {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let mut my = ConnectionConfig::new(23, Driver::MariaDb);
+        my.host = var("DATACRAFT_MY_HOST");
+        my.port = var("DATACRAFT_MY_PORT").parse().unwrap_or(3306);
+        my.user = var("DATACRAFT_MY_USER");
+        my.password = var("DATACRAFT_MY_PASSWORD");
+        my.database = var("DATACRAFT_MY_DB");
+        let db = my.database.clone();
+        let dir = std::env::temp_dir().join(format!("datacraft-copy-my-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = people_db(&dir);
+        let back = dir.join("back.db");
+        rusqlite::Connection::open(&back).unwrap();
+        let w = Worker::start(egui::Context::default());
+        w.send(Request::Connect(sqlite_cfg(24, &source)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 24, .. }));
+        w.send(Request::Connect(my));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 23, .. }));
+        w.send(Request::Connect(sqlite_cfg(25, &back)));
+        wait_for(&w, |r| matches!(r, Response::Connected { conn: 25, .. }));
+        w.send(Request::RunDdl { conn: 23, db: None, statements: vec!["drop table if exists dc_people".into()], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { result: Ok(_), .. }));
+
+        assert_eq!(run_copy(&w, 24, 23, 1, copy_request(&db, "dc_people", "", 100, true, false)), Ok(40));
+        let mut back_req = copy_request("main", "people", "ok = 1", 100, true, false);
+        back_req.source_db.clone_from(&db);
+        back_req.source_schema.clone_from(&db);
+        back_req.source_table = "dc_people".into();
+        back_req.columns[2].data_type = "tinyint(1)".into();
+        assert_eq!(run_copy(&w, 23, 25, 2, back_req), Ok(20));
+        let name: String = rusqlite::Connection::open(&back).unwrap().query_row("select name from people where id = 3", [], |r| r.get(0)).unwrap();
+        assert_eq!(name, "O'Brien 3");
+        w.send(Request::RunDdl { conn: 23, db: None, statements: vec!["drop table dc_people".into()], close_db: None, transaction: false });
+        wait_for(&w, |r| matches!(r, Response::DdlDone { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
