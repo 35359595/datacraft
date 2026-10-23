@@ -436,7 +436,8 @@
     "The key “{key}” already exists": "キー “{key}” は既に存在します",
     "The keys changed while saving; nothing was saved. Refresh and try again": "保存中にキーが変更されました。何も保存されていません。更新してもう一度お試しください",
     "The type of a key cannot be changed": "キーの型は変更できません",
-    "“{value}” is not a valid TTL (seconds)": "“{value}” は有効な TTL (秒) ではありません"
+    "“{value}” is not a valid TTL (seconds)": "“{value}” は有効な TTL (秒) ではありません",
+    "string (truncated)": "string (切り詰め)"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "ステートメントが {n} 行に影響しました (想定は 1 行)。何も保存されていません:\n{stmt}",

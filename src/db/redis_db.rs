@@ -22,6 +22,8 @@ const INTROSPECT_KEYS: usize = 5000;
 const PREVIEW_ITEMS: isize = 100;
 /// Characters of a value preview.
 const PREVIEW_CHARS: usize = 2000;
+/// Characters of a string value shown whole (and editable) in the key grid.
+const EDITABLE_STRING_CHARS: usize = 1_000_000;
 
 pub struct RedisSession {
     conn: MultiplexedConnection,
@@ -340,7 +342,14 @@ impl RedisSession {
                     "stream" => text(&v).map(|n| trf("Stream entries: {n}", &[("n", &n)])),
                     _ => None,
                 };
-                rows.push(vec![Some(k.clone()), Some(ty), ttl, preview.map(|p| cut(&p))]);
+                // String values are shown whole so editing them saves exactly what the cell holds;
+                // only huge ones are cut, and then their type says so and the grid refuses to edit them.
+                let (ty, preview) = match (ty.as_str(), preview) {
+                    ("string", Some(p)) if p.chars().count() > EDITABLE_STRING_CHARS => (tr("string (truncated)").to_string(), Some(cut(&p))),
+                    ("string", p) => (ty, p),
+                    (_, p) => (ty, p.map(|p| cut(&p))),
+                };
+                rows.push(vec![Some(k.clone()), Some(ty), ttl, preview]);
             }
         }
         Ok(ResultSet { columns: ["key", "type", "ttl", "value"].map(String::from).to_vec(), rows, ..Default::default() })

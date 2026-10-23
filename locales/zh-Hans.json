@@ -436,7 +436,8 @@
     "The key “{key}” already exists": "键“{key}”已存在",
     "The keys changed while saving; nothing was saved. Refresh and try again": "保存期间键已更改；未保存任何内容。请刷新后重试",
     "The type of a key cannot be changed": "无法更改键的类型",
-    "“{value}” is not a valid TTL (seconds)": "“{value}”不是有效的 TTL（秒）"
+    "“{value}” is not a valid TTL (seconds)": "“{value}”不是有效的 TTL（秒）",
+    "string (truncated)": "string（已截断）"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "该语句影响了 {n} 行（预期为 1 行）；未保存任何内容：\n{stmt}",

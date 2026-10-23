@@ -436,7 +436,8 @@
     "The key “{key}” already exists": "A chave “{key}” já existe",
     "The keys changed while saving; nothing was saved. Refresh and try again": "As chaves mudaram durante o salvamento; nada foi salvo. Atualize e tente novamente",
     "The type of a key cannot be changed": "Não é possível alterar o tipo de uma chave",
-    "“{value}” is not a valid TTL (seconds)": "“{value}” não é um TTL válido (segundos)"
+    "“{value}” is not a valid TTL (seconds)": "“{value}” não é um TTL válido (segundos)",
+    "string (truncated)": "string (truncado)"
   },
   "core": {
     "The statement affected {n} rows (expected 1); nothing was saved:\n{stmt}": "A instrução afetou {n} linhas (esperada 1); nada foi salvo:\n{stmt}",
